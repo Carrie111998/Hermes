@@ -477,3 +477,109 @@ def test_unmentioned_decide_speak_exception_is_silent():
     result = asyncio.run(run())
     assert result.get("success") is not True
     assert result.get("silent") is True
+
+
+def _adapter_for_stored_send(poster, ref):
+    from plugins.platforms.teams.adapter import TeamsAdapter
+
+    adapter = object.__new__(TeamsAdapter)
+    adapter._app = object()
+    adapter._client_id = BOT
+    adapter._own_activity_ids = {}
+    adapter._stored_refs = {ref["conversation_id"]: ref}
+    adapter.format_message = lambda content: content
+    adapter.truncate_message = lambda content, max_length=4096, len_fn=None: [content]
+
+    async def _token():
+        return "not-a-secret-for-test"
+
+    adapter._get_botframework_token = _token
+    adapter._post_stored_activity = poster
+    return adapter
+
+
+def test_adapter_send_unmentioned_decide_speak_false_does_not_post():
+    posted = []
+
+    async def poster(url, headers, body):
+        posted.append(body)
+        raise AssertionError("must not POST when decide_speak is false")
+
+    adapter = _adapter_for_stored_send(
+        poster, _group_ref(addressed_via="unmentioned")
+    )
+
+    async def run():
+        return await adapter.send(
+            "19:group-throwaway",
+            "STORED-REF-OWN-SEND",
+            reply_to="activity-inbound-1",
+            metadata={"decide_speak": False},
+        )
+
+    result = asyncio.run(run())
+    assert posted == []
+    assert result.success is True
+    assert result.message_id is None
+
+
+def test_adapter_send_unmentioned_decide_speak_true_posts_once():
+    posted = []
+
+    async def poster(url, headers, body):
+        posted.append(body)
+        return 201, {"id": "activity-adapter-spoken"}
+
+    adapter = _adapter_for_stored_send(
+        poster, _group_ref(addressed_via="unmentioned")
+    )
+
+    async def run():
+        return await adapter.send(
+            "19:group-throwaway",
+            "STORED-REF-OWN-SEND",
+            reply_to="activity-inbound-1",
+            metadata={"decide_speak": True},
+        )
+
+    result = asyncio.run(run())
+    assert len(posted) == 1
+    assert posted[0]["replyToId"] == "activity-inbound-1"
+    assert result.success is True
+    assert result.message_id == "activity-adapter-spoken"
+
+
+def test_adapter_send_unmentioned_default_and_error_are_silent():
+    posted = []
+
+    async def poster(url, headers, body):
+        posted.append(body)
+        raise AssertionError("must not POST on default or decision-error")
+
+    ref = _group_ref(addressed_via="unmentioned")
+
+    async def default_send():
+        adapter = _adapter_for_stored_send(poster, ref)
+        return await adapter.send(
+            "19:group-throwaway",
+            "STORED-REF-OWN-SEND",
+            reply_to="activity-inbound-1",
+        )
+
+    def boom():
+        raise RuntimeError("classifier failed")
+
+    async def error_send():
+        adapter = _adapter_for_stored_send(poster, ref)
+        return await adapter.send(
+            "19:group-throwaway",
+            "STORED-REF-OWN-SEND",
+            reply_to="activity-inbound-1",
+            metadata={"decide_speak": boom},
+        )
+
+    default = asyncio.run(default_send())
+    error = asyncio.run(error_send())
+    assert posted == []
+    assert default.success is True and default.message_id is None
+    assert error.success is True and error.message_id is None

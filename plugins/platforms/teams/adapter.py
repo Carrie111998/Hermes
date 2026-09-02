@@ -827,7 +827,8 @@ class TeamsAdapter(BasePlatformAdapter):
         self._stored_refs: Dict[str, Dict[str, Any]] = {}
         # Activity ids this bot sent, keyed by conversation id. Group inbound
         # is heard always; a send replies on @mention or reply-to-own, and
-        # unmentioned lines default silent.
+        # unmentioned lines default silent unless this turn's decide_speak
+        # opts in.
         self._own_activity_ids: Dict[str, set[str]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -947,6 +948,23 @@ class TeamsAdapter(BasePlatformAdapter):
         self._stored_refs = load_stored_refs(self._stored_ref_dir())
         if self._stored_refs:
             logger.info("[teams] loaded %d stored conversation ref(s)", len(self._stored_refs))
+
+    def _decide_speak_for_turn(self, metadata: Optional[Dict[str, Any]]):
+        """Speak decision bound to this inbound send, not adapter-wide state.
+
+        Unmentioned group turns run through this callable. Default is
+        silent; a per-send ``metadata['decide_speak']`` bool or callable
+        may opt in. Exceptions fail closed in ``group_inbound_should_reply``.
+        """
+        snapshot = dict(metadata or {})
+
+        def _decide() -> bool:
+            raw = snapshot.get("decide_speak", False)
+            if callable(raw):
+                return bool(raw())
+            return bool(raw)
+
+        return _decide
 
     def _persist_inbound_stored_ref(self, activity: Any, conv: Any, from_account: Any) -> None:
         if not self._client_id:
@@ -1459,6 +1477,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 token = await self._get_botframework_token()
             except Exception as e:
                 return SendResult(success=False, error=str(e), retryable=True)
+            decide_speak = self._decide_speak_for_turn(metadata)
             last_message_id = None
             for chunk in chunks:
                 result = await send_from_stored_ref(
@@ -1468,7 +1487,10 @@ class TeamsAdapter(BasePlatformAdapter):
                     expected_bot_app_id=self._client_id,
                     token=token,
                     reply_to=reply_to,
+                    decide_speak=decide_speak,
                 )
+                if result.get("silent"):
+                    return SendResult(success=True, message_id=None)
                 if not result.get("success"):
                     return SendResult(
                         success=False,
