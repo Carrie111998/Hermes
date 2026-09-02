@@ -29,7 +29,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, **_receipt_identity):
         calls.append(("deliver", job["id"]))
         return None
 
@@ -76,6 +76,81 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_run_one_job_uses_unknown_delivery_outcome_from_receipt_ledger(monkeypatch):
+    finished = []
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-unknown"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "run_job",
+        lambda *_a, **_kw: (True, "out", "final response", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a: None)
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *_a, **_kw: "bot-chat delivery confirmation unavailable",
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        s,
+        "receipt_summary",
+        lambda _execution_id: {
+            "delivered": 0, "failed": 0, "unknown": 1, "targets_delivered": 0,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    assert s.run_one_job({
+        "id": "j-unknown", "name": "bot", "deliver": "bot-chat:research",
+    }) is True
+    assert finished[-1][1]["delivery_outcome"] == "unknown"
+
+
+def test_run_one_job_keeps_concrete_delivery_error_failed_despite_text_ack(
+    monkeypatch,
+):
+    finished = []
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-partial"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "run_job", lambda *_a, **_kw: (True, "out", "final response", None)
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a: None)
+    monkeypatch.setattr(
+        s, "_deliver_result", lambda *_a, **_kw: "media path policy rejected attachment"
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        s,
+        "receipt_summary",
+        lambda _execution_id: {
+            "delivered": 1, "failed": 0, "unknown": 0, "targets_delivered": 1,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: finished.append((args, kwargs)),
+    )
+
+    assert s.run_one_job({
+        "id": "j-partial", "name": "partial", "deliver": "telegram",
+    }) is True
+    assert finished[-1][1]["delivery_outcome"] == "failed"
 
 
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):

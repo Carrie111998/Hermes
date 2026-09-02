@@ -112,7 +112,8 @@ class TestCronjobRunExecutesImmediately:
 
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is False
-        assert out["job"]["execution_error"] == "provider 500"
+        assert out["job"]["execution_error"] == "run_failed"
+        assert "provider 500" not in json.dumps(out)
 
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
@@ -172,7 +173,7 @@ class TestCronjobRunExecutesImmediately:
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is True
         assert res["success"] is False
-        assert "boom" in res["error"]
+        assert res["error"] == "run_failed"
         m_mark.assert_called_once_with(
             "job-run-1",
             False,

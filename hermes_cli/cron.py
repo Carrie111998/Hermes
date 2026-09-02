@@ -8,6 +8,7 @@ pause/resume/run/remove, status, and tick.
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -25,6 +26,18 @@ from hermes_cli.colors import Colors, color
 from cron.lifecycle_guard import (  # noqa: F401  (re-exported for terminal_tool)
     contains_gateway_lifecycle_command as _contains_gateway_lifecycle_command,
 )
+
+
+def _public_timestamp(value) -> Optional[str]:
+    if type(value) is not str or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return value
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -197,35 +210,19 @@ def cron_list(show_all: bool = False):
     print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
     print()
 
-    from cron.jobs import effective_job_state
+    from tools.cronjob_tools import _format_job
 
-    for job in jobs:
-        job_id = job.get("id", "?")
-        name = job.get("name", "(unnamed)")
-        schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
-        # Derive from the scheduler-honoured flag — never show [paused] when
-        # enabled=true (half-paused contradiction must not look frozen).
-        state = effective_job_state(job)
-        next_run = job.get("next_run_at", "?")
+    for stored_job in jobs:
+        # Keep CLI list output on the same bounded projection as the cronjob
+        # model tool. Stored prompts, targets and execution configuration are
+        # management detail, not public status fields.
+        job = _format_job(stored_job)
+        job_id = job["job_id"]
+        name = job["name"]
+        schedule = job["schedule"]
+        state = job.get("state") or "scheduled"
+        next_run = job.get("next_run_at") or "?"
 
-        # `repeat` may be present-but-null in the job record (e.g. a one-shot
-        # job persisted with "repeat": null), so coalesce to {} rather than
-        # relying on the dict-default, which only applies to a missing key.
-        repeat_info = job.get("repeat") or {}
-        repeat_times = repeat_info.get("times")
-        repeat_completed = repeat_info.get("completed", 0)
-        repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
-
-        # `deliver` may be present-but-null in the job record (same pitfall as
-        # `repeat` above), so coalesce to the default rather than relying on the
-        # dict-default, which only applies to a missing key. A null value would
-        # otherwise reach `", ".join(None)` and crash the whole listing (#32896).
-        deliver = job.get("deliver") or ["local"]
-        if isinstance(deliver, str):
-            deliver = [deliver]
-        deliver_str = ", ".join(deliver)
-
-        skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
         if state == "paused":
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
@@ -238,59 +235,37 @@ def cron_list(show_all: bool = False):
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")
         print(f"    Schedule:  {schedule}")
-        print(f"    Repeat:    {repeat_str}")
+        print(f"    Repeat:    {job['repeat']}")
         print(f"    Next run:  {next_run}")
-        print(f"    Deliver:   {deliver_str}")
-        if skills:
-            print(f"    Skills:    {', '.join(skills)}")
-        script = job.get("script")
-        if script:
-            print(f"    Script:    {script}")
-        monitor_source = job.get("monitor_script") or job.get("monitor_url")
-        if monitor_source:
-            print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
-            mon_state = job.get("monitor_state") or {}
-            if mon_state.get("last_changed_at"):
-                print(f"    Changed:   {mon_state['last_changed_at']}")
-        if job.get("no_agent"):
-            print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
-        workdir = job.get("workdir")
-        if workdir:
-            print(f"    Workdir:   {workdir}")
+        print(f"    Delivery:  {job['delivery_kind']}")
+        print(f"    Mode:      {job['mode']}")
 
-        # Execution history
         last_status = job.get("last_status")
         if last_status:
-            last_run = job.get("last_run_at", "?")
-            if last_status == "ok":
-                status_display = color("ok", Colors.GREEN)
-            else:
-                status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
-                streak = int(job.get("failure_streak") or 0)
-                if streak >= 2:
-                    status_display += color(f"  ({streak} failures in a row)", Colors.RED)
+            last_run = job.get("last_run_at") or "?"
+            status_display = color(
+                last_status,
+                Colors.GREEN if last_status == "ok" else Colors.RED,
+            )
             print(f"    Last run:  {last_run}  {status_display}")
 
         dispatch_line = _dispatch_display(job.get("last_dispatch"))
         if dispatch_line:
             print(f"    Dispatch:  {dispatch_line}")
 
-        latest_execution = job.get("latest_execution")
-        if latest_execution:
-            print(
-                f"    Execution: {latest_execution.get('status', '?')}  "
-                f"{latest_execution.get('id', '?')}"
-            )
+        last_execution = job.get("last_execution")
+        if isinstance(last_execution, dict) and last_execution.get("status"):
+            print(f"    Execution: {last_execution['status']}")
 
-        delivery_err = job.get("last_delivery_error")
-        if delivery_err:
-            print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
+        if job.get("last_delivery_error"):
+            print(f"    {color('⚠ Delivery failed', Colors.YELLOW)}")
 
         fire_err = job.get("last_fire_error")
-        if isinstance(fire_err, dict) and fire_err.get("detail"):
+        if isinstance(fire_err, dict):
+            fire_at = fire_err.get("at") or "?"
             print(
                 f"    {color('⚠ Missed scheduled fire:', Colors.RED)} "
-                f"{fire_err.get('at', '?')}  {fire_err['detail']}"
+                f"{fire_at}"
             )
 
         print()
@@ -316,9 +291,9 @@ def cron_tick():
     except OSError as exc:
         # tick() now propagates real lock-acquisition failures (EMFILE,
         # EACCES on open, ...) instead of swallowing them as contention
-        # (#87644). For the one-shot CLI surface, report cleanly instead of
-        # dumping a traceback; the gateway ticker loop handles its own retry.
-        print(color(f"✗ Cron tick failed: {exc}", Colors.RED))
+        # (#87644). Public output stays categorical; the gateway log retains
+        # operator-only diagnostic detail.
+        print(color("✗ Cron tick failed: tick_failed", Colors.RED))
         print("  Check `hermes cron status` and the gateway log for details.")
         return 1
     return 0
@@ -326,7 +301,7 @@ def cron_tick():
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
     """Show indexed durable cron execution history."""
-    from cron.executions import list_executions
+    from cron.executions import list_executions, receipt_summary
 
     records = list_executions(job_id=job_id, limit=limit)
     if not records:
@@ -338,8 +313,16 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
             f"{record.get('claimed_at', '?')}"
         )
-        if record.get("error"):
-            print(f"    {record['error']}")
+        summary = receipt_summary(str(record.get("id", "")))
+        print(
+            "    Receipt: "
+            f"delivered={summary['delivered']} failed={summary['failed']} "
+            f"unknown={summary['unknown']} targets_delivered={summary['targets_delivered']}"
+        )
+        if record.get("error_kind"):
+            # Only the bounded category is durable; raw exception/provider text
+            # never enters executions.db or this operator surface.
+            print(f"    Failure kind: {record['error_kind']}")
 
 
 _INCIDENT_STATE_COLORS = {
@@ -547,13 +530,14 @@ def cron_status():
                 print(f"  PID: {', '.join(map(str, pids))}")
             last_error = get_ticker_last_error()
             if last_error:
-                # Show WHY ticks fail — e.g. a root-rewritten jobs.json
-                # (PermissionError) that silently locked out the ticker's
-                # uid for ~14h in the field (#68483), or fd exhaustion
-                # (EMFILE) that used to stall the scheduler invisibly
-                # (#87644).
-                print(color(f"  Last tick error: {last_error}", Colors.RED))
                 if "Permission denied" in last_error:
+                    error_kind = "permission_denied"
+                elif _cron_is_fd_exhaustion_text(last_error):
+                    error_kind = "fd_exhaustion"
+                else:
+                    error_kind = "tick_failed"
+                print(color(f"  Last tick error: {error_kind}", Colors.RED))
+                if error_kind == "permission_denied":
                     print(color(
                         "  Hint: jobs.json may be owned by another user "
                         "(e.g. rewritten by a root `docker exec hermes "
@@ -561,7 +545,7 @@ def cron_status():
                         "gateway user, and prefer `docker exec -u <uid>:<gid>`.",
                         Colors.YELLOW,
                     ))
-                elif _cron_is_fd_exhaustion_text(last_error):
+                elif error_kind == "fd_exhaustion":
                     print(color(
                         "  Hint: the ticker hit file-descriptor exhaustion "
                         "(EMFILE). The scheduler now retries with backoff and "
@@ -926,11 +910,11 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         # success/failure verdict would be a lie (#83340). Report the
         # background dispatch instead of claiming the run failed.
         delegation_id = job.get("delegation_id")
-        if job.get("execution_mode") == "background" or delegation_id:
-            if delegation_id:
-                print(f"  Running in background (delegation {delegation_id}).")
-            else:
-                print("  Running in background.")
+        if (
+            job.get("execution_mode") == "background"
+            or isinstance(delegation_id, str) and bool(delegation_id)
+        ):
+            print("  Running in background.")
         elif job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")

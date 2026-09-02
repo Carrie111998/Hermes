@@ -1,5 +1,32 @@
 import type { CronJob, CronJobMutation } from "./api";
 
+export async function loadCronJobDetailForEditor(
+  getDetail: (id: string, profile: string) => Promise<CronJob>,
+  job: CronJob,
+  profile: string,
+): Promise<CronJob> {
+  if (!profile || profile === "all") {
+    throw new Error("cron_detail_profile_required");
+  }
+  return getDetail(job.id, profile);
+}
+
+export function cronJobSummaryPresentation(job: CronJob): {
+  title: string;
+  mode: "agent" | "script" | "monitor";
+  modelLabel: string;
+} {
+  const name = typeof job.name === "string" ? job.name.trim() : "";
+  const id = typeof job.id === "string" ? job.id : "";
+  const mode =
+    job.mode === "script" || job.mode === "monitor" ? job.mode : "agent";
+  return {
+    title: name || id || "Cron job",
+    mode,
+    modelLabel: job.model_configured === true ? "configured" : "",
+  };
+}
+
 export interface CronJobFormState {
   name: string;
   prompt: string;
