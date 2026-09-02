@@ -160,6 +160,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.adaptive_reasoning import adaptive_reasoning_turn
 from agent.interrupt_compat import request_hard_interrupt
 
 
@@ -540,6 +541,7 @@ class AIAgent:
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
+        adaptive_reasoning: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -633,6 +635,7 @@ class AIAgent:
             reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
+            adaptive_reasoning=adaptive_reasoning,
             service_tier=service_tier,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
@@ -884,6 +887,11 @@ class AIAgent:
         # Copilot x-initiator: True for the first API call of a user turn,
         # False for tool-loop follow-ups (#3040).
         self._is_user_initiated_turn = False
+
+        # Adaptive-reasoning per-session state (continuation inheritance +
+        # escalation-notice dedup) does not carry across session boundaries.
+        self._adaptive_prev_effort = None
+        self._adaptive_last_notified_effort = None
 
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
@@ -9207,6 +9215,10 @@ class AIAgent:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
+    # Opt-in adaptive reasoning: the decorator may adjust reasoning_config for
+    # this turn only and restores the baseline on every exit path. No-op unless
+    # agent.adaptive_reasoning is enabled and no user override is active.
+    @adaptive_reasoning_turn
     def run_conversation(
         self,
         user_message: Any,
