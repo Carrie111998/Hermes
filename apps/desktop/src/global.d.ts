@@ -32,6 +32,9 @@ declare global {
       }) => Promise<GatewayWsUrlResult>
       // Union agent roster across every registered connection.
       getAgentRoster?: () => Promise<DesktopAgentRoster>
+      // A source whose startup enumeration exceeded the UI deadline finished
+      // connecting in the background; consumers should refetch once.
+      onAgentRosterChanged?: (callback: (payload: { connectionId: string }) => void) => () => void
       // Credential-free routes across the union connection registry. The
       // optional profile list is used only by the single-local v1 fallback;
       // endpoint and auth material never crosses the IPC boundary.

@@ -14,6 +14,7 @@ const FLEET_ROSTER_STALE_MS = 60_000
 
 let fetchedAt = 0
 let inflight: null | Promise<void> = null
+let forceAfterInflight = false
 
 export async function refreshFleetRoster(options: { force?: boolean } = {}): Promise<void> {
   const bridge = window.hermesDesktop?.getAgentRoster
@@ -27,6 +28,8 @@ export async function refreshFleetRoster(options: { force?: boolean } = {}): Pro
   }
 
   if (inflight) {
+    forceAfterInflight ||= options.force === true
+
     return inflight
   }
 
@@ -42,6 +45,11 @@ export async function refreshFleetRoster(options: { force?: boolean } = {}): Pro
     })
     .finally(() => {
       inflight = null
+
+      if (forceAfterInflight) {
+        forceAfterInflight = false
+        void refreshFleetRoster({ force: true })
+      }
     })
 
   return inflight
@@ -52,4 +60,5 @@ export function _resetFleetRosterForTests(): void {
   $fleetRoster.set(null)
   fetchedAt = 0
   inflight = null
+  forceAfterInflight = false
 }

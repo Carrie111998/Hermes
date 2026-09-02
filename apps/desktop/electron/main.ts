@@ -333,6 +333,7 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { createRosterRecoverySignals } from './roster-recovery'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -11128,6 +11129,16 @@ function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'r
   }
 }
 
+function broadcastAgentRosterChanged(payload: { connectionId: string }) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:agents:roster-changed', payload)
+    }
+  }
+}
+
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return
@@ -15121,6 +15132,7 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
 const sshRosterCache = new Map<string, string[]>()
 const sshInventoryAttemptedAt = new Map<string, number>()
 const SSH_INVENTORY_RETRY_MS = 60_000
+const rosterRecoverySignals = createRosterRecoverySignals(broadcastAgentRosterChanged)
 
 // Stable backend identity per registered connection: the `install_id` its
 // /api/status reports (absent on backends older than the field). Enumeration
@@ -15231,7 +15243,11 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
       return await Promise.race([
         work,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('roster enumeration timed out')), perSourceTimeoutMs)
+          timer = setTimeout(() => {
+            const error: any = new Error('roster enumeration timed out')
+            error.code = 'roster_enumeration_timeout'
+            reject(error)
+          }, perSourceTimeoutMs)
         })
       ])
     } finally {
@@ -15243,6 +15259,8 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
 
   return Promise.all(
     registry.connections.map(async connection => {
+      let pendingDial: Promise<any> | null = null
+
       let raw: {
         connection: typeof connection
         error?: string
@@ -15283,13 +15301,12 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // Claim-guarded (#90812): this ~5s roster poll can race a renderer's
           // own reconnect dial for the same connection; coalescing avoids
           // bootstrapping a second SSH tunnel / remote dashboard.
-          const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
+          pendingDial = Promise.resolve(
+            backendDialClaims.run(backendScopeKey(connection.id, null), () =>
+              ensureRegistryBackend(connection.id, null)
             )
           )
+          const descriptor: any = await withEnumerationDeadline(pendingDial)
 
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
 
@@ -15349,6 +15366,14 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           }
         }
       } catch (error: any) {
+        // The UI deadline is intentionally shorter than a remote readiness
+        // dial. Let that dial finish in the background, then tell renderers to
+        // refetch once instead of leaving the startup roster partial until a
+        // manual connection Test/focus cycle.
+        if (error?.code === 'roster_enumeration_timeout' && pendingDial) {
+          rosterRecoverySignals.afterPendingDial(connection.id, pendingDial)
+        }
+
         raw = { connection, profiles: null, error: String(error?.message || error) }
       }
 

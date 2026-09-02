@@ -28,11 +28,13 @@ export function useFleetRoster(enabled: boolean): void {
     window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onVisibility)
     const offRegistry = window.hermesDesktop?.connections?.onChanged?.(() => void refreshFleetRoster({ force: true }))
+    const offRoster = window.hermesDesktop?.onAgentRosterChanged?.(() => void refreshFleetRoster({ force: true }))
 
     return () => {
       window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisibility)
       offRegistry?.()
+      offRoster?.()
     }
   }, [enabled])
 }
