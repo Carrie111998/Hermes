@@ -793,6 +793,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("buttons"):
+        result["buttons"] = job["buttons"]
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]
@@ -1482,6 +1484,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    buttons: Optional[List[Any]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1598,6 +1601,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    buttons=buttons,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1902,6 +1906,9 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if buttons is not None:
+                from cron.jobs import normalize_buttons
+                updates["buttons"] = normalize_buttons(buttons)
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -2029,6 +2036,23 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "buttons": {
+                "type": "array",
+                "description": "Optional inline buttons to attach to cron delivery on supported platforms (currently Telegram live gateway). Each item may be a string or an object with text and optional value. Button presses are recorded locally for later review.",
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["text"]
+                        }
+                    ]
+                }
+            },
         },
         "required": ["action"]
     }
@@ -2097,6 +2121,7 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        buttons=args.get("buttons"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )
