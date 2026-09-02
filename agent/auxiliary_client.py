@@ -6299,8 +6299,22 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
             return recovered
-        response_type = type(response).__name__
-        response_preview = str(response)[:120]
+        # Build a useful preview instead of raw str()[:120] that shows mostly None fields
+        try:
+            response_type = type(response).__name__
+            _id = getattr(response, 'id', None)
+            _model = getattr(response, 'model', None)
+            _choices = getattr(response, 'choices', None)
+            preview_parts = []
+            if _id:
+                preview_parts.append(f"id={_id!r}")
+            if _model:
+                preview_parts.append(f"model={_model!r}")
+            if _choices is None:
+                preview_parts.append("choices=None")
+            response_preview = f"{response_type}({', '.join(preview_parts)})"
+        except Exception:
+            response_preview = repr(response)[:200]
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned invalid response "
             f"(type={response_type}): {response_preview!r}. "
