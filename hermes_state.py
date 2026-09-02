@@ -276,6 +276,29 @@ def workspace_key(row: Dict[str, Any]) -> Optional[str]:
     return cwd or None
 
 
+_STATE_DB_FULL_INTEGRITY_CHECK_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def _db_full_integrity_check_skip_reason(
+    db_path: Path,
+    *,
+    max_integrity_check_bytes: int | None = _STATE_DB_FULL_INTEGRITY_CHECK_MAX_BYTES,
+) -> Optional[str]:
+    """Return a short reason when the expensive full DB scan should be skipped."""
+    if max_integrity_check_bytes is None or max_integrity_check_bytes < 0:
+        return None
+    try:
+        db_size = db_path.stat().st_size
+    except OSError:
+        return None
+    if db_size <= max_integrity_check_bytes:
+        return None
+    return (
+        f"{db_size // (1024 * 1024)} MB exceeds "
+        f"{max_integrity_check_bytes // (1024 * 1024)} MB"
+    )
+
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
@@ -3469,16 +3492,20 @@ def _copy_database_snapshot(
             source.close()
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    max_integrity_check_bytes: int | None = _STATE_DB_FULL_INTEGRITY_CHECK_MAX_BYTES,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
-    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
-    ``sessions`` read, and finally a rolled-back ``messages`` write so that
-    FTS5 index corruption — which leaves base-table reads and
-    ``integrity_check`` passing while every ``INSERT INTO messages`` fails
-    through the FTS triggers — is reported as unhealthy rather than slipping
-    past as a false "ok" (#50502).
+    malformed-schema parse, then a bounded ``PRAGMA integrity_check`` for
+    ordinary-sized DBs, a canonical ``sessions`` read, and finally a
+    rolled-back ``messages`` write + FTS lookup so that FTS5 index corruption
+    — which leaves base-table reads passing while message persistence/search
+    fails through the FTS triggers — is reported as unhealthy rather than
+    slipping past as a false "ok" (#50502).
     """
     conn = _connect_repair_durable(db_path)
     try:
@@ -3490,10 +3517,14 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # working), so tokenizer absence must never classify as corruption.
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-        if problems:
-            return "; ".join(problems[:3])
+        if _db_full_integrity_check_skip_reason(
+            db_path,
+            max_integrity_check_bytes=max_integrity_check_bytes,
+        ) is None:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+            if problems:
+                return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
         # FTS5 read probe: run a representative MATCH query against the
@@ -3560,6 +3591,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # new file mid-init) the OperationalError is treated as "not yet a
         # populated DB", not corruption.
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        probe_content = "hermesftshealthprobe"
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
@@ -3569,10 +3601,14 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp) "
                 "VALUES (?, ?, ?, ?)",
-                (probe_session_id, "user", "_fts_health_probe", time.time()),
+                (probe_session_id, "user", probe_content, time.time()),
+            )
+            conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ? LIMIT 1",
+                (probe_content,),
             )
             conn.execute("ROLLBACK")
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
             # Missing tables / FTS disabled — not the corruption class we probe.
             try:
                 conn.execute("ROLLBACK")

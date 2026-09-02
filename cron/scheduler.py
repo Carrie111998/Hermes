@@ -631,7 +631,9 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return None
 
 
-def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
+def _resolve_job_reasoning_config(
+    job: dict, cfg: dict, model: str, provider: str = ""
+) -> dict | None:
     """Resolve the effective reasoning config for a cron run.
 
     Precedence: per-job ``reasoning_effort`` pin (validated at the store
@@ -670,7 +672,9 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
             pinned,
             job.get("id", "?"),
         )
-    return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
+    return resolve_reasoning_config(
+        cfg if isinstance(cfg, dict) else {}, str(model), provider
+    )
 
 
 # Valid delivery platforms — used to validate user-supplied platform names
@@ -6504,7 +6508,10 @@ def run_job(
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
         reasoning_config = _resolve_job_reasoning_config(
-            job, _cfg if isinstance(_cfg, dict) else {}, str(model)
+            job,
+            _cfg if isinstance(_cfg, dict) else {},
+            str(model),
+            str(runtime.get("provider") or ""),
         )
 
         # Provider/model-drift fail-closed guard (#44585).

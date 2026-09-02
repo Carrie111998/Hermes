@@ -424,6 +424,14 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    repo_dir: Optional[Path] = None
+    git_head: Optional[str] = None
+    if not embedded_rev:
+        # Track the active checkout and its HEAD so a same-version source
+        # update (no pyproject version bump) still invalidates the cache.
+        repo_dir = _resolve_repo_dir()
+        if repo_dir is not None:
+            git_head = _read_git_head_for_cache(repo_dir)
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
@@ -449,6 +457,8 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("repo") == (str(repo_dir) if repo_dir else None)
+                and cached.get("git_head") == git_head
             ):
                 return cached.get("behind")
     except Exception:
@@ -479,13 +489,45 @@ def check_for_updates() -> Optional[int]:
         # connectivity is restored (#82166).
         if behind is not None:
             cache_file.write_text(
-                json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
+                json.dumps(
+                    {
+                        "ts": now,
+                        "behind": behind,
+                        "rev": embedded_rev,
+                        "ver": VERSION,
+                        "repo": str(repo_dir) if repo_dir else None,
+                        "git_head": git_head,
+                    }
+                ),
                 encoding="utf-8",
             )
     except Exception:
         pass
 
     return behind
+
+
+def _read_git_head_for_cache(repo_dir: Path) -> Optional[str]:
+    """Read the local git HEAD cheaply for update-cache invalidation."""
+    git_entry = repo_dir / ".git"
+    try:
+        if git_entry.is_file():
+            text = git_entry.read_text().strip()
+            if not text.startswith("gitdir:"):
+                return None
+            git_dir = (repo_dir / text.split(":", 1)[1].strip()).resolve()
+        else:
+            git_dir = git_entry
+
+        head_text = (git_dir / "HEAD").read_text().strip()
+        if head_text.startswith("ref:"):
+            ref_path = git_dir / head_text[4:].strip()
+            if not ref_path.exists():
+                return None
+            return ref_path.read_text().strip()
+        return head_text
+    except OSError:
+        return None
 
 
 def _resolve_repo_dir() -> Optional[Path]:

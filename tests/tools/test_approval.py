@@ -983,6 +983,30 @@ class TestPgrepKillExpansion:
         assert dangerous is False
 
 
+class TestLiteralPidSelfTermination:
+    """Literal PIDs from ``ps`` must not bypass Hermes host protection."""
+
+    def test_kill_current_process_or_parent_detected(self, monkeypatch):
+        monkeypatch.setattr("tools.approval.os.getpid", lambda: 36902)
+        monkeypatch.setattr("tools.approval.os.getppid", lambda: 36206)
+
+        for command in (
+            "kill 36902 && echo restarted",
+            "kill -TERM 36206",
+            "sudo kill -- 36902",
+        ):
+            dangerous, _, description = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert "self-termination" in description
+
+    def test_unrelated_literal_pid_and_quoted_text_stay_safe(self, monkeypatch):
+        monkeypatch.setattr("tools.approval.os.getpid", lambda: 36902)
+        monkeypatch.setattr("tools.approval.os.getppid", lambda: 36206)
+
+        assert detect_dangerous_command("kill 12345")[0] is False
+        assert detect_dangerous_command('echo "kill 36902"')[0] is False
+
+
 class TestLaunchctlGatewayLifecycle:
     """launchctl stop/kickstart/bootout/unload against the Hermes service
     label achieves the same effect as `hermes gateway stop|restart` and

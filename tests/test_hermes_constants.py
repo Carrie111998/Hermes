@@ -506,6 +506,41 @@ class TestResolveReasoningConfig:
         assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "medium"}
 
 
+    def test_opencode_provider_defaults_to_max(self):
+        """Free/Go/Zen default to max before model-specific wire clamping."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="high")
+        for provider in ("opencode-free", "opencode-go", "opencode-zen"):
+            assert resolve_reasoning_config(
+                cfg, "some-model", provider
+            ) == {"enabled": True, "effort": "max"}
+
+    def test_custom_opencode_family_defaults_to_max(self):
+        """Custom OpenCode-family providers inherit the provider default."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="high")
+        assert resolve_reasoning_config(
+            cfg, "grok-4.5", "custom:opencode-go-bridge"
+        ) == {"enabled": True, "effort": "max"}
+
+    def test_non_opencode_provider_keeps_global_effort(self):
+        """Only the OpenCode family gets the stronger provider default."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="high")
+        for provider in ("openrouter", "nous", "opencode-something-else"):
+            assert resolve_reasoning_config(
+                cfg, "gpt-5", provider
+            ) == {"enabled": True, "effort": "high"}
+
+    def test_per_model_override_beats_opencode_default(self):
+        """A user-pinned model effort still wins over provider max."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="high", overrides={"foo": "low"})
+        assert resolve_reasoning_config(cfg, "foo", "opencode-go") == {
+            "enabled": True, "effort": "low"
+        }
+
+
 class TestReasoningOverridesDefaultConfig:
     """Tests for the agent.reasoning_overrides default config key (Task 2)."""
 

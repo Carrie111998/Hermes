@@ -14,25 +14,79 @@ import pytest
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache is fresh, check_for_updates should return cached value without calling git."""
-    from hermes_cli.banner import check_for_updates
+    import hermes_cli.banner as banner
     from hermes_cli import __version__
 
     # Create a fake git repo and fresh cache
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
+    (repo_dir / ".git" / "HEAD").write_text("local-head\n")
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir()
+    fake_banner.touch()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 3,
+                "ver": __version__,
+                "rev": None,
+                "repo": str(repo_dir),
+                "git_head": "local-head",
+            }
+        )
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
+        result = banner.check_for_updates()
 
     assert result == 3
     mock_run.assert_not_called()
 
 
+def test_check_for_updates_invalidates_on_git_head_change(tmp_path, monkeypatch):
+    """Same-version source updates must not reuse the old behind-count cache."""
+    import hermes_cli.banner as banner
+    from hermes_cli import __version__
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    (repo_dir / ".git" / "HEAD").write_text("new-head\n")
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir()
+    fake_banner.touch()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 69,
+                "rev": None,
+                "ver": __version__,
+                "repo": str(repo_dir),
+                "git_head": "old-head",
+            }
+        )
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="0\n")
+        result = banner.check_for_updates()
+
+    assert result == 0
+    assert mock_run.called
+    written = json.loads(cache_file.read_text())
+    assert written["git_head"] == "new-head"
 
 
 
@@ -243,7 +297,6 @@ def test_check_for_updates_does_not_cache_none(tmp_path, monkeypatch):
 
     # The cache file must NOT have been written with a None result
     assert not cache_file.exists(), "None result must not be cached"
-
 
 
 

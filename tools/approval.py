@@ -2537,6 +2537,25 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
         return False
     return contains_gateway_lifecycle_command(command)
 
+def _literal_kill_targets_current_host(command: str) -> bool:
+    """Return whether a shell ``kill`` targets this Hermes host process.
+
+    Name-based guards catch ``pkill hermes`` but cannot recognize a literal
+    PID copied from ``ps`` output.  Protect only this process and its direct
+    parent so ordinary child-process cleanup remains unaffected.
+    """
+    protected = {pid for pid in (os.getpid(), os.getppid()) if pid > 1}
+    if not protected:
+        return False
+
+    pid_alternation = "|".join(str(pid) for pid in sorted(protected))
+    pattern = re.compile(
+        rf"{_CMDPOS}kill\s+(?:(?:-[^\s;|&]+|--signal(?:=[^\s;|&]+)?)\s+)*"
+        rf"(?:--\s+)?(?:{pid_alternation})(?=\s|$|[;|&])",
+        re.IGNORECASE,
+    )
+    return any(pattern.search(variant) for variant in _command_detection_variants(command))
+
 
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
@@ -2548,6 +2567,9 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    if _literal_kill_targets_current_host(command):
+        description = "kill the current Hermes host process by PID (self-termination)"
+        return (True, description, description)
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()

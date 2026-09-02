@@ -5992,6 +5992,7 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            provider=str(runtime_kwargs.get("provider") or ""),
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -10408,7 +10409,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return self._load_ephemeral_system_prompt()
 
     @staticmethod
-    def _load_reasoning_config(model: str = "") -> dict | None:
+    def _load_reasoning_config(model: str = "", provider: str = "") -> dict | None:
         """Load reasoning effort from config.yaml, respecting per-model overrides.
 
         Thin wrapper over the shared chokepoint
@@ -10419,10 +10420,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Args:
             model: The effective model for the calling session. When empty,
                    the config's ``model.default`` is used.
+            provider: The effective provider, when known; OpenCode defaults to max.
         """
         from hermes_constants import resolve_reasoning_config
         cfg = _load_gateway_runtime_config()
-        return resolve_reasoning_config(cfg, model)
+        return resolve_reasoning_config(cfg, model, provider)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -10456,6 +10458,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        provider: str = "",
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
@@ -10477,7 +10480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-        return self._load_reasoning_config(model)
+        return self._load_reasoning_config(model, provider)
 
     def _set_session_reasoning_override(
         self,
@@ -25394,7 +25397,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(
-                source=source, model=model
+                source=source, model=model,
+                provider=str(runtime_kwargs.get("provider") or ""),
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)

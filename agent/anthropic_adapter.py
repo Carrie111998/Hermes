@@ -152,7 +152,18 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# Manual-thinking budget table for pre-4.6 Anthropic-compatible models
+# (MiniMax, Qwen, older Claude). max/ultra reuse the existing xhigh ceiling
+# so a strongest-effort request cannot fall through to the weak default and
+# become weaker than an explicit high.
+THINKING_BUDGET = {
+    "ultra": 32000,
+    "max": 32000,
+    "xhigh": 32000,
+    "high": 16000,
+    "medium": 8000,
+    "low": 4000,
+}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
 # Opus/Sonnet 4.6 only expose 4 levels: low, medium, high, max — no xhigh.

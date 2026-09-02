@@ -294,6 +294,28 @@ def test_fts_write_corruption_detected_by_write_probe(tmp_path):
     assert reason is not None
 
 
+def test_large_db_probe_skips_full_integrity_scan_but_keeps_write_probe(tmp_path):
+    """Large DBs skip the expensive full scan without skipping write health."""
+    from hermes_state import (
+        _db_full_integrity_check_skip_reason,
+        _db_opens_cleanly,
+    )
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    assert _db_full_integrity_check_skip_reason(
+        db_path,
+        max_integrity_check_bytes=0,
+    )
+    assert _db_opens_cleanly(db_path, max_integrity_check_bytes=0) is None
+
+    _corrupt_fts_index_data(db_path)
+
+    reason = _db_opens_cleanly(db_path, max_integrity_check_bytes=0)
+    assert reason is not None
+
+
 def test_fts_write_corruption_repaired_in_place(tmp_path):
     """repair_state_db_schema rebuilds the FTS index; reads + writes resume."""
     from hermes_state import _db_opens_cleanly
@@ -382,7 +404,9 @@ def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     # The real detector must see the real corruption...
     reason = hermes_state._db_opens_cleanly(db_path)
     assert reason is not None
-    assert "wrong # of entries in index idx_messages_session" in reason
+    # SQLite wording varies by linked version; the behavioral contract is
+    # that the damaged index is identified, not one exact English sentence.
+    assert "idx_messages_session" in reason
 
     # ...and the real repair ladder must fix it via REINDEX.
     report = repair_state_db_schema(db_path)

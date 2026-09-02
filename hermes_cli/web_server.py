@@ -6246,7 +6246,11 @@ def _declared_field_is_set(field: ProviderField, sources: tuple, env: Dict[str, 
 def _honcho_resolvers():
     """Lazily import the Honcho plugin's resolvers (optional plugin)."""
 
-    from plugins.memory.honcho.client import _host_block, resolve_active_host, resolve_config_path
+    try:
+        from plugins.memory.honcho.client import _host_block, resolve_active_host, resolve_config_path
+    except ModuleNotFoundError:
+        # Honcho plugin retired in this installation; treat as unconfigured.
+        return None, None, None
 
     return resolve_active_host, resolve_config_path, _host_block
 
@@ -6255,6 +6259,8 @@ def _honcho_read_sources() -> tuple[Dict[str, Any], str, Dict[str, Any]]:
     """Return (root config, active host key, host block) for the current profile."""
 
     resolve_active_host, resolve_config_path, host_block_of = _honcho_resolvers()
+    if not (resolve_active_host and resolve_config_path and host_block_of):
+        return {}, "", {}
     host = resolve_active_host()
     path = resolve_config_path()
     raw: Dict[str, Any] = {}
@@ -6357,10 +6363,15 @@ def _write_provider_honcho(provider: ProviderConfigSchema, values: Dict[str, str
     text clears a key so it falls back to the host/default mapping.
     """
 
-    from plugins.memory.honcho.oauth import ACCESS_TOKEN_PREFIX, _config_refresh_lock
     from utils import atomic_json_write
 
     resolve_active_host, resolve_config_path, host_block_of = _honcho_resolvers()
+    if not (resolve_active_host and resolve_config_path and host_block_of):
+        raise ValueError("Honcho plugin is not installed; cannot write Honcho-hosted provider settings")
+    try:
+        from plugins.memory.honcho.oauth import ACCESS_TOKEN_PREFIX, _config_refresh_lock
+    except ModuleNotFoundError:
+        raise ValueError("Honcho plugin is not installed; cannot write Honcho-hosted provider settings")
     host = resolve_active_host()
     # Write the file reads resolve, or a save shadows it with a sparse copy.
     path = resolve_config_path()

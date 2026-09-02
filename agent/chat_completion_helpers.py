@@ -3042,7 +3042,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             from hermes_constants import resolve_reasoning_config
 
             agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
+                load_config() or {}, agent.model, agent.provider
             )
             logger.info(
                 "Fallback %s: reasoning_config resolved: %s",
