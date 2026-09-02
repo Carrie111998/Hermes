@@ -63,6 +63,18 @@
       "capabilities": ["tools"],
       "api_version": 1,
       "added_at": "2026-08-12"
+    },
+    {
+      "name": "hermes-rbac",
+      "description": "Role-based access control for multi-user Hermes gateways — per-user tool/skill permissions, role inheritance, cross-platform identity linking, fail-closed by default, audit log.",
+      "author": "TTomas78",
+      "tags": ["rbac", "multi-user", "permissions", "security", "gateway"],
+      "repo": "TTomas78/hermes-rbac",
+      "ref": "c1d6b33ef5d08be17e7b2c8cec00f19c9f232d94",
+      "homepage": "https://github.com/TTomas78/hermes-rbac",
+      "capabilities": ["commands", "hooks"],
+      "api_version": 1,
+      "added_at": "2026-08-24"
     }
   ]
 }
