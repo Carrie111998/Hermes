@@ -35,6 +35,7 @@ import { queryClient } from '@/lib/query-client'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { cn } from '@/lib/utils'
 import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { $hubActions, installHubSkill, OFFICIAL_SKILLS_KEY } from '@/store/hub-actions'
 import { notify, notifyError } from '@/store/notifications'
@@ -66,6 +67,7 @@ import { TerminalBackendPanel } from '../settings/terminal-backend-panel'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
+import { CollectiveTab } from './collective-tab'
 import { EmbeddedHubPicker } from './embedded-hub-picker'
 import { McpTab } from './mcp-tab'
 import { $skillsSortDesc, $toolsetsSortDesc } from './store'
@@ -73,7 +75,7 @@ import { $skillsSortDesc, $toolsetsSortDesc } from './store'
 // 'hub' is gone as a top-level tab — the Skills Hub browser lives inside the
 // Skills tab now (EmbeddedHubPicker below the installed list). Legacy
 // `?tab=hub` links fall back to 'skills' via useRouteEnumParam.
-const SKILLS_MODES = ['skills', 'toolsets', 'mcp'] as const
+const SKILLS_MODES = ['skills', 'toolsets', 'mcp', 'collective'] as const
 
 // Skills + toolsets live in the RQ cache so switching tabs/pages paints the
 // cached lists instantly (no reload flash) and mount only fires a deduped
@@ -849,12 +851,19 @@ export function SkillsView({
       // searching it is noise.
       searchHidden={mode === 'mcp'}
       searchHints={searchHints}
-      searchPlaceholder={mode === 'skills' ? t.skills.searchSkills : t.skills.searchToolsets}
+      searchPlaceholder={
+        mode === 'skills'
+          ? t.skills.searchSkills
+          : mode === 'collective'
+            ? t.skills.searchCollective
+            : t.skills.searchToolsets
+      }
       searchValue={query}
       tabs={[
         { id: 'skills', label: t.skills.tabSkills, meta: skills?.length ?? null },
         { id: 'toolsets', label: t.skills.tabToolsets, meta: toolsets ? visibleToolsetCount(toolsets) : null },
-        { id: 'mcp', label: t.skills.tabMcp }
+        { id: 'mcp', label: t.skills.tabMcp },
+        { id: 'collective', label: t.skills.tabCollective }
       ]}
     >
       {/* One shared column: the scope selector sits above whichever tab is
@@ -863,8 +872,10 @@ export function SkillsView({
       <div className="flex h-full flex-col">
         {profileScopeSelector}
         <div className="flex min-h-0 flex-1 flex-col">
-          <div className={mode === 'skills' ? 'min-h-40 flex-1 overflow-hidden' : 'min-h-0 flex-1'}>
-            {mode === 'mcp' ? (
+          <div className={cn(mode === 'skills' ? 'min-h-40 flex-1 overflow-hidden' : 'min-h-0 flex-1', 'relative')}>
+            {mode === 'collective' ? (
+              <CollectiveTab profile={scopeProfile} query={query} />
+            ) : mode === 'mcp' ? (
               // The gateway instance backs ONLY the live `reload.mcp` RPC, and
               // it is the ACTIVE gateway's socket — for a scope pinned to a
               // different backend that RPC would hot-reload the wrong

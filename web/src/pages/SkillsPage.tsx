@@ -42,6 +42,7 @@ import type {
 import { useProfileScope } from "@/contexts/useProfileScope";
 import { ToolsetConfigDrawer } from "@/components/ToolsetConfigDrawer";
 import { SkillEditorDialog } from "@/components/SkillEditorDialog";
+import { CollectiveWisdomPanel } from "@/components/CollectiveWisdomPanel";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
@@ -130,7 +131,7 @@ export default function SkillsPage() {
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [view, setView] = useState<"skills" | "toolsets" | "hub">("skills");
+  const [view, setView] = useState<"skills" | "toolsets" | "hub" | "collective">("skills");
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [togglingSkills, setTogglingSkills] = useState<Set<string>>(new Set());
   const [configToolset, setConfigToolset] = useState<ToolsetInfo | null>(null);
@@ -415,10 +416,19 @@ export default function SkillsPage() {
                 />
                 <PanelItem
                   icon={Search}
-                  label="Browse hub"
+                  label={t.skills.wisdom.browseHub}
                   active={view === "hub"}
                   onClick={() => {
                     setView("hub");
+                    setSearch("");
+                  }}
+                />
+                <PanelItem
+                  icon={Sparkles}
+                  label={t.skills.wisdom.tab}
+                  active={view === "collective"}
+                  onClick={() => {
+                    setView("collective");
                     setSearch("");
                   }}
                 />
@@ -566,6 +576,8 @@ export default function SkillsPage() {
                 )}
               </CardContent>
             </Card>
+          ) : view === "collective" ? (
+            <CollectiveWisdomPanel profile={selectedProfile || undefined} />
           ) : view === "toolsets" ? (
             /* Toolsets grid */
             <>
