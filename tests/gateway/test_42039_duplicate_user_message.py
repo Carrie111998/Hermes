@@ -24,7 +24,13 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, TranscriptReadError
+from gateway.session import (
+    AsyncSessionStore,
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    TranscriptReadError,
+)
 
 
 def _bootstrap(monkeypatch, tmp_path):
@@ -201,6 +207,66 @@ async def test_transcript_read_failure_stops_turn_before_agent_or_append(
     assert "not processed" in response
     runner._run_agent.assert_not_awaited()
     runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_real_sqlite_read_failure_releases_outer_gateway_turn(
+    monkeypatch, tmp_path
+):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    config = GatewayConfig()
+    runner = gateway_run.GatewayRunner(config)
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner._run_agent = AsyncMock()
+
+    source = _source()
+    existing = await runner.async_session_store.get_or_create_session(source)
+    await runner.async_session_store.append_to_transcript(
+        existing.session_id, {"role": "user", "content": "persisted history"}
+    )
+    history = await runner.async_session_store.load_transcript(existing.session_id)
+    assert len(history) == 1
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "persisted history"
+
+    empty_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1002",
+        chat_type="group",
+        user_id="12345",
+    )
+    empty = await runner.async_session_store.get_or_create_session(empty_source)
+    assert await runner.async_session_store.load_transcript(empty.session_id) == []
+
+    append_spy = MagicMock(wraps=store.append_to_transcript)
+    store.append_to_transcript = append_spy
+    db = store._db
+    assert db is not None
+    with db._lock:
+        db._conn.execute("DROP TABLE messages")
+        db._conn.commit()
+
+    response = await runner._handle_message(_event())
+
+    assert "history is temporarily unavailable" in response
+    assert "not processed" in response
+    runner._run_agent.assert_not_awaited()
+    append_spy.assert_not_called()
+
+    session_key = existing.session_key
+    state = runner._peek_session_state(session_key)
+    assert state is not None
+    assert state.turn.agent is None
+    assert state.turn.lease is None
+    assert not any(key[0] == session_key for key in runner._turn_lease_tokens)
 
 
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────
