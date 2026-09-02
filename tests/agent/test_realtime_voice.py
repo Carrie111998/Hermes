@@ -126,6 +126,7 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
     await coordinator.send_audio(b"user-pcm")
     await coordinator.add_context("progress-1", "checked repository")
     observed = [event async for event in coordinator.events()]
+    await asyncio.gather(*coordinator._tool_tasks.values())
     await coordinator.close()
 
     assert provider.opened_with == {
@@ -253,6 +254,7 @@ async def test_coordinator_logs_dispatch_failures_with_tool_context(
     coordinator = RealtimeVoiceCoordinator(FakeProvider("fake", session), dispatch_tool=dispatch)
     await coordinator.open(instructions="", tools=[])
     events = [event async for event in coordinator.events()]
+    await asyncio.gather(*coordinator._tool_tasks.values())
 
     assert len(events) == 1
     assert session.tool_results == [("call-2", "Error: approval denied")]
@@ -309,6 +311,11 @@ async def test_tool_dispatch_does_not_block_later_realtime_events():
     release.set()
     with pytest.raises(StopAsyncIteration):
         await anext(events)
+    async def wait_for_result() -> None:
+        while not session.tool_results:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_result(), timeout=0.1)
     assert session.tool_results == [("call-1", "done")]
 
 
@@ -328,6 +335,7 @@ async def test_duplicate_tool_call_is_dispatched_exactly_once():
     )
     await coordinator.open(instructions="", tools=[])
     assert len([event async for event in coordinator.events()]) == 2
+    await asyncio.gather(*coordinator._tool_tasks.values())
 
     assert dispatched == 1
     assert session.tool_results == [("call-1", "done")]
@@ -348,3 +356,162 @@ async def test_tool_call_id_reuse_with_different_arguments_fails_closed():
 
     with pytest.raises(ValueError, match="reused with different arguments"):
         _ = [event async for event in coordinator.events()]
+
+
+@pytest.mark.asyncio
+async def test_sync_tool_dispatch_runs_off_the_event_loop():
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    session = FakeSession(
+        [
+            RealtimeEvent.tool_call("call-sync", "terminal", {}),
+            RealtimeEvent.transcript("next event"),
+        ]
+    )
+
+    def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
+        started.set()
+        release.wait()
+        return "done"
+
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=dispatch
+    )
+    await coordinator.open(instructions="", tools=[])
+    events = coordinator.events()
+    assert (await anext(events)).type is RealtimeEventType.TOOL_CALL
+    assert (
+        await asyncio.wait_for(anext(events), timeout=0.1)
+    ).type is RealtimeEventType.TRANSCRIPT
+    assert started.wait(timeout=1)
+    release.set()
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_eof_does_not_wait_for_pending_tool():
+    release = asyncio.Event()
+    session = FakeSession([RealtimeEvent.tool_call("pending", "terminal", {})])
+
+    async def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
+        await release.wait()
+        return "done"
+
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=dispatch
+    )
+    await coordinator.open(instructions="", tools=[])
+    assert len(await asyncio.wait_for(
+        _collect_events(coordinator), timeout=0.1
+    )) == 1
+    assert session.tool_results == []
+    await coordinator.close()
+
+
+async def _collect_events(
+    coordinator: RealtimeVoiceCoordinator,
+) -> list[RealtimeEvent]:
+    return [event async for event in coordinator.events()]
+
+
+@pytest.mark.asyncio
+async def test_close_rejects_buffered_events_and_stale_tool_effects():
+    release_event = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    class BufferedSession(FakeSession):
+        async def events(self) -> AsyncIterator[RealtimeEvent]:
+            await release_event.wait()
+            yield RealtimeEvent.audio(b"stale", item_id="old")
+
+    session = BufferedSession([])
+
+    async def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
+        await release_tool.wait()
+        return "stale result"
+
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=dispatch
+    )
+    await coordinator.open(instructions="", tools=[])
+    events = coordinator.events()
+    pending_event = asyncio.create_task(anext(events))
+    await asyncio.sleep(0)
+    coordinator._start_tool_dispatch(
+        RealtimeEvent.tool_call("stale-call", "terminal", {}),
+        session,
+        coordinator._generation,
+    )
+    await coordinator.close()
+    release_event.set()
+    release_tool.set()
+    with pytest.raises(StopAsyncIteration):
+        await pending_event
+    assert session.tool_results == []
+
+
+@pytest.mark.asyncio
+async def test_completed_duplicate_is_not_resubmitted():
+    duplicate = RealtimeEvent.tool_call("duplicate", "terminal", {})
+    session = FakeSession([duplicate, duplicate])
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "done"
+    )
+    await coordinator.open(instructions="", tools=[])
+    events = coordinator.events()
+    await anext(events)
+    await asyncio.gather(*coordinator._tool_tasks.values())
+    await anext(events)
+    assert session.tool_results == [("duplicate", "done")]
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_result_submission_failure_is_observed(
+    caplog: pytest.LogCaptureFixture,
+):
+    class FailingSubmissionSession(FakeSession):
+        async def submit_tool_result(self, call_id: str, output: str) -> None:
+            raise RuntimeError("provider disconnected")
+
+    session = FailingSubmissionSession(
+        [RealtimeEvent.tool_call("failed-submit", "terminal", {})]
+    )
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "done"
+    )
+    await coordinator.open(instructions="", tools=[])
+    await _collect_events(coordinator)
+    await asyncio.gather(
+        *coordinator._tool_tasks.values(), return_exceptions=True
+    )
+    assert any(
+        record.getMessage() == "Realtime voice tool result submission failed"
+        and record.__dict__["call_id"] == "failed-submit"
+        and record.exc_info is not None
+        for record in caplog.records
+    )
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_dedupe_and_output_are_bounded():
+    session = FakeSession(
+        [RealtimeEvent.tool_call(f"call-{index}", "terminal", {}) for index in range(8)]
+    )
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session),
+        dispatch_tool=lambda _name, _args: "x" * 1000,
+        max_in_flight_tool_calls=8,
+        max_completed_tool_calls=3,
+    )
+    await coordinator.open(instructions="", tools=[])
+    await _collect_events(coordinator)
+    await asyncio.gather(*coordinator._tool_tasks.values())
+    assert len(coordinator._completed_tool_calls) == 3
+    assert list(coordinator._completed_tool_calls) == ["call-5", "call-6", "call-7"]
+    assert "x" * 1000 not in repr(coordinator._completed_tool_calls)
+    assert coordinator._tool_calls == {}
+    await coordinator.close()
