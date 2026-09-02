@@ -3653,22 +3653,31 @@ class SlackAdapter(BasePlatformAdapter):
                 getattr(self, "_status_text", {}).get(str(chat_id))
                 or getattr(self.config, "typing_status_text", None)
             )
+            _elapsed = (
+                int(time.monotonic() - _status_started)
+                if _status_started is not None
+                else 0
+            )
             if not _status:
                 # Heartbeat (#45702): once a turn has run for 30s+, replace
-                # the static default with visible elapsed progress. Only the
-                # fallback label changes — explicit live-status phrases and
-                # configured typing_status_text always win.
-                _elapsed = (
-                    int(time.monotonic() - _status_started)
-                    if _status_started is not None
-                    else 0
-                )
+                # the static default with visible elapsed progress.
                 if _elapsed >= 30:
                     _mins, _secs = divmod(_elapsed, 60)
                     _human = f"{_mins}m{_secs:02d}s" if _mins else f"{_secs}s"
                     _status = f"still working… ({_human})"
                 else:
                     _status = "is thinking..."
+            elif _elapsed >= 30:
+                # Preserve the sanitized live stage while making elapsed work
+                # visible. Keep the complete status within Slack's 50-character
+                # status surface so the elapsed suffix cannot be truncated.
+                _mins, _secs = divmod(_elapsed, 60)
+                _human = f"{_mins}m{_secs:02d}s" if _mins else f"{_secs}s"
+                _suffix = f" ({_human})"
+                _base_limit = 50 - len(_suffix)
+                if len(_status) > _base_limit:
+                    _status = _status[: max(1, _base_limit - 1)].rstrip(" …") + "…"
+                _status = f"{_status}{_suffix}"
             await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,

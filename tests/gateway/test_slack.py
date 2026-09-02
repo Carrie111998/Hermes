@@ -2363,6 +2363,42 @@ class TestSendTyping:
         )
 
     @pytest.mark.asyncio
+    async def test_live_status_keeps_sanitized_stage_and_adds_elapsed_time(self, adapter, monkeypatch):
+        import time as _time
+
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        clock = [3000.0]
+        monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
+
+        adapter.set_status_text("C123", "is running checks…")
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        clock[0] += 95
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+
+        assert (
+            adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
+            == "is running checks… (1m35s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_elapsed_suffix_stays_visible_with_maximum_length_stage(self, adapter, monkeypatch):
+        import time as _time
+
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        clock = [4000.0]
+        monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
+
+        adapter.set_status_text("C123", "is running " + "x" * 36 + "…")
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        clock[0] += 95
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+
+        status = adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
+        assert len(status) <= 50
+        assert status.endswith(" (1m35s)")
+        assert status.startswith("is running ")
+
+    @pytest.mark.asyncio
     async def test_heartbeat_resets_after_stop_typing(self, adapter, monkeypatch):
         """stop_typing ends the turn — the next turn starts a fresh clock."""
         import time as _time

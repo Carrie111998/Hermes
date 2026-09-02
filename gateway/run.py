@@ -4886,6 +4886,7 @@ class TurnRunner:
                     _phrase = build_status_phrase(
                         tool_name,
                         args if ctx._live_status_mode == "full" else None,
+                        safe=ctx._live_status_mode == "safe",
                     )
                     ctx._live_status_adapter.set_status_text(ctx.source.chat_id, _phrase)
                 elif event_type == "tool.completed":

@@ -524,7 +524,8 @@ display:
   platforms:
     slack:
       # full = verb + argument ("is running pytest…")   [default]
-      # verb = verb only ("is running…") — hides commands/paths,
+      # verb = verb only ("is running…") — hides commands/paths
+      # safe = fixed activity categories; hides arguments and unknown tool names,
       #        useful in shared or customer-facing channels
       # off  = static text (typing_status_text or "is thinking...")
       live_status: full
@@ -532,7 +533,7 @@ display:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `display.live_status` | `"full"` | Live per-tool status line. `full` shows verb + argument preview; `verb` shows the verb only (keeps file paths and commands out of shared channels); `off` restores the static text. Requires the `assistant:write` scope, same as the static status line. |
+| `display.live_status` | `"full"` | Live per-tool status line. `full` shows verb + argument preview; `verb` shows the verb only; `safe` uses a closed set of argument-free activity categories and hides unknown plugin/MCP names; `off` restores the static text. Elapsed time is appended after 30 seconds. Requires the `assistant:write` scope, same as the static status line. |
 
 ### Native Streaming (live-typing replies)
 

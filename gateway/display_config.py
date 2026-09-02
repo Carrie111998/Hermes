@@ -63,6 +63,8 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     #   "full" / true  -> verb + argument preview ("is running pytest…")
     #   "verb"         -> verb only ("is running…") — keeps file paths and
     #                     commands out of shared channels
+    #   "safe"         -> fixed argument-free activity categories; unknown
+    #                     plugin/MCP names become "is working…"
     #   "off" / false  -> static text (typing_status_text or "is thinking...")
     # Independent of tool_progress: works even when progress bubbles are off
     # (Slack's default), and costs no extra API calls — the existing typing
@@ -297,7 +299,8 @@ def _normalise(setting: str, value: Any) -> Any:
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
     if setting == "live_status":
-        # Tri-state: "full" (verb + preview), "verb" (verb only), "off".
+        # "full" (verb + preview), "verb" (verb only), "safe" (closed,
+        # argument-free categories), or "off".
         if value is True:
             return "full"
         if value is False:
@@ -307,7 +310,7 @@ def _normalise(setting: str, value: Any) -> Any:
             return "full"
         if val in {"false", "0", "no"}:
             return "off"
-        return val if val in {"full", "verb", "off"} else "full"
+        return val if val in {"full", "verb", "safe", "off"} else "full"
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"

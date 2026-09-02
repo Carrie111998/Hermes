@@ -296,6 +296,15 @@ class TestBuildStatusPhrase:
         assert build_status_phrase("terminal", None) == "is running…"
         assert build_status_phrase("read_file", None) == "is reading…"
 
+    def test_safe_mode_uses_bounded_categories_without_args_or_tool_names(self):
+        from agent.display import build_status_phrase
+
+        secret = "/private/path --token=secret-value"
+        assert build_status_phrase("read_file", {"path": secret}, safe=True) == "is inspecting project…"
+        assert build_status_phrase("terminal", {"command": secret}, safe=True) == "is running checks…"
+        assert build_status_phrase("delegate_task", {"goal": secret}, safe=True) == "is waiting on delegated work…"
+        assert build_status_phrase("custom_private_mcp", {"token": secret}, safe=True) == "is working…"
+
 
 
     def test_caps_length_for_slack_status_line(self):

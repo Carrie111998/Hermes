@@ -663,6 +663,31 @@ _TOOL_VERBS: dict[str, str] = {
     "todo_list": "Updating tasks",
 }
 
+# Argument-free categories for status surfaces in shared or sensitive lanes.
+# The mapping is intentionally closed: unknown plugin/MCP names become the
+# generic "Working" category rather than leaking an implementation name.
+_SAFE_STATUS_CATEGORIES: dict[str, str] = {
+    "web_search": "Searching references",
+    "web_extract": "Searching references",
+    "search_files": "Inspecting project",
+    "session_search": "Searching references",
+    "skill_view": "Searching references",
+    "skills_list": "Searching references",
+    "browser_navigate": "Inspecting project",
+    "browser_click": "Inspecting project",
+    "read_file": "Inspecting project",
+    "vision_analyze": "Inspecting project",
+    "write_file": "Editing",
+    "patch": "Editing",
+    "browser_type": "Editing",
+    "terminal": "Running checks",
+    "execute_code": "Running checks",
+    "image_generate": "Building",
+    "video_generate": "Building",
+    "text_to_speech": "Building",
+    "delegate_task": "Waiting on delegated work",
+}
+
 # Verbs that read better without the raw argument preview appended.
 _TOOL_VERBS_NO_PREVIEW: frozenset[str] = frozenset({
     "skills_list",
@@ -713,7 +738,13 @@ def verb_drops_preview(tool_name: str) -> bool:
     return tool_name in _TOOL_VERBS_NO_PREVIEW
 
 
-def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) -> str | None:
+def build_status_phrase(
+    tool_name: str,
+    args: dict | None,
+    max_len: int = 49,
+    *,
+    safe: bool = False,
+) -> str | None:
     """Build a short present-tense status phrase for platform status surfaces.
 
     Used by text-rendering "typing" indicators (Slack's
@@ -735,6 +766,13 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
         return None
     if not _friendly_tool_labels:
         return None
+
+    if safe:
+        category = _SAFE_STATUS_CATEGORIES.get(tool_name, "Working")
+        phrase = f"is {category[0].lower()}{category[1:]}"
+        if len(phrase) > max_len - 1:
+            return phrase[: max_len - 2].rstrip() + "…"
+        return phrase + "…"
 
     verb = _TOOL_VERBS.get(tool_name)
     if verb:

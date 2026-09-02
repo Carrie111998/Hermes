@@ -326,4 +326,10 @@ class TestLiveStatusSetting:
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
+    def test_safe_mode_is_preserved_for_platform_override(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"slack": {"live_status": "safe"}}}}
+        assert resolve_display_setting(config, "slack", "live_status") == "safe"
+
 
