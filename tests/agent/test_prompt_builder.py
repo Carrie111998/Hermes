@@ -821,6 +821,71 @@ class TestEnvironmentHints:
         assert "root" in line
 
 
+    def test_probe_remote_backend_cleans_up_its_container(self, monkeypatch):
+        """The probe creates a REAL backend environment to introspect it, but a
+        docker backend defaults to persist-mode, so a probe that never cleaned
+        up left a `sleep infinity` container running forever (one per probe,
+        never reaped because the reaper only removes `exited` containers). The
+        probe must tear its own container down with force_remove=True.
+        """
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8\nhome=/root\ncwd=/workspace\nuser=tommy\n",
+                }
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append(force_remove)
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(
+            _tt, "_create_environment", lambda *, env_type, **kw: _FakeEnv()
+        )
+
+        line = _pb._probe_remote_backend("docker")
+        assert line is not None
+        assert cleanup_calls == [True], (
+            "probe must force-remove its container exactly once"
+        )
+
+    def test_probe_remote_backend_cleans_up_when_probe_command_fails(self, monkeypatch):
+        """Cleanup must run even when the probe command errors mid-flight —
+        otherwise a failing probe leaks its container just as a successful one
+        used to."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        cleanup_calls = []
+
+        class _BoomEnv:
+            def execute(self, cmd, timeout=None):
+                raise RuntimeError("probe exec exploded")
+
+            def cleanup(self, *, force_remove=False):
+                cleanup_calls.append(force_remove)
+
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(
+            _tt, "_create_environment", lambda *, env_type, **kw: _BoomEnv()
+        )
+
+        line = _pb._probe_remote_backend("docker")
+        assert line is None  # probe failed → static fallback
+        assert cleanup_calls == [True], (
+            "probe must force-remove its container even when the probe fails"
+        )
+
+
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
         import agent.prompt_builder as _pb

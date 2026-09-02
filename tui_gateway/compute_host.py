@@ -588,6 +588,9 @@ class ComputeHost:
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            # Re-adopt the serving process's admission on every reused turn
+            # (Design 1) -- the lease sentinel is per-turn frame state.
+            server._install_delegated_active_session_lease(session, frame)
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
@@ -688,6 +691,11 @@ class ComputeHost:
         session = server._sessions[sid]
         session["transport"] = self._transport
         session["profile_home"] = profile_home or session.get("profile_home")
+        # Turn-isolation lease handoff (Design 1): adopt the serving process's
+        # admission so the ownership chokepoint in _run_prompt_submit is a
+        # genuine no-op here, instead of re-claiming a slot the serving process
+        # already holds (which would be refused across the process boundary).
+        server._install_delegated_active_session_lease(session, frame)
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:

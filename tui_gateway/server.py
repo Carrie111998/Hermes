@@ -735,6 +735,44 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
+def _install_delegated_active_session_lease(session: dict, frame: dict) -> None:
+    """Install a disabled sentinel lease for a turn admitted by the serving process.
+
+    Turn-isolation Design 1: a named-profile turn is admitted ONCE, in the
+    serving (dashboard/gateway) process, which claims the real active-session
+    lease. The turn is then dispatched to a compute-host child, whose rebuilt
+    session dict carries no lease. The child re-crosses the ownership chokepoint
+    in ``_run_prompt_submit`` (the #94778 double-writer guard) and would
+    otherwise re-claim -- and be refused, because ``_is_same_writer`` cannot
+    match across a process boundary (it requires an equal pid).
+
+    When the frame says the turn was already admitted, install a DISABLED
+    ``ActiveSessionLease`` so ``_ensure_active_session_slot`` short-circuits on
+    the ``active_session_lease is not None`` fast path -- no second registry
+    claim. The lease is disabled (``enabled=False``), so ``release()`` is a
+    no-op and ``transfer_active_session`` (fired when auto-compression rotates
+    the session id mid-turn) takes its disabled-lease no-op branch instead of
+    the fallback that would claim a real second slot in the child. It must NOT
+    be marked ``released``: a released lease trips ``transfer_active_session``'s
+    ``if lease.released`` early-return, which bypasses the disabled branch and
+    falls through to that real re-claim. A real lease already present (native,
+    non-isolated path) is never overwritten.
+    """
+    if not frame.get("active_session_admitted"):
+        return
+    if session.get("active_session_lease") is not None:
+        return
+    from hermes_cli.active_sessions import ActiveSessionLease
+
+    session["active_session_lease"] = ActiveSessionLease(
+        lease_id=f"delegated:{frame.get('session_key') or ''}",
+        session_id=str(frame.get("session_key") or ""),
+        surface="compute-host",
+        enabled=False,
+        released=False,
+    )
+
+
 def _release_active_session_lease(lease) -> bool:
     if lease is None:
         return True
@@ -1193,6 +1231,38 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    # An isolated (compute-host) turn runs in a CHILD process, not in this
+    # process's _run_thread, so the settle-grace join below cannot see it. Its
+    # safety while running rests entirely on this serving process holding the
+    # real active-session lease (the child's own ownership chokepoint is a
+    # no-op via the delegated sentinel). _finalize_session releases that lease
+    # unconditionally, so interrupt the child FIRST -- otherwise the lease
+    # drops while the child keeps writing, reopening a narrow #94778 window for
+    # a sibling backend sharing HERMES_HOME. The automatic reapers already gate
+    # on `running`, so this only matters for an explicit close mid-turn.
+    if (
+        end_reason != "tui_shutdown"
+        and (session.get("running") or session.get("_compute_host_active"))
+        and _session_uses_compute_host(session)
+    ):
+        try:
+            _interrupt_session_turn(str(session.get("_sid") or ""), session)
+            # interrupt() is fire-and-forget (it just sends a frame to the
+            # child), so wait -- bounded by the same settle grace the in-process
+            # path uses for _run_thread -- for the child to report the turn done
+            # (_on_compute_host_turn_done clears `running`). This keeps the real
+            # lease held until the child actually stops writing, not merely until
+            # the interrupt was dispatched.
+            deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
+            while session.get("running") and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if session.get("running"):
+                logger.warning(
+                    "compute-host turn still running after %.1fs close grace",
+                    _TURN_SETTLE_BEFORE_CLOSE_SECONDS,
+                )
+        except Exception:
+            logger.debug("failed to interrupt compute-host turn on close", exc_info=True)
     run_thread = session.get("_run_thread")
     if (
         end_reason != "tui_shutdown"
@@ -2747,6 +2817,16 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        # Turn-isolation lease handoff (Design 1). This turn was already admitted
+        # through the per-session ownership chokepoint in THIS (serving) process,
+        # which holds the real active-session lease. The compute-host child
+        # re-crosses that chokepoint in _run_prompt_submit but cannot recognise
+        # the serving process's lease across the process boundary
+        # (_is_same_writer requires an equal pid). Signal the admission so the
+        # child installs a disabled sentinel lease instead of re-claiming a
+        # second registry slot -- keeping exactly one admission and leaving the
+        # #94778 double-writer guard intact.
+        "active_session_admitted": session.get("active_session_lease") is not None,
     }
 
 
