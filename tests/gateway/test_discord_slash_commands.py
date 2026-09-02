@@ -204,6 +204,21 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_registers_builtin_aliases_for_discord(adapter):
+    """Aliases from COMMAND_REGISTRY should appear as Discord slash commands."""
+    adapter._run_simple_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    compact_cmd = adapter._client.tree.commands["compact"]
+    interaction = SimpleNamespace()
+    await compact_cmd.callback(interaction, args="here 3")
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/compact here 3"
+    )
+
+
+@pytest.mark.asyncio
 async def test_plugin_command_name_conflict_skipped(adapter):
     """A plugin command that collides with a built-in must not override it."""
     adapter._run_simple_slash = AsyncMock()

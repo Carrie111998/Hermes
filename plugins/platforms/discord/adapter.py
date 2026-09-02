@@ -6136,24 +6136,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not _is_gateway_available(cmd_def, config_overrides):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
-                discord_name = cmd_def.name.lower()[:32]
-                if discord_name in already_registered:
-                    continue
-                if len(already_registered) >= slot_cap:
-                    dropped_over_cap += 1
-                    continue
-                auto_cmd = _build_auto_slash_command(
-                    cmd_def.name,
-                    cmd_def.description,
-                    cmd_def.args_hint,
-                )
-                try:
-                    tree.add_command(auto_cmd)
-                    already_registered.add(discord_name)
-                except Exception:
-                    # Silently skip commands that fail registration (e.g.
-                    # name conflict with a subcommand group).
-                    pass
+                # Register aliases too; gateway users should get the same
+                # command picker as CLI users (for example /compact).
+                for command_name in (cmd_def.name, *cmd_def.aliases):
+                    discord_name = command_name.lower()[:32]
+                    if discord_name in already_registered:
+                        continue
+                    if len(already_registered) >= slot_cap:
+                        dropped_over_cap += 1
+                        continue
+                    auto_cmd = _build_auto_slash_command(
+                        command_name,
+                        cmd_def.description,
+                        cmd_def.args_hint,
+                    )
+                    try:
+                        tree.add_command(auto_cmd)
+                        already_registered.add(discord_name)
+                    except Exception:
+                        # Silently skip commands that fail registration (e.g.
+                        # name conflict with a subcommand group).
+                        pass
 
             logger.debug(
                 "Discord auto-registered %d commands from COMMAND_REGISTRY",
