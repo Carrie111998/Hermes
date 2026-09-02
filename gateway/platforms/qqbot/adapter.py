@@ -252,6 +252,7 @@ class QQAdapter(BasePlatformAdapter):
         self._http_client: Optional[httpx.AsyncClient] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._fatal_notify_task: Optional[asyncio.Task] = None
         self._heartbeat_interval: float = 30.0  # seconds, updated by Hello
         self._session_id: Optional[str] = None
         self._last_seq: Optional[int] = None
@@ -516,6 +517,49 @@ class QQAdapter(BasePlatformAdapter):
         )
         logger.info("[%s] WebSocket connected to %s", self._log_tag, gateway_url)
 
+    async def _notify_fatal_error_guarded(self) -> None:
+        """Best-effort fatal-error notification — never raises.
+
+        Runs on its own task; an escaping exception would surface only as
+        "Task exception was never retrieved" at GC time and the gateway
+        would silently never learn about the dead adapter.
+        """
+        try:
+            await self._notify_fatal_error()
+        except Exception:  # noqa: BLE001 - notification is best-effort
+            logger.debug("[%s] fatal-error notify failed", self._log_tag, exc_info=True)
+
+    def _notify_fatal_error_detached(self) -> None:
+        """Schedule gateway notification of a fatal error without awaiting it.
+
+        The gateway's fatal-error handler calls ``adapter.disconnect()``,
+        which awaits ``self._listen_task`` — awaiting this very task from
+        inside the listen loop itself would deadlock, so the notification
+        runs on its own task. A strong reference is kept so the task is not
+        garbage-collected mid-notification.
+        """
+        try:
+            self._fatal_notify_task = asyncio.create_task(
+                self._notify_fatal_error_guarded()
+            )
+        except RuntimeError:
+            # No running event loop (e.g. interpreter shutdown) — nothing to notify.
+            pass
+
+    def _give_up_and_notify(self, code: str, message: str, *, retryable: bool) -> None:
+        """Terminal listen-loop exit: set a fatal error and notify the gateway.
+
+        The gateway handler disconnects this zombie adapter and requeues the
+        platform for background reconnection (retryable) or marks it fatal
+        (non-retryable). Callers must ``return`` immediately after this.
+
+        ``_set_fatal_error`` runs before ``_mark_disconnected`` so the latter
+        sees ``has_fatal_error`` and skips its redundant status write.
+        """
+        self._set_fatal_error(code, message, retryable=retryable)
+        self._mark_disconnected()
+        self._notify_fatal_error_detached()
+
     async def _listen_loop(self) -> None:
         """Read WebSocket events and reconnect on errors.
 
@@ -566,7 +610,12 @@ class QQAdapter(BasePlatformAdapter):
                             "Check: 1) AppID/Secret correct 2) Bot permissions on QQ Open Platform",
                             self._log_tag,
                         )
-                        self._set_fatal_error(
+                        # This branch returns before the shared
+                        # _fail_pending("Connection closed") below, so fail
+                        # pending response futures here — a handler-less
+                        # (standalone) adapter would otherwise never settle them.
+                        self._fail_pending("Too many quick disconnects")
+                        self._give_up_and_notify(
                             "qq_quick_disconnect",
                             "Too many quick disconnects — check bot permissions",
                             retryable=True,
@@ -605,8 +654,15 @@ class QQAdapter(BasePlatformAdapter):
                     logger.error(
                         "[%s] Bot is %s. Check QQ Open Platform.", self._log_tag, desc
                     )
-                    self._set_fatal_error(
-                        f"qq_{desc}", f"Bot is {desc}", retryable=False
+                    # Slugify the code (desc contains spaces/slashes/hyphens
+                    # and mixed case) so runtime-status error_code stays
+                    # machine-friendly.
+                    code_slug = (
+                        desc.replace(" ", "_").replace("/", "_")
+                        .replace("-", "_").lower()
+                    )
+                    self._give_up_and_notify(
+                        f"qq_{code_slug}", f"Bot is {desc}", retryable=False
                     )
                     return
 
@@ -618,7 +674,12 @@ class QQAdapter(BasePlatformAdapter):
                         RATE_LIMIT_DELAY,
                     )
                     if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
-                        self._mark_disconnected()
+                        logger.error("[%s] Max reconnect attempts reached (rate limited)", self._log_tag)
+                        self._give_up_and_notify(
+                            "qq_max_reconnect",
+                            f"QQBot gave up reconnecting after {MAX_RECONNECT_ATTEMPTS} attempts (rate-limited)",
+                            retryable=True,
+                        )
                         return
                     await asyncio.sleep(RATE_LIMIT_DELAY)
                     if await self._reconnect(backoff_idx):
@@ -673,7 +734,11 @@ class QQAdapter(BasePlatformAdapter):
                     backoff_idx += 1
                     if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                         logger.error("[%s] Max reconnect attempts reached (QQCloseError)", self._log_tag)
-                        self._mark_disconnected()
+                        self._give_up_and_notify(
+                            "qq_max_reconnect",
+                            f"QQBot gave up reconnecting after {MAX_RECONNECT_ATTEMPTS} attempts (last close code {code})",
+                            retryable=True,
+                        )
                         return
 
             except Exception as exc:
@@ -685,7 +750,11 @@ class QQAdapter(BasePlatformAdapter):
 
                 if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                     logger.error("[%s] Max reconnect attempts reached", self._log_tag)
-                    self._mark_disconnected()
+                    self._give_up_and_notify(
+                        "qq_max_reconnect",
+                        f"QQBot gave up reconnecting after {MAX_RECONNECT_ATTEMPTS} attempts: {exc}",
+                        retryable=True,
+                    )
                     return
 
                 if await self._reconnect(backoff_idx):
