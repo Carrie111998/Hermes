@@ -10125,7 +10125,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if override and override.system_prompt:
                 return (override.system_prompt or "").strip()
-        return getattr(self, "_ephemeral_system_prompt", None) or ""
+        # The global overlay is user config, not session state.  Resolve it at
+        # turn time so ordinary config edits affect the next message just like
+        # /personality does.  The underlying raw-config reader is mtime-cached.
+        prompt = self._load_ephemeral_system_prompt()
+        self._ephemeral_system_prompt = prompt
+        return prompt
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:
