@@ -168,11 +168,14 @@ def build_profile_terminal_scope(hermes_home: "Any") -> Dict[str, str]:
         # later; they are not a policy value.
         if cfg_key == "cwd" and str(value).strip() in {".", "auto", "cwd"}:
             return
-        from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+        from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
 
         env_var = TERMINAL_CONFIG_ENV_MAP.get(cfg_key)
         if env_var:
-            scope[env_var] = str(value)
+            # List/dict config values must be JSON (same contract as
+            # apply_terminal_config_to_env). str() yields Python repr, which
+            # json.loads in terminal_tool rejects.
+            scope[env_var] = _terminal_env_value(value)
 
     # 1) Defined defaults — the total baseline.
     for cfg_key, value in defaults.items():
