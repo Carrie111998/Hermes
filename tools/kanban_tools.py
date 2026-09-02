@@ -622,6 +622,7 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "completion_policy": t.completion_policy,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,

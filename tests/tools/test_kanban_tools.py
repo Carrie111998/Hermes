@@ -84,8 +84,32 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
+    assert d["task"]["completion_policy"] == "independent"
     assert "worker_context" in d
+    assert "Completion policy: independent" in d["worker_context"]
     assert "runs" in d
+
+
+def test_show_exposes_worker_completion_policy(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        ordinary = kb.create_task(
+            conn,
+            title="ordinary worker card",
+            assignee="test-worker",
+            completion_policy="worker",
+        )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", ordinary)
+
+    shown = json.loads(kt._handle_show({}))
+
+    assert shown["task"]["completion_policy"] == "worker"
+    assert "Completion policy: worker" in shown["worker_context"]
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
