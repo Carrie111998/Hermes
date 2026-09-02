@@ -1297,6 +1297,488 @@ def test_dispatch_runs_short_handlers_inline(server):
     assert resp == {"jsonrpc": "2.0", "id": "r1", "result": {"pong": True}}
 
 
+def test_dispatch_quick_command_exec_does_not_block_fast_handler(capture, monkeypatch):
+    """An exec quick command must not monopolize the RPC reader thread."""
+    server, buf = capture
+    released = threading.Event()
+
+    def slow_run(*_args, **_kwargs):
+        released.wait(timeout=5)
+        return types.SimpleNamespace(returncode=0, stdout="done", stderr="")
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"slow": {"type": "exec", "command": "slow"}}},
+    )
+    monkeypatch.setattr(server.subprocess, "run", slow_run)
+    monkeypatch.setitem(
+        server._methods,
+        "fast.ping",
+        lambda rid, params: server._ok(rid, {"pong": True}),
+    )
+
+    watchdog = threading.Timer(3, released.set)
+    watchdog.start()
+    try:
+        slow_response = server.dispatch({
+            "id": "slow",
+            "method": "command.dispatch",
+            "params": {"name": "slow"},
+        })
+        fast_response = server.dispatch({
+            "id": "fast",
+            "method": "fast.ping",
+            "params": {},
+        })
+
+        assert slow_response is None
+        assert fast_response["result"] == {"pong": True}
+        assert not released.is_set()
+    finally:
+        watchdog.cancel()
+        released.set()
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    assert json.loads(buf.getvalue()) == {
+        "jsonrpc": "2.0",
+        "id": "slow",
+        "result": {"type": "exec", "output": "done"},
+    }
+
+
+def test_dispatch_non_exec_quick_command_stays_inline(server, monkeypatch):
+    """Only subprocess-backed quick commands may bypass command ordering."""
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"shortcut": {"type": "alias", "target": "/help"}}},
+    )
+
+    response = server.dispatch({
+        "id": "alias",
+        "method": "command.dispatch",
+        "params": {"name": "shortcut"},
+    })
+
+    assert response["result"] == {"type": "alias", "target": "/help"}
+
+
+def test_dispatch_alias_snapshot_survives_config_flip_to_exec(server, monkeypatch):
+    """Inline dispatch must execute the alias snapshot it classified."""
+    configs = iter([
+        {"quick_commands": {"flip": {"type": "alias", "target": "/help"}}},
+        {"quick_commands": {"flip": {"type": "exec", "command": "must-not-run"}}},
+    ])
+    loads = []
+    owner_thread = threading.get_ident()
+    real_load_cfg = server._load_cfg
+
+    def load_cfg():
+        if threading.get_ident() != owner_thread:
+            return real_load_cfg()
+        config = next(configs)
+        loads.append(config)
+        return config
+
+    real_run = server.subprocess.run
+
+    def reject_flipped_exec(command, *args, **kwargs):
+        if command == "must-not-run":
+            pytest.fail("flipped exec command ran inline")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_load_cfg", load_cfg)
+    monkeypatch.setattr(server.subprocess, "run", reject_flipped_exec)
+
+    response = server.dispatch({
+        "id": "alias-flip",
+        "method": "command.dispatch",
+        "params": {"name": "flip"},
+    })
+
+    assert response["result"] == {"type": "alias", "target": "/help"}
+    assert len(loads) == 1
+
+
+def test_dispatch_exec_snapshot_survives_config_flip_to_alias(capture, monkeypatch):
+    """Pool dispatch must execute the exact exec snapshot it classified."""
+    server, buf = capture
+    configs = iter([
+        {"quick_commands": {"flip": {"type": "exec", "command": "original"}}},
+        {"quick_commands": {"flip": {"type": "alias", "target": "/help"}}},
+    ])
+    loads = []
+    commands = []
+    owner_thread = threading.get_ident()
+    real_load_cfg = server._load_cfg
+    real_run = server.subprocess.run
+
+    def load_cfg():
+        if threading.get_ident() != owner_thread:
+            return real_load_cfg()
+        config = next(configs)
+        loads.append(config)
+        return config
+
+    def run(command, *args, **kwargs):
+        if command == "original":
+            commands.append(command)
+            return types.SimpleNamespace(returncode=0, stdout="original-output", stderr="")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_load_cfg", load_cfg)
+    # Execute the submitted context immediately so the exact exec→alias flip
+    # ordering is deterministic; the separate slow-command test covers that
+    # the production executor remains asynchronous.
+    monkeypatch.setattr(
+        server, "_pool", types.SimpleNamespace(submit=lambda callback: callback())
+    )
+    monkeypatch.setattr(server.subprocess, "run", run)
+
+    assert server.dispatch({
+        "id": "exec-flip",
+        "method": "command.dispatch",
+        "params": {"name": "flip"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    assert len(loads) == 1
+    assert commands == ["original"]
+    assert json.loads(buf.getvalue()) == {
+        "jsonrpc": "2.0",
+        "id": "exec-flip",
+        "result": {"type": "exec", "output": "original-output"},
+    }
+
+
+def test_dispatch_config_load_failure_is_async_logged_and_redacted(
+    capture, monkeypatch, caplog
+):
+    """Unknown classification fails off-reader without leaking config details."""
+    server, buf = capture
+    secret = "config-parser-secret"
+
+    def load_cfg():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(server, "_load_cfg", load_cfg)
+    caplog.set_level("WARNING", logger="tui_gateway.server")
+
+    assert server.dispatch({
+        "id": "config-error",
+        "method": "command.dispatch",
+        "params": {"name": "unknown"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    response = buf.getvalue()
+    assert secret not in response
+    assert secret not in caplog.text
+    assert "Failed to load config while resolving command.dispatch" in caplog.text
+    assert json.loads(response) == {
+        "jsonrpc": "2.0",
+        "id": "config-error",
+        "error": {"code": 4018, "message": "quick command config unavailable"},
+    }
+
+
+@pytest.mark.parametrize("failure", ["malformed", "io-error"])
+def test_dispatch_real_config_read_failure_is_async_tolerant_and_redacted(
+    capture, monkeypatch, caplog, tmp_path, failure
+):
+    """The production config reader must fail closed only at dispatch's boundary."""
+    server, buf = capture
+    secret = "config-parser-secret"
+    config_path = tmp_path / "config.yaml"
+    if failure == "malformed":
+        config_path.write_text(
+            f"quick_commands:\n  broken: [{secret}\n", encoding="utf-8"
+        )
+    else:
+        config_path.mkdir()
+
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+    caplog.set_level("WARNING", logger="tui_gateway.server")
+
+    # Other behavioral config consumers intentionally remain fail-open.
+    assert server._load_cfg() == {}
+
+    assert server.dispatch({
+        "id": f"real-{failure}",
+        "method": "command.dispatch",
+        "params": {"name": "unknown"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    responses = buf.getvalue().splitlines()
+    assert len(responses) == 1
+    assert secret not in responses[0]
+    assert secret not in caplog.text
+    assert json.loads(responses[0]) == {
+        "jsonrpc": "2.0",
+        "id": f"real-{failure}",
+        "error": {"code": 4018, "message": "quick command config unavailable"},
+    }
+    assert server._propagate_quick_command_config_errors.get() is False
+    assert server._load_cfg() == {}
+
+
+def test_dispatch_real_valid_alias_config_stays_inline(capture, monkeypatch, tmp_path):
+    """Strict classification still accepts a real valid config without pool routing."""
+    server, buf = capture
+    (tmp_path / "config.yaml").write_text(
+        "quick_commands:\n  shortcut:\n    type: alias\n    target: /help\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+
+    response = server.dispatch({
+        "id": "real-alias",
+        "method": "command.dispatch",
+        "params": {"name": "shortcut"},
+    })
+
+    assert response["result"] == {"type": "alias", "target": "/help"}
+    assert buf.getvalue() == ""
+
+
+def test_dispatch_quick_command_timeout_redacts_command(capture, monkeypatch):
+    """A timed-out exec command must not disclose its configured command text."""
+    server, buf = capture
+    command = "quick-command-secret"
+
+    def timeout(*_args, **kwargs):
+        assert kwargs["timeout"] == 30
+        raise server.subprocess.TimeoutExpired(command, 30)
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"timeout": {"type": "exec", "command": command}}},
+    )
+    monkeypatch.setattr(server.subprocess, "run", timeout)
+
+    assert server.dispatch({
+        "id": "timeout",
+        "method": "command.dispatch",
+        "params": {"name": "timeout"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    response = buf.getvalue()
+    assert command not in response
+    assert json.loads(response) == {
+        "jsonrpc": "2.0",
+        "id": "timeout",
+        "error": {"code": 4018, "message": "quick command timed out"},
+    }
+
+
+@pytest.mark.parametrize("failure_site", ["environment", "execution"])
+def test_dispatch_quick_command_failure_is_stable_and_redacted(
+    capture, monkeypatch, failure_site
+):
+    """Worker-side quick-command setup and execution errors never expose details."""
+    from tools.environments import local as local_environment
+
+    server, buf = capture
+    command = "quick-command-config-secret"
+    secret = f"{failure_site}-exception-secret"
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"broken": {"type": "exec", "command": command}}},
+    )
+    if failure_site == "environment":
+        monkeypatch.setattr(
+            local_environment,
+            "build_subprocess_env",
+            lambda: (_ for _ in ()).throw(RuntimeError(secret)),
+        )
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail("command ran after environment failure"),
+        )
+    else:
+        monkeypatch.setattr(
+            server.subprocess,
+            "run",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret)),
+        )
+
+    assert server.dispatch({
+        "id": f"broken-{failure_site}",
+        "method": "command.dispatch",
+        "params": {"name": "broken"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    response = buf.getvalue()
+    assert secret not in response
+    assert command not in response
+    assert json.loads(response) == {
+        "jsonrpc": "2.0",
+        "id": f"broken-{failure_site}",
+        "error": {"code": 4018, "message": "quick command failed"},
+    }
+
+
+@pytest.mark.parametrize("failure_site", ["execution", "result"])
+def test_handle_request_quick_command_failure_is_stable_and_redacted(
+    server, monkeypatch, failure_site
+):
+    """Synchronous direct callers receive the same safe execution error."""
+    command = "direct-quick-command-secret"
+    secret = f"direct-{failure_site}-error-secret"
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"broken": {"type": "exec", "command": command}}},
+    )
+    if failure_site == "execution":
+        run = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret))
+    else:
+        class BrokenResult:
+            @property
+            def stdout(self):
+                raise RuntimeError(secret)
+
+        run = lambda *_args, **_kwargs: BrokenResult()
+    monkeypatch.setattr(server.subprocess, "run", run)
+
+    response = server.handle_request({
+        "id": f"direct-broken-{failure_site}",
+        "method": "command.dispatch",
+        "params": {"name": "broken"},
+    })
+
+    serialized = json.dumps(response)
+    assert secret not in serialized
+    assert command not in serialized
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": f"direct-broken-{failure_site}",
+        "error": {"code": 4018, "message": "quick command failed"},
+    }
+
+
+def test_dispatch_quick_command_worker_wrapper_is_stable_and_redacted(
+    capture, monkeypatch
+):
+    """The pool's final exception boundary must never serialize exec details."""
+    server, buf = capture
+    command = "worker-wrapper-command-secret"
+    secret = "worker-wrapper-os-error-secret"
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"broken": {"type": "exec", "command": command}}},
+    )
+    monkeypatch.setitem(
+        server._methods,
+        "command.dispatch",
+        lambda _rid, _params: (_ for _ in ()).throw(OSError(secret)),
+    )
+
+    assert server.dispatch({
+        "id": "worker-wrapper-broken",
+        "method": "command.dispatch",
+        "params": {"name": "broken"},
+    }) is None
+
+    for _ in range(50):
+        if buf.getvalue():
+            break
+        time.sleep(0.01)
+
+    response = buf.getvalue()
+    assert secret not in response
+    assert command not in response
+    assert json.loads(response) == {
+        "jsonrpc": "2.0",
+        "id": "worker-wrapper-broken",
+        "error": {"code": 4018, "message": "quick command failed"},
+    }
+
+
+def test_dispatch_quick_command_pool_rejection_fails_inline_and_redacted(
+    server, monkeypatch, caplog
+):
+    """Executor shutdown must not run an exec command or orphan its response."""
+    command = "must-not-run"
+    secret = "pool-rejection-secret"
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"blocked": {"type": "exec", "command": command}}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_pool",
+        types.SimpleNamespace(
+            submit=lambda _callback: (_ for _ in ()).throw(RuntimeError(secret))
+        ),
+    )
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("rejected command was executed"),
+    )
+    caplog.set_level("WARNING", logger="tui_gateway.server")
+
+    response = server.dispatch({
+        "id": "pool-rejected",
+        "method": "command.dispatch",
+        "params": {"name": "blocked"},
+    })
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "pool-rejected",
+        "error": {"code": -32000, "message": "handler unavailable"},
+    }
+    assert secret not in caplog.text
+    assert command not in caplog.text
+    assert "RPC worker unavailable; rejecting request" in caplog.text
+    assert server._resolved_quick_command.get() is None
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.

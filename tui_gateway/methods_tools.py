@@ -469,25 +469,30 @@ def _(rid, params: dict) -> dict:
 
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
-    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
-    resolved = _resolve_name(name)
-    if resolved != name:
-        name = resolved
+    arg = params.get("arg", "")
+    quick_command = _resolved_quick_command.get()
+    if quick_command is None:
+        # Direct handle_request() callers do not pass through dispatch(), so
+        # resolve once here. Normal RPCs always consume dispatch's snapshot.
+        quick_command = _resolve_quick_command(params)
+    name = quick_command.name
     session = _sessions.get(params.get("session_id", ""))
 
-    qcmds = _load_cfg().get("quick_commands", {})
-    if name in qcmds:
-        qc = qcmds[name]
-        if qc.get("type") == "exec":
-            # Sanitize env to prevent credential leakage —
-            # quick commands run in the TUI server process which
-            # has all API keys in os.environ.
+    if quick_command.config_error:
+        return _err(rid, 4018, "quick command config unavailable")
+    if quick_command.kind == "exec":
+        try:
+            # Sanitize env to prevent credential leakage — quick commands run
+            # in the TUI server process which has all API keys in os.environ.
+            # Keep the whole setup/execute/result boundary guarded: import,
+            # platform, decoding, and redaction failures may all carry details.
             from tools.environments.local import build_subprocess_env
+
             sanitized_env = build_subprocess_env()
             from hermes_cli._subprocess_compat import windows_hide_flags
 
             r = subprocess.run(
-                qc.get("command", ""),
+                quick_command.command,
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -506,6 +511,7 @@ def _(rid, params: dict) -> dict:
             ).strip()[:4000]
             if output:
                 from agent.redact import redact_sensitive_text
+
                 output = redact_sensitive_text(output)
             if r.returncode != 0:
                 return _err(
@@ -514,8 +520,12 @@ def _(rid, params: dict) -> dict:
                     output or f"quick command failed with exit code {r.returncode}",
                 )
             return _ok(rid, {"type": "exec", "output": output})
-        if qc.get("type") == "alias":
-            return _ok(rid, {"type": "alias", "target": qc.get("target", "")})
+        except subprocess.TimeoutExpired:
+            return _err(rid, 4018, "quick command timed out")
+        except Exception:
+            return _err(rid, 4018, "quick command failed")
+    if quick_command.kind == "alias":
+        return _ok(rid, {"type": "alias", "target": quick_command.target})
 
     try:
         from hermes_cli.plugins import (

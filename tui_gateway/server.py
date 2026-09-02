@@ -3218,6 +3218,72 @@ def _current_session_steer_authority(
         return transport, session
 
 
+class _ResolvedQuickCommand(NamedTuple):
+    """Immutable command.dispatch classification shared with its handler."""
+
+    name: str
+    kind: str | None
+    command: str = ""
+    target: str = ""
+    config_error: bool = False
+
+
+_resolved_quick_command: contextvars.ContextVar[_ResolvedQuickCommand | None] = (
+    contextvars.ContextVar("resolved_quick_command", default=None)
+)
+_propagate_quick_command_config_errors: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("propagate_quick_command_config_errors", default=False)
+)
+
+
+def _resolve_quick_command(params: dict) -> _ResolvedQuickCommand:
+    name = _resolve_name(params.get("name", "").lstrip("/"))
+    config_error_token = _propagate_quick_command_config_errors.set(True)
+    try:
+        # Classification is the one config read that must distinguish an
+        # absent config from an unreadable one: treating the latter as an
+        # empty mapping could run a newly configured exec command inline.
+        cfg = _load_cfg()
+    except Exception:
+        # Do not include parser exception text: malformed config may contain
+        # credentials. The client receives a similarly fixed, redacted error.
+        logger.warning(
+            "Failed to load config while resolving command.dispatch; routing request to worker"
+        )
+        return _ResolvedQuickCommand(name=name, kind=None, config_error=True)
+    finally:
+        _propagate_quick_command_config_errors.reset(config_error_token)
+
+    quick_commands = cfg.get("quick_commands", {})
+    quick_command = quick_commands.get(name) if isinstance(quick_commands, dict) else None
+    if not isinstance(quick_command, dict):
+        return _ResolvedQuickCommand(name=name, kind=None)
+
+    kind = quick_command.get("type")
+    command = quick_command.get("command", "")
+    target = quick_command.get("target", "")
+    return _ResolvedQuickCommand(
+        name=name,
+        kind=kind if isinstance(kind, str) else None,
+        command=command if isinstance(command, str) else "",
+        target=target if isinstance(target, str) else "",
+    )
+
+
+def _is_pool_routed_request(
+    method: str, quick_command: _ResolvedQuickCommand | None = None
+) -> bool:
+    if method in _LONG_HANDLERS:
+        return True
+    if method != "command.dispatch":
+        return False
+    # A failed config read cannot prove the request is safe to run inline.
+    # Keep it off the reader and let the worker return the redacted error.
+    return quick_command is not None and (
+        quick_command.kind == "exec" or quick_command.config_error
+    )
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -3232,13 +3298,19 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """
     t = transport or _stdio_transport
     token = bind_transport(t)
+    quick_command_token = None
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
             return normalized
 
         _rid, method, _params = normalized
-        if method not in _LONG_HANDLERS:
+        quick_command = None
+        if method == "command.dispatch":
+            quick_command = _resolve_quick_command(_params)
+            quick_command_token = _resolved_quick_command.set(quick_command)
+
+        if not _is_pool_routed_request(method, quick_command):
             return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
@@ -3248,14 +3320,29 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             try:
                 resp = handle_request(req)
             except Exception as exc:
-                resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+                if quick_command is not None and quick_command.kind == "exec":
+                    # Defense in depth: the command handler redacts its own
+                    # setup/execution failures, but no later regression may
+                    # expose command, config, or exception details here.
+                    resp = _err(req.get("id"), 4018, "quick command failed")
+                else:
+                    resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        try:
+            _pool.submit(lambda: ctx.run(run))
+        except RuntimeError:
+            # ThreadPoolExecutor rejects submissions during interpreter/server
+            # shutdown. Fail this request once, inline, without running a
+            # subprocess on the reader or retaining exception text.
+            logger.warning("RPC worker unavailable; rejecting request")
+            return _err(req.get("id"), -32000, "handler unavailable")
 
         return None
     finally:
+        if quick_command_token is not None:
+            _resolved_quick_command.reset(quick_command_token)
         reset_transport(token)
 
 
@@ -4654,7 +4741,7 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
     }
 
 
-def _load_cfg_raw() -> dict:
+def _load_cfg_raw(*, raise_on_error: bool = False) -> dict:
     """Read the active profile's config.yaml EXACTLY as written (write-back primitive).
 
     ONLY legal for read→mutate→``_save_cfg`` round-trips (and raw-file
@@ -4672,11 +4759,15 @@ def _load_cfg_raw() -> dict:
         override = get_hermes_home_override()
         home = override if isinstance(override, str) and override else _hermes_home
         p = Path(home) / "config.yaml"
-        mtime = p.stat().st_mtime if p.exists() else None
+        try:
+            stat_result = p.stat()
+        except FileNotFoundError:
+            stat_result = None
+        mtime = stat_result.st_mtime if stat_result is not None else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
-        if p.exists():
+        if stat_result is not None:
             from hermes_cli.config import read_user_config_raw
             data = read_user_config_raw(p)
         else:
@@ -4691,7 +4782,8 @@ def _load_cfg_raw() -> dict:
             _cfg_path = p
         return data
     except Exception:
-        pass
+        if raise_on_error:
+            raise
     return {}
 
 
@@ -4706,9 +4798,14 @@ def _load_cfg() -> dict:
     would also break ``_load_cfg() == {}`` sentinels). Do NOT pass the
     result to ``_save_cfg``: use ``_load_cfg_raw()`` for write-back
     round-trips or expanded/overlaid values get persisted into the user's
-    file.
+    file. Malformed/unreadable config remains intentionally fail-open for the
+    existing behavioral consumers. The command-dispatch classifier binds a
+    short-lived ContextVar so only that security boundary propagates failures
+    and can distinguish an absent file from a failed read.
     """
-    cfg = _apply_managed(_load_cfg_raw())
+    cfg = _apply_managed(
+        _load_cfg_raw(raise_on_error=_propagate_quick_command_config_errors.get())
+    )
     try:
         from hermes_cli.config import _expand_env_vars
 
