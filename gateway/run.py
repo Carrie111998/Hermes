@@ -1154,7 +1154,10 @@ def _clarify_send_disposition(fut, *, session_key: str, clarify_mod) -> "str | N
     return None
 
 
-def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_mod) -> str:
+def _clarify_send_then_wait(
+    fut, *, clarify_id: str, session_key: str, clarify_mod,
+    timeout_seconds=None, rich: bool = False,
+) -> str:
     """Resolve a clarify prompt: send disposition, then the bounded wait.
 
     The full caller contract in one testable seam: a definitive send failure
@@ -1162,17 +1165,40 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     ``ambiguous`` both proceed to ``wait_for_response`` with the configured
     timeout — for ambiguous, the registration stays armed so a late reply to
     the (probably rendered) card still resolves.
+
+    Rich path (``rich=True``): ``timeout_seconds`` overrides the config
+    default, and responses are returned as ClarifyResult JSON — a response
+    that already parses as a status dict passes through, anything else is
+    wrapped as ``{"status": "answered", "value": ...}``.
     """
+    import json as _json
+
     abort = _clarify_send_disposition(
         fut, session_key=session_key, clarify_mod=clarify_mod
     )
     if abort is not None:
         return abort
-    timeout = clarify_mod.get_clarify_timeout()
+    if timeout_seconds is not None:
+        timeout = int(timeout_seconds)
+    else:
+        timeout = clarify_mod.get_clarify_timeout()
     response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
     if response is None or response == "":
         # Timeout or session-boundary cancellation
+        if rich:
+            return _json.dumps({
+                "status": "timeout",
+                "message": f"User did not respond within {int(timeout / 60)}m",
+            }, ensure_ascii=False)
         return f"[user did not respond within {int(timeout / 60)}m]"
+    if rich:
+        try:
+            parsed = _json.loads(response)
+            if isinstance(parsed, dict) and "status" in parsed:
+                return response
+        except (_json.JSONDecodeError, ValueError):
+            pass
+        return _json.dumps({"status": "answered", "value": response}, ensure_ascii=False)
     return response
 
 
@@ -6583,13 +6609,28 @@ class TurnRunner:
         # explaining that no response arrived (so the agent can adapt
         # rather than hang forever).
         # ------------------------------------------------------------------
-        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+        def _clarify_callback_sync(
+            question: str,
+            choices=None,
+            multi_select: bool = False,
+            options=None,
+            display_type: str = "buttons",
+            auth_policy: str = "session_owner_only",
+            timeout_seconds=None,
+            **kwargs,
+        ) -> str:
+            """Unified clarify callback: simple, batch, and rich paths.
+
+            Simple path:  callback(question, choices, multi_select)
+            Rich path:    callback(question, choices=None, options=[...], ...)
+            """
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
             if not ctx._status_adapter:
                 return ""
 
+            is_rich = options is not None
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_mod.register(
                 clarify_id=clarify_id,
@@ -6597,6 +6638,9 @@ class TurnRunner:
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                options=options,
+                display_type=display_type if is_rich else None,
+                auth_policy=auth_policy if is_rich else None,
             )
 
             # For WeCom native streaming: finalize the current stream before
@@ -6650,6 +6694,10 @@ class TurnRunner:
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
                     metadata=ctx._status_thread_metadata,
+                    options=options,
+                    display_type=display_type if is_rich else None,
+                    auth_policy=auth_policy if is_rich else None,
+                    timeout_seconds=timeout_seconds if is_rich else None,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -6664,6 +6712,8 @@ class TurnRunner:
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 clarify_mod=_clarify_mod,
+                timeout_seconds=timeout_seconds if is_rich else None,
+                rich=is_rich,
             )
             # Only re-arm typing when the user actually answered — the
             # undeliverable sentinel and the timeout/cancellation strings

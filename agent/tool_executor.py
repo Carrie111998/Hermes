@@ -2214,6 +2214,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
                     questions=next_args.get("questions"),
+                    options=next_args.get("options"),
+                    display_type=next_args.get("display_type", "buttons"),
+                    auth_policy=next_args.get("auth_policy", "session_owner_only"),
+                    timeout_seconds=next_args.get("timeout_seconds"),
                     callback=agent.clarify_callback,
                 )
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
