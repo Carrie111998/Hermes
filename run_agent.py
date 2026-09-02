@@ -8354,7 +8354,8 @@ class AIAgent:
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.
 
-        DeepSeek v4 thinking and Kimi / Moonshot thinking both reject replays
+        DeepSeek v4 thinking, Kimi / Moonshot thinking, and NVIDIA NIM
+        thinking models reject replays
         of assistant tool-call messages that omit ``reasoning_content`` (refs
         #15250, #17400). Xiaomi MiMo thinking mode has the same requirement.
 
@@ -8374,6 +8375,7 @@ class AIAgent:
             self._needs_deepseek_tool_reasoning()
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
+            or self._needs_nim_tool_reasoning()
             or self._reasoning_echo_opt_in()
         )
         self._thinking_pad_cache = (key, result)
@@ -8444,6 +8446,18 @@ class AIAgent:
 
         Rule table owner: ``agent.message_sanitization.reasoning_echo_family``.
         """
+        from utils import base_url_host_matches
+
+        # NVIDIA NIM re-exports DeepSeek alongside strict instruct models and
+        # has its own reasoning enable/disable contract. Let the NIM gate own
+        # both hosted and local/on-prem NVIDIA endpoints instead of the generic
+        # model-name rule below.
+        provider = (self.provider or "").strip().lower()
+        if provider in {"nvidia", "nvidia-nim"} or base_url_host_matches(
+            self.base_url, "integrate.api.nvidia.com"
+        ):
+            return self._needs_nim_tool_reasoning()
+
         from agent.message_sanitization import matches_reasoning_echo_family
         return matches_reasoning_echo_family(
             "deepseek", (self.provider or "").lower(), self.model, self.base_url
@@ -8462,6 +8476,34 @@ class AIAgent:
         return matches_reasoning_echo_family(
             "mimo", (self.provider or "").lower(), self.model, self.base_url
         )
+
+    def _needs_nim_tool_reasoning(self) -> bool:
+        """Return True for thinking models on NVIDIA's NIM endpoint.
+
+        NIM serves strict instruct and reasoning models from the same OpenAI-
+        compatible endpoint.  Gate on endpoint, model family, and the active
+        reasoning configuration so ordinary NIM models never receive the
+        provider-specific ``reasoning_content`` replay field.
+        """
+        from agent.nim_reasoning import is_nim_thinking_model
+        from utils import base_url_host_matches
+
+        provider = (self.provider or "").strip().lower()
+        official_host = base_url_host_matches(
+            self.base_url, "integrate.api.nvidia.com"
+        )
+        if provider not in {"nvidia", "nvidia-nim"} and not (
+            provider == "custom" and official_host
+        ):
+            return False
+        config = self.reasoning_config
+        if not isinstance(config, dict):
+            return False
+        enabled = config.get("enabled", True)
+        effort = str(config.get("effort") or "").strip().lower()
+        if enabled is False or effort == "none":
+            return False
+        return is_nim_thinking_model(self.model)
 
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
