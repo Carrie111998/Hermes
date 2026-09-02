@@ -139,6 +139,13 @@ custom = CustomProfile(
     ),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
+    # llama.cpp & friends default to temperature=1.0 when the field is omitted,
+    # which causes factual drift on local models (#18470); pin a sensible
+    # default instead. request_overrides are merged later and still win.
+    fixed_temperature=0.2,
+    # Same backends only batch multiple tool calls in one round when the flag
+    # is sent explicitly (#18470).
+    parallel_tool_calls_default=True,
     # Without this, no max_tokens is sent and Ollama falls back to its internal
     # num_predict=128, truncating responses after a few tokens (#39281). This is
     # only a floor used when the user hasn't set model.max_tokens — they can
