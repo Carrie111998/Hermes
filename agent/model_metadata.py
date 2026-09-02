@@ -545,6 +545,16 @@ DEFAULT_CONTEXT_LENGTHS = {
     "deepseek": 128000,
     # Meta
     "llama": 131072,
+    # Muse Spark family (1.1/1.2/1.3) ships with a 1M context window:
+    # 1,048,576 per OpenRouter live metadata for meta/muse-spark-1.1,
+    # muse-spark-1.2, muse-spark-1.3 and both contributor tiers (verified
+    # 2026-09-02); contributor $0.10 in / $0.20 out, standard $1.25 in /
+    # $4.25 out. Longer key wins for 1.3; the family key covers 1.1/1.2 and
+    # future checkpoints. Live endpoint / models.dev metadata still wins
+    # when available. Substring match also covers -contributor and
+    # provider-prefixed ids (meta/...).
+    "muse-spark-1.3": 1_048_576,
+    "muse-spark": 1_048_576,
     # Thinking Machines — Inkling family ships with a 1M context window
     # (max output 256K).  Verified against OpenRouter live metadata
     # (context_length 1,048,576 for inkling, inkling-small, and the
@@ -2304,6 +2314,8 @@ def _model_name_suggests_minimax_m3(model: str) -> bool:
 # catch-all can never be listed here.
 _PRE_CATALOG_STALE_KEYS = frozenset({
     "minimax-m3",    # 1M; older builds persisted the "minimax" catch-all (204,800)
+    "muse-spark-1.3",  # 1M; builds before this entry fell through to the 256K fallback
+    "muse-spark",      # 1M; 1.1/1.2 builds fell through to the 256K fallback
     "grok-4.3",      # 1M; pre-2026-05-15 builds persisted the "grok-4" catch-all (256,000)
     "grok-4.6",      # 500K; pre-catalog builds persisted the "grok-4" catch-all (256,000)
     "grok-4-fast",   # 2M; pre-2026-04-10 builds fell through to the 256K probe fallback

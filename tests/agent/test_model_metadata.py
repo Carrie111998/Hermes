@@ -1631,6 +1631,39 @@ class TestGrok43StaleCacheGuard:
             assert ctx == 256_000, f"{slug} should stay 256000, got {ctx}"
 
 
+class TestMuseSparkStaleCacheGuard:
+    """Muse Spark (1M window: 1,048,576 per OpenRouter live metadata) had no
+    catalog entry, so builds resolved every slug via the 256K default fallback
+    and persisted that. The step-1 cache guard must drop the stale value and
+    re-resolve to 1M.
+    """
+
+    def test_stale_muse_spark_detected_by_generic_guard(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # 256,000 is the old fallback value — stale for every Muse slug (1M).
+        assert _stale_pre_catalog_cache_entry("muse-spark-1.3", 256_000)
+        assert _stale_pre_catalog_cache_entry("muse-spark-1.3-contributor", 256_000)
+        assert _stale_pre_catalog_cache_entry("meta/muse-spark-1.3-contributor", 256_000)
+        assert _stale_pre_catalog_cache_entry("muse-spark-1.2-contributor", 256_000)
+        assert _stale_pre_catalog_cache_entry("muse-spark-1.1", 256_000)
+        # Correct/probed values are never dropped.
+        assert not _stale_pre_catalog_cache_entry("muse-spark-1.3-contributor", 1_048_576)
+        assert not _stale_pre_catalog_cache_entry("muse-spark-1.2", 1_048_576)
+
+    def test_stale_muse_spark_dropped_and_reresolves_to_1m(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+        importlib.reload(mm)
+        base = "https://api.meta.ai/v1"
+        for slug in ("muse-spark-1.3-contributor", "muse-spark-1.2"):
+            mm.save_context_length(slug, base, 256_000)
+            ctx = mm.get_model_context_length(
+                slug, base_url=base, api_key="", provider="meta-ai"
+            )
+            assert ctx == 1_048_576, f"{slug} should re-resolve to 1048576, got {ctx}"
+
+
 class TestGrok46StaleCacheGuard:
     """Pre-catalog builds resolved grok-4.6 via the generic 'grok-4' catch-all
     (256,000) and persisted it before the 500K catalog entry existed.
