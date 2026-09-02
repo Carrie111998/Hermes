@@ -182,6 +182,11 @@ def _register_direct_openai_provider() -> None:
 class OSSBackend(Mem0Backend):
     """Wraps mem0.Memory for self-hosted (OSS) mode."""
 
+    # Vector stores whose mem0 pydantic config schema accepts embedding_model_dims.
+    # Others (e.g. chroma) reject it as an extra field and auto-detect dims
+    # from the embedder's own output instead.
+    _DIMS_AWARE_PROVIDERS = {"qdrant", "pgvector", "elasticsearch", "milvus"}
+
     def __init__(self, oss_config: dict):
         import os
         from mem0 import Memory
@@ -209,6 +214,8 @@ class OSSBackend(Mem0Backend):
         if "path" in vs_config:
             vs_config["path"] = os.path.expanduser(vs_config["path"])
 
+        vs_provider = str(vector_store.get("provider") or "qdrant").strip().lower()
+
         embedder_config = oss_config.get("embedder", {}).get("config", {})
         dims = embedder_config.get("embedding_dims")
         if not dims:
@@ -216,10 +223,14 @@ class OSSBackend(Mem0Backend):
             model = embedder_config.get("model", "")
             dims = KNOWN_DIMS.get(model)
         if dims:
-            vs_config["embedding_model_dims"] = dims
-            self._recreate_collection_if_dims_changed(
-                vector_store.get("provider", "qdrant"), vs_config, dims,
-            )
+            # mem0's pydantic schema only allows embedding_model_dims for
+            # vector stores that actually use it (qdrant/pgvector/elasticsearch/
+            # milvus). Chroma's config schema rejects unknown extra fields, so
+            # injecting it there raises a ValidationError; chroma auto-detects
+            # dims from the embedder's own output instead.
+            if vs_provider in self._DIMS_AWARE_PROVIDERS:
+                vs_config["embedding_model_dims"] = dims
+            self._recreate_collection_if_dims_changed(vs_provider, vs_config, dims)
 
         vector_store["config"] = vs_config
 
