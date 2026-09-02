@@ -2849,6 +2849,14 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         access_token=client_kwargs.get("api_key", ""),
         base_url=str(client_kwargs.get("base_url", "")),
     )
+    # LM Studio: normalize base_url to always end in /v1 so the SDK
+    # appends /chat/completions to the correct path. Without this, a bare
+    # http://127.0.0.1:1234 reaches LM Studio's management API (200 OK, JSON
+    # error) instead of the OpenAI-compatible endpoint (issue #98678).
+    if agent.provider == "lmstudio" and client_kwargs.get("base_url"):
+        from hermes_cli.auth import _normalize_lmstudio_runtime_base_url
+
+        client_kwargs["base_url"] = _normalize_lmstudio_runtime_base_url(client_kwargs["base_url"])
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)

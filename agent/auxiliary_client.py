@@ -267,11 +267,53 @@ def _openai_http_client_kwargs(
         return {}
     return {"http_client": client}
 
+def _is_lmstudio_base_url(base_url: str) -> bool:
+    """Return True when base_url targets a local LM Studio instance.
+
+    Detects by matching the host:port against the configured LM_BASE_URL env
+    var, or the LM Studio default 127.0.0.1:1234 / localhost:1234.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or 1234
+    except Exception:
+        return False
+
+    if host in ("127.0.0.1", "localhost") and port == 1234:
+        return True
+
+    import os
+
+    lm_env = os.environ.get("LM_BASE_URL", "")
+    if lm_env:
+        try:
+            lm_parsed = urlparse(lm_env)
+            lm_host = (lm_parsed.hostname or "").lower()
+            lm_port = lm_parsed.port or 1234
+            if host == lm_host and port == lm_port:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     if _aux_probe_active():
         # Availability probe: credentials/base_url resolved — that is the
         # answer. Skip the openai import + httpx/SSL construction entirely.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
+
+    # LM Studio: normalize base_url to always end in /v1. The runtime resolver
+    # normalizes when it knows the provider, but auxiliary_client.py has no
+    # provider context — detect from the URL instead (issue #98678).
+    if _is_lmstudio_base_url(base_url):
+        from hermes_cli.auth import _normalize_lmstudio_runtime_base_url
+
+        base_url = _normalize_lmstudio_runtime_base_url(base_url)
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # OpenCode Zen free tier: the keyless placeholder must never reach the
     # wire — the Zen relay serves free models anonymously but 401s any
