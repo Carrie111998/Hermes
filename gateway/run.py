@@ -16880,6 +16880,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        if platform == Platform.SIGNAL:
+            adapter._signal_transport_profile_name = profile_name
         # Runtime status is process-scoped even while message/config work is
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.
@@ -17486,7 +17488,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not validate_signal_config(config):
                 logger.warning("Signal: SIGNAL_HTTP_URL or SIGNAL_ACCOUNT not configured")
                 return None
-            return SignalAdapter(config)
+            adapter = SignalAdapter(config)
+            adapter.gateway_runner = self
+            adapter._signal_transport_profile_name = self._active_profile_name()
+            return adapter
 
         elif platform == Platform.WEIXIN:
             from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
@@ -17564,9 +17569,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         store, allow-all flags — stays the single source of truth.
 
         ``profile_name`` binds the callback to the secondary adapter's own
-        multiplex profile, so its ``SessionSource`` resolves that profile's
-        secret scope instead of falling back to the active profile.
+        multiplex profile. Adapter callbacks can run before the scoped message
+        handler (Signal read receipts do), so capture only the owning profile's
+        home here and rebuild its secret scope for each authorization check.
+        This keeps long-lived listener tasks from retaining a stale connect-time
+        allowlist while leaving single-profile and other primary adapters on
+        their legacy environment path.
         """
+        auth_profile_home: Optional[Path] = None
+        requires_auth_profile_scope = (
+            platform == Platform.SIGNAL
+            and getattr(self.config, "multiplex_profiles", False)
+        )
+        if requires_auth_profile_scope:
+            try:
+                if profile_name:
+                    from hermes_cli.profiles import get_profile_dir
+
+                    auth_profile_home = get_profile_dir(profile_name)
+                else:
+                    # The primary Signal adapter owns the process runner's
+                    # home. Do not resolve its display name through
+                    # get_profile_dir(): custom HERMES_HOME paths are reported
+                    # as the synthetic profile name "custom".
+                    auth_profile_home = Path(get_hermes_home())
+            except Exception:
+                # A multiplexed Signal receipt has no safe process-env fallback:
+                # the process may currently hold another profile's allowlist.
+                auth_profile_home = None
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
@@ -17581,6 +17612,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            if requires_auth_profile_scope and auth_profile_home is None:
+                return False
+            if auth_profile_home is not None:
+                with _profile_runtime_scope(auth_profile_home):
+                    return self._is_user_authorized(source)
             return self._is_user_authorized(source)
         return check
 
