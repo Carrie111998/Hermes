@@ -3056,6 +3056,23 @@ class SlackAdapter(BasePlatformAdapter):
                         last_result = await self._get_client(
                             chat_id, team_id=team_id
                         ).chat_postMessage(**retry_kwargs)
+                    elif (
+                        kwargs.get("thread_ts")
+                        and self._is_thread_reply_rejection(e)
+                    ):
+                        # Non-threadable root (e.g. a Slack system event):
+                        # retry the same payload as a top-level channel
+                        # message instead of dropping the response (#98285).
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("thread_ts", None)
+                        retry_kwargs.pop("reply_broadcast", None)
+                        logger.info(
+                            "[Slack] Thread root cannot accept replies; retrying send as top-level message: %s",
+                            e,
+                        )
+                        last_result = await self._get_client(
+                            chat_id, team_id=team_id
+                        ).chat_postMessage(**retry_kwargs)
                     else:
                         raise
 
@@ -4171,6 +4188,29 @@ class SlackAdapter(BasePlatformAdapter):
             "msg_too_long",
             "too_many_blocks",
         }
+        response = getattr(error, "response", None)
+        response_get = getattr(response, "get", None)
+        if callable(response_get):
+            try:
+                if response_get("error") in recoverable_codes:
+                    return True
+            except Exception:
+                pass
+        message = str(error)
+        return any(code in message for code in recoverable_codes)
+
+    @staticmethod
+    def _is_thread_reply_rejection(error: BaseException) -> bool:
+        """Return True for Slack errors recoverable by dropping ``thread_ts``.
+
+        Some thread roots cannot accept replies — non-threadable message
+        types such as Slack system events (channel renames, etc.). Slack
+        rejects the whole ``chat.postMessage`` call with
+        ``cannot_reply_to_message``; retrying the same payload as a
+        top-level channel message is safe and prevents the response from
+        being dropped entirely (#98285).
+        """
+        recoverable_codes = {"cannot_reply_to_message"}
         response = getattr(error, "response", None)
         response_get = getattr(response, "get", None)
         if callable(response_get):
