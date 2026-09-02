@@ -12551,7 +12551,147 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print("       DISCORD_BOT_TOKEN=your_token")
             print(f"    2. Or configure settings in {display_hermes_home()}/config.yaml")
             print()
-    
+
+    # ── /queue management (list / edit / rm / move / clear) ──────────
+    # Inspired by Factory Droid v0.203 "edit queued messages": a queued
+    # next-turn prompt can be inspected and changed before it is sent.
+
+    def _pending_input_items(self) -> list:
+        """Snapshot of queued next-turn prompts (raw items, may include
+        ``_VoiceInputMessage`` sentinels)."""
+        with self._pending_input.mutex:
+            return list(self._pending_input.queue)
+
+    def _replace_pending_input_items(self, items: list) -> None:
+        """Replace queued next-turn prompts while preserving queue.Queue
+        bookkeeping (unfinished_tasks / not_empty waiters)."""
+        with self._pending_input.mutex:
+            self._pending_input.queue.clear()
+            self._pending_input.queue.extend(items)
+            self._pending_input.unfinished_tasks = len(items)
+            if items:
+                self._pending_input.not_empty.notify_all()
+
+    def _print_queue_items(self, items: list) -> None:
+        _cprint(f"  Queue ({len(items)} pending):")
+        for idx, item in enumerate(items, 1):
+            voice = isinstance(item, _VoiceInputMessage)
+            preview = str(item).replace("\n", " ")
+            tag = " [voice]" if voice else ""
+            _cprint(f"    {idx}. {preview[:120]}{'...' if len(preview) > 120 else ''}{tag}")
+
+    def _handle_queue_command(self, cmd_original: str) -> None:
+        """Queue, inspect, and edit next-turn prompts.
+
+        Backward compatible: ``/queue <anything>`` still enqueues the literal
+        prompt unless the first word is an explicit management subcommand.
+        ``/queue add <prompt>`` force-enqueues prompts that begin with a
+        management word (e.g. "clear the logs").
+        """
+        parts = cmd_original.split(None, 1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        subcmds = {
+            "add", "list", "ls", "show", "edit", "set",
+            "remove", "rm", "delete", "del", "pop", "clear", "move",
+        }
+        usage = ("  Usage: /queue <prompt> | /queue list | /queue edit N <prompt> | "
+                 "/queue rm N | /queue move FROM TO | /queue clear")
+
+        def _enqueue(text: str) -> None:
+            text = self._expand_paste_references(text)
+            self._pending_input.put(text)
+            label = "Queued for the next turn" if self._agent_running else "Queued"
+            _cprint(f"  {label}: {text[:80]}{'...' if len(text) > 80 else ''}")
+
+        if not payload:
+            items = self._pending_input_items()
+            if not items:
+                _cprint("  Queue is empty." + "\n" + usage)
+                return
+            self._print_queue_items(items)
+            return
+
+        action, _, rest = payload.partition(" ")
+        action_l = action.lower()
+
+        if action_l not in subcmds:
+            _enqueue(payload)
+            return
+
+        if action_l == "add":
+            if not rest.strip():
+                _cprint("  Usage: /queue add <prompt>")
+                return
+            _enqueue(rest.strip())
+            return
+
+        if action_l in {"list", "ls", "show"}:
+            items = self._pending_input_items()
+            if not items:
+                _cprint("  Queue is empty.")
+                return
+            self._print_queue_items(items)
+            return
+
+        if action_l == "clear":
+            count = len(self._pending_input_items())
+            self._replace_pending_input_items([])
+            _cprint(f"  Cleared {count} queued prompt{'s' if count != 1 else ''}.")
+            return
+
+        if action_l in {"remove", "rm", "delete", "del", "pop"}:
+            if not rest.strip().isdigit():
+                _cprint("  Usage: /queue rm <number>")
+                return
+            idx = int(rest.strip())
+            items = self._pending_input_items()
+            if idx < 1 or idx > len(items):
+                _cprint(f"  Queue item {idx} not found. Current size: {len(items)}")
+                return
+            removed = items.pop(idx - 1)
+            self._replace_pending_input_items(items)
+            preview = str(removed).replace("\n", " ")
+            _cprint(f"  Removed queue item {idx}: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+            return
+
+        if action_l in {"edit", "set"}:
+            idx_text, _, new_prompt = rest.strip().partition(" ")
+            if not idx_text.isdigit() or not new_prompt.strip():
+                _cprint("  Usage: /queue edit <number> <new prompt>")
+                return
+            idx = int(idx_text)
+            items = self._pending_input_items()
+            if idx < 1 or idx > len(items):
+                _cprint(f"  Queue item {idx} not found. Current size: {len(items)}")
+                return
+            new_text = self._expand_paste_references(new_prompt.strip())
+            # Editing a voice-queued item keeps its voice sentinel so the
+            # concise-voice-response prefix still applies (#65827).
+            if isinstance(items[idx - 1], _VoiceInputMessage):
+                items[idx - 1] = _VoiceInputMessage(new_text)
+            else:
+                items[idx - 1] = new_text
+            self._replace_pending_input_items(items)
+            shown = str(items[idx - 1])
+            _cprint(f"  Updated queue item {idx}: {shown[:80]}{'...' if len(shown) > 80 else ''}")
+            return
+
+        if action_l == "move":
+            bits = rest.split()
+            if len(bits) != 2 or not bits[0].isdigit() or not bits[1].isdigit():
+                _cprint("  Usage: /queue move <from> <to>")
+                return
+            src, dst = int(bits[0]), int(bits[1])
+            items = self._pending_input_items()
+            if src < 1 or src > len(items) or dst < 1 or dst > len(items):
+                _cprint(f"  Queue move out of range. Current size: {len(items)}")
+                return
+            item = items.pop(src - 1)
+            items.insert(dst - 1, item)
+            self._replace_pending_input_items(items)
+            _cprint(f"  Moved queue item {src} to {dst}.")
+            return
+
     def process_command(self, command: str) -> bool:
         """
         Process a slash command.
@@ -13017,18 +13157,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "btw":
             self._handle_btw_command(cmd_original)
         elif canonical == "queue":
-            # Extract prompt after "/queue " or "/q "
-            parts = cmd_original.split(None, 1)
-            payload = parts[1].strip() if len(parts) > 1 else ""
-            payload = self._expand_paste_references(payload)
-            if not payload:
-                _cprint("  Usage: /queue <prompt>")
-            else:
-                self._pending_input.put(payload)
-                if self._agent_running:
-                    _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
-                else:
-                    _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+            self._handle_queue_command(cmd_original)
         elif canonical == "steer":
             # Inject a message after the next tool call without interrupting.
             # If the agent is actively running, push the text into the agent's
