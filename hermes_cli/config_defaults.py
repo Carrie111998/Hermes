@@ -632,9 +632,11 @@ DEFAULT_CONFIG = {
         # When true, local browsing (the Browser Use CLI, or the built-in
         # browser tools) runs on a Hermes-managed SNAPSHOT of the user's
         # ACTIVE default-Chromium profile (Local State -> profile.last_used) —
-        # its cookies, logins and preferences copied in and re-synced when a
-        # fresh session launches — driven by Hermes' packaged Chromium. Only
-        # the active profile is copied. The snapshot is a non-default dir, so it
+        # its portable cookies, logins and preferences copied once for bootstrap
+        # — driven by the user's real browser binary. The managed profile then owns
+        # its durable auth/storage state; partial per-launch source overlays would
+        # be inconsistent with Local Storage and IndexedDB. Only the active
+        # profile is copied. The snapshot is a non-default dir, so it
         # sidesteps Chrome 136+'s block on debugging the default profile and
         # never contends with the user's running browser. Turning this back off
         # deletes the snapshot store (~/.hermes/browser-profile/) so copied

@@ -69,9 +69,8 @@ class TestRealProfilePin:
         got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text()
         assert got == "cookies-Profile 4", "no pin = native last_used"
 
-    def test_re_sync_respects_pin_when_last_used_flips(self, tmp_path, monkeypatch):
-        """The wrong-principal regression: session 2 with different last_used
-        must NOT overlay a different profile's auth onto the pinned copy."""
+    def test_managed_profile_stays_on_pin_when_last_used_flips(self, tmp_path, monkeypatch):
+        """Later source changes must not replace the pinned managed identity."""
         import hermes_cli.browser_connect as bc
 
         src = self._make_profile(tmp_path / "real", last_used="Profile 2")
@@ -91,4 +90,21 @@ class TestRealProfilePin:
         dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
         assert err2 is None and dst2 == dst1
         got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text()
-        assert got == "cookies-Profile 2-v2", "auth re-sync must stay on the pin"
+        assert got == "cookies-Profile 2", "managed auth must stay durable"
+
+    def test_changing_pin_requires_managed_profile_reset(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        src = self._make_profile(tmp_path / "real", last_used="Profile 2")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        selected = {"pin": "Profile 2"}
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: selected["pin"])
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None and dst
+
+        selected["pin"] = "Profile 4"
+        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
+        assert dst2 is None
+        assert err2 and "initialized from 'Profile 2'" in err2
+        assert "real_profile_pin" in err2 and "delete the managed profile" in err2
