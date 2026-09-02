@@ -40,6 +40,18 @@ import time
 # critical first so operators see the worst fires at the top.
 SEVERITY_ORDER = ("warning", "error", "critical")
 
+# A run that produced a deliberate board transition proves the worker spawned
+# and ran. Only infrastructure-level non-outcomes such as ``timed_out``,
+# ``spawn_failed``, and ``gave_up`` may be skipped without breaking a crash
+# streak. ``reclaimed`` is the equivalent explicit operator reset.
+_WORKER_RAN_OUTCOMES = frozenset({
+    "completed",
+    "reclaimed",
+    "blocked",
+    "review_requested",
+    "changes_requested",
+})
+
 
 def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> bool:
     """Return True when ``severity`` meets or exceeds ``threshold``."""
@@ -698,13 +710,14 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
+        elif outcome in _WORKER_RAN_OUTCOMES:
+            # A deliberate lifecycle transition or reclaim proves this is no
+            # longer the same uninterrupted infrastructure crash streak.
             break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
+            # Infrastructure-level non-outcomes (timed_out, spawn_failed,
+            # gave_up) aren't crash signals, but they also don't prove the
+            # worker ran successfully enough to clear the crash streak.
             continue
     if consecutive < threshold:
         return []

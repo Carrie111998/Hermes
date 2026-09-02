@@ -101,6 +101,52 @@ def test_stuck_in_blocked_fires_past_threshold():
 
 
 
+def _repeated_crash_diagnostics(outcomes):
+    runs = [_run(outcome=outcome, run_id=index) for index, outcome in enumerate(outcomes, 1)]
+    return [
+        diagnostic
+        for diagnostic in kd.compute_task_diagnostics(_task(status="ready"), [], runs)
+        if diagnostic.kind == "repeated_crashes"
+    ]
+
+
+def test_repeated_crashes_clear_after_deliberate_worker_transitions():
+    outcomes = [
+        "crashed",
+        "blocked",
+        "crashed",
+        "crashed",
+        "changes_requested",
+        "review_requested",
+        "blocked",
+        "blocked",
+    ]
+
+    assert _repeated_crash_diagnostics(outcomes) == []
+
+
+def test_repeated_crashes_clear_after_review_handoff():
+    assert _repeated_crash_diagnostics(["crashed", "crashed", "review_requested"]) == []
+
+
+def test_repeated_crashes_clear_after_blocking_for_input():
+    assert _repeated_crash_diagnostics(["crashed", "crashed", "blocked"]) == []
+
+
+def test_repeated_crashes_skip_timeout_without_clearing_streak():
+    diagnostics = _repeated_crash_diagnostics(["crashed", "timed_out", "crashed"])
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].count == 2
+
+
+def test_repeated_crashes_still_fire_without_later_worker_transition():
+    diagnostics = _repeated_crash_diagnostics(["crashed", "crashed"])
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].count == 2
+
+
 def test_repeated_crashes_truncates_huge_tracebacks():
     """Full Python tracebacks can be tens of KB. The title stays one
     line (≤160 chars); the detail caps at 500 chars + ellipsis so the
