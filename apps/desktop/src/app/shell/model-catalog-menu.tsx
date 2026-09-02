@@ -23,7 +23,11 @@ import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
-import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
+import {
+  DEFAULT_REASONING_EFFORT,
+  reasoningEffortLabel,
+  resolveSupportedReasoningEffort
+} from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
@@ -305,7 +309,14 @@ export function ModelCatalogMenu({
 
     controller.applyPreset(
       {
-        effort: (caps?.reasoning ?? true) ? (preset.effort ?? defaultEffort) : undefined,
+        effort: (caps?.reasoning ?? true)
+          ? resolveSupportedReasoningEffort(
+              preset.effort ?? '',
+              defaultEffort,
+              caps?.supported_efforts,
+              caps?.can_disable_reasoning !== false
+            )
+          : undefined,
         fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
       },
       { model: family.id, provider: provider.slug }
@@ -516,6 +527,13 @@ export function ModelCatalogMenu({
                     const effEffort = isCurrent ? current.effort : (preset.effort ?? '')
                     const effFast = isCurrent ? current.fast : (preset.fast ?? false)
 
+                    const resolvedEffort = resolveSupportedReasoningEffort(
+                      effEffort,
+                      defaultEffort,
+                      caps?.supported_efforts,
+                      caps?.can_disable_reasoning !== false
+                    )
+
                     const fastControl: FastControl = resolveFastControl(
                       activeId ?? family.id,
                       group.provider.models ?? [],
@@ -525,7 +543,9 @@ export function ModelCatalogMenu({
 
                     const meta = [
                       fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
-                      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
+                      (caps?.reasoning ?? true) && resolvedEffort !== 'none'
+                        ? reasoningEffortLabel(resolvedEffort)
+                        : null
                     ]
                       .filter(Boolean)
                       .join(' ')
@@ -598,6 +618,7 @@ export function ModelCatalogMenu({
                           }
                           provider={group.provider.slug}
                           reasoning={caps?.reasoning ?? true}
+                          supportedEfforts={caps?.supported_efforts}
                         />
                       </DropdownMenuSub>
                     )
