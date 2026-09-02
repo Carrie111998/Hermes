@@ -3695,6 +3695,15 @@ def _build_document_context_note(
     wording ("Ask the user what they'd like you to do with it") steered the
     model into punting back to the user, which is why attached PDFs/DOCX looked
     "unreadable" to the agent even though it has the tools to read them.
+
+    The extraction guidance points at ``read_file`` first, not the terminal
+    tool. ``read_file`` already extracts PDF/DOCX/XLSX/PPT text natively (see
+    ``tools/read_extract.py``) with no approval prompt — the terminal tool and
+    the ocr-and-documents skill both go through the command-approval gate,
+    which stalls on any platform whose approval UI is unreliable (e.g. a known
+    Teams adaptive-card bug at the time of writing). Sending the model to the
+    gated path first for what is usually a zero-approval read caused it to get
+    stuck waiting on approvals a chat platform couldn't reliably deliver.
     """
     if mtype.startswith("text/") and content_inlined:
         return (
@@ -3711,9 +3720,12 @@ def _build_document_context_note(
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
         f"Its text is not inlined here (it's a binary format such as PDF or DOCX). "
-        f"To read it, extract the document's text yourself — for example with the "
-        f"terminal tool or the ocr-and-documents skill — before answering, instead "
-        f"of asking the user to paste the contents.]"
+        f"To read it, first use the read_file tool directly on that path — it "
+        f"extracts PDF/DOCX/XLSX/PPT text natively and requires no approval. "
+        f"Only if read_file comes back empty or flags an extraction-coverage "
+        f"warning (a scanned/image-only document with no text layer), fall back "
+        f"to the terminal tool or the ocr-and-documents skill for OCR. Do this "
+        f"before answering, instead of asking the user to paste the contents.]"
     )
 
 

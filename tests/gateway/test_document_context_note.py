@@ -8,6 +8,11 @@ is perfectly capable of reading. These tests pin the contract:
 - text documents: note confirms the (adapter-)inlined content + records path.
 - binary documents (PDF/DOCX/…): note tells the agent to extract the text
   itself and never tells it to punt back to the user.
+- binary documents: note recommends the zero-approval `read_file` tool before
+  the terminal tool / ocr-and-documents skill, both of which are gated behind
+  command approval. A prior wording pointed straight at the terminal tool,
+  which stalled indefinitely on any platform whose approval UI can't deliver
+  the prompt (e.g. a known Teams adaptive-card bug at the time of writing).
 """
 
 import importlib
@@ -100,4 +105,22 @@ class TestBinaryDocumentNote:
         # ...and does NOT steer it into punting back to the user (the bug).
         assert "ask the user" not in note.lower()
         assert "paste" in note.lower()
+
+    @pytest.mark.parametrize(
+        "mtype",
+        [
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/octet-stream",
+        ],
+    )
+    def test_binary_note_recommends_read_file_before_terminal_tool(self, mtype):
+        note = _build_document_context_note("contract.pdf", "/cache/doc_contract.pdf", mtype)
+        lower = note.lower()
+        assert "read_file" in lower
+        # read_file must be the first extraction path offered, not a mention
+        # buried after the gated terminal-tool/skill fallback.
+        assert lower.index("read_file") < lower.index("terminal tool")
+        assert lower.index("read_file") < lower.index("ocr-and-documents")
 
