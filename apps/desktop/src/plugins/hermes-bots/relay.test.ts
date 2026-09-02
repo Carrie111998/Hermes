@@ -632,6 +632,50 @@ describe('the drain loop wires drain → deliver → reply', () => {
     stopBotRelay()
   })
 
+  it('waits for the registered target warm dial before using its synthesized route', async () => {
+    let finishWarm!: () => void
+
+    const warmPending = new Promise<void>(resolve => {
+      finishWarm = resolve
+    })
+
+    hostMock.connections = vi.fn(async () => [{ id: 'a', kind: 'local' }, { id: 'b', kind: 'ssh' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('c')])
+    hostMock.warmAgent = vi.fn(() => warmPending)
+
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? [envelope] : [] }
+      }
+
+      if (call.method === 'bot_relay.deliver') {
+        return { reply: 'dial was ready' }
+      }
+
+      return {}
+    })
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(0)
+    calls.length = 0
+    const drain = pushAndSettle()
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(calls.some(call => call.method === 'bot_relay.deliver')).toBe(false)
+
+    finishWarm()
+    await drain
+
+    expect(calls.find(call => call.method === 'bot_relay.deliver')).toMatchObject({
+      connectionId: 'b',
+      params: { message: 'status?', profile: 'ops' }
+    })
+
+    stopBotRelay()
+  })
+
   it('forwards the gateway’s typed failure reason to both the reply and the badge', async () => {
     // #93091: bot_relay.deliver classifies the failed turn and ships the code
     // in `data.reason`; a classified code beats re-parsing free text.

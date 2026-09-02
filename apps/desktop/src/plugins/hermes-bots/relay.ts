@@ -222,7 +222,12 @@ async function waitForRelayConnection(
   // SSH/backend socket. Ask the existing non-foregrounding warm path to dial
   // the target, then poll only for its credential-free route to reappear.
   if (typeof host.warmAgent === 'function') {
-    host.warmAgent(connectionId, profile)
+    try {
+      await host.warmAgent(connectionId, profile)
+    } catch {
+      // A failed pre-dial can still race with the Desktop's own reconnect.
+      // Keep the bounded inventory loop below as the final authority.
+    }
   }
 
   // A remembered SSH roster can momentarily suppress its undialed seed route
