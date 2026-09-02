@@ -200,7 +200,40 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
             "hermes_cli.main",
             "desktop",
         ]
+    hermes_home = _custom_hermes_home()
+    if hermes_home:
+        # Desktop Entry Exec is argv, not shell syntax: a leading
+        # ``HERMES_HOME=...`` would be treated as the program name.  Resolve
+        # env while creating the entry, then persist its absolute path so the
+        # cold desktop session need not provide a shell PATH (including on
+        # Nix/profile installations).  If no env executable is available,
+        # retain the pre-existing runnable command rather than write a dead
+        # launcher.
+        env = shutil.which("env")
+        if env:
+            argv = [env, f"HERMES_HOME={hermes_home}", *argv]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _custom_hermes_home() -> Optional[str]:
+    """Return an absolute, non-default process ``HERMES_HOME``, if set.
+
+    A desktop launcher is started outside the installing shell, so preserve
+    this process-scoped selection only when it differs from the platform
+    default.  Resolving here also freezes a relative setting against the cwd
+    in which the entry was installed, matching its effective value.
+    """
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if not raw:
+        return None
+    try:
+        home = Path(raw).expanduser().resolve(strict=False)
+        default = (Path.home() / ".hermes").resolve(strict=False)
+    except OSError:
+        return None
+    if home == default:
+        return None
+    return str(home)
 
 
 def _resolve_hermes_bin_for_desktop_entry(

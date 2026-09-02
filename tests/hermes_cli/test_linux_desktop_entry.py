@@ -21,6 +21,10 @@ def xdg_home(tmp_path, monkeypatch) -> Path:
     # Isolate the known-wrapper probe too: tests must never see the real
     # ~/.local/bin/hermes on the dev machine.
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Tests in this module should start from the normal default-home behavior.
+    # The suite-wide isolation fixture injects a temporary HERMES_HOME; tests
+    # that exercise custom-home persistence set it explicitly themselves.
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(lde.sys, "platform", "linux")
     return data_home
 
@@ -660,6 +664,50 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+def test_install_preserves_nondefault_hermes_home_for_cold_desktop_launch(
+    tmp_path, xdg_home, monkeypatch
+):
+    """The menu launcher must retain custom state outside its shell env."""
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    custom_home = tmp_path / "managed Hermes home"
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+
+    assert _parse(entry.read_text(encoding="utf-8"))["Exec"] == (
+        f'/usr/bin/env "HERMES_HOME={custom_home}" {hermes_bin} desktop'
+    )
+
+
+def test_install_does_not_prefix_default_hermes_home(
+    tmp_path, xdg_home, monkeypatch
+):
+    root = _make_project(tmp_path)
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+
+    assert _parse(entry.read_text(encoding="utf-8"))["Exec"] == (
+        f"{hermes_bin} desktop"
+    )
 
 
 @pytest.mark.skipif(
