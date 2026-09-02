@@ -1120,6 +1120,95 @@ class TestCustomProviderCompatibility:
             }
         ]
 
+    def test_dedup_across_legacy_and_providers(self, tmp_path):
+        """Same name+url in both schemas should not produce duplicates."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 17,
+                    "custom_providers": [
+                        {
+                            "name": "OpenAI Direct",
+                            "base_url": "https://api.openai.com/v1",
+                            "api_key": "legacy-key",
+                        }
+                    ],
+                    "providers": {
+                        "openai-direct": {
+                            "api": "https://api.openai.com/v1",
+                            "api_key": "new-key",
+                            "name": "OpenAI Direct",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            compatible = get_compatible_custom_providers()
+
+        assert len(compatible) == 1
+        # Legacy entry wins (read first)
+        assert compatible[0]["api_key"] == "legacy-key"
+
+    def test_dedup_preserves_entries_with_different_models(self, tmp_path):
+        """Entries with same name+URL but different models must not be collapsed."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 17,
+                    "custom_providers": [
+                        {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "qwen3-coder"},
+                        {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "glm-5.1"},
+                        {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "kimi-k2.5"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            compatible = get_compatible_custom_providers()
+
+        assert len(compatible) == 3
+        models = [e.get("model") for e in compatible]
+        assert models == ["qwen3-coder", "glm-5.1", "kimi-k2.5"]
+
+    def test_string_custom_providers_does_not_suppress_providers_dict(
+        self, tmp_path
+    ):
+        """String-form custom_providers (e.g. from `hermes config set` JSON
+        serialisation) must not suppress valid ``providers:`` dict entries."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 17,
+                    "custom_providers": '[{"name":"broken","base_url":"https://x.com"}]',
+                    "providers": {
+                        "my-provider": {
+                            "api": "https://api.example.com/v1",
+                            "api_key": "test-key",
+                            "name": "My Provider",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            compatible = get_compatible_custom_providers()
+
+        # The malformed custom_providers string is skipped (logged warning),
+        # but the providers dict entry is still resolved.
+        assert len(compatible) == 1
+        assert compatible[0]["name"] == "My Provider"
+        assert compatible[0]["base_url"] == "https://api.example.com/v1"
+        assert compatible[0]["provider_key"] == "my-provider"
 
 class TestInterimAssistantMessageConfig:
     """Test the explicit gateway interim-message config gate."""
