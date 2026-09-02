@@ -9529,7 +9529,7 @@ def _minimax_save_auth_state(auth_state: Dict[str, Any]) -> None:
 
 def _minimax_oauth_login(
     *, region: str = "global", open_browser: bool = True,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 15.0, label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run MiniMax OAuth flow, persist tokens, return auth state dict."""
     pconfig = PROVIDER_REGISTRY["minimax-oauth"]
@@ -9602,6 +9602,8 @@ def _minimax_oauth_login(
         "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
         "expires_in": expires_in_s,
     }
+    if label:
+        auth_state["label"] = label
 
     _minimax_save_auth_state(auth_state)
     print("\u2713 MiniMax OAuth login successful.")

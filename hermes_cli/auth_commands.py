@@ -495,26 +495,19 @@ def auth_add_command(args) -> None:
         return
 
     if provider == "minimax-oauth":
-        creds = auth_mod._minimax_oauth_login(
+        requested_label = (getattr(args, "label", None) or "").strip()
+        auth_mod._minimax_oauth_login(
             open_browser=not getattr(args, "no_browser", False),
             timeout_seconds=getattr(args, "timeout", None) or 15.0,
+            label=requested_label or None,
         )
-        label = (getattr(args, "label", None) or "").strip() or label_from_token(
-            creds["access_token"],
-            _oauth_default_label(provider, len(pool.entries()) + 1),
+        pool = load_pool(provider)
+        entry = next(
+            (item for item in pool.entries() if item.source == "oauth"),
+            None,
         )
-        entry = PooledCredential(
-            provider=provider,
-            id=uuid.uuid4().hex[:6],
-            label=label,
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=f"{SOURCE_MANUAL}:minimax_oauth",
-            access_token=creds["access_token"],
-            refresh_token=creds.get("refresh_token"),
-            base_url=creds.get("inference_base_url"),
-        )
-        pool.add_entry(entry)
+        if entry is None:
+            raise SystemExit("MiniMax login succeeded but the OAuth pool was not seeded.")
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
