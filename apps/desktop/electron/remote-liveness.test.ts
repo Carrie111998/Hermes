@@ -260,6 +260,87 @@ describe('revalidateRemoteConnection', () => {
 })
 
 describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
+  function latencyHarness(healthyAfterMs: null | number) {
+    const cached = { baseUrl: 'https://gateway.example.com', mode: 'remote' }
+    const replacement = { baseUrl: 'https://replacement.example.com', mode: 'remote' }
+    const cachedPromise = Promise.resolve(cached)
+    let currentPromise: Promise<typeof cached> | null = cachedPromise
+
+    const retire = vi.fn(async () => {
+      currentPromise = null
+    })
+
+    const reconnect = vi.fn(async () => replacement)
+
+    const probe = vi.fn(
+      (_connection, _path, { timeoutMs }: { timeoutMs: number }) =>
+        new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+          }, timeoutMs)
+
+          if (healthyAfterMs !== null) {
+            setTimeout(() => {
+              clearTimeout(timeout)
+              resolve({ ok: true })
+            }, healthyAfterMs)
+          }
+        })
+    )
+
+    const pending = ensureHealthyPooledRemoteBackendForDispatch({
+      connectionPromise: cachedPromise,
+      currentConnectionPromise: () => currentPromise,
+      probe,
+      reconnect,
+      retire
+    })
+
+    return { cached, pending, probe, reconnect, replacement, retire }
+  }
+
+  it.each([
+    ['distant authenticated origin latency observed at 4.71s', 4_710],
+    ['transient load on the remote host', 3_250]
+  ])('keeps a healthy cached descriptor through %s', async (_scenario, healthyAfterMs) => {
+    vi.useFakeTimers()
+
+    try {
+      const test = latencyHarness(healthyAfterMs)
+
+      await vi.advanceTimersByTimeAsync(healthyAfterMs)
+
+      await expect(test.pending).resolves.toBe(test.cached)
+      expect(test.retire).not.toHaveBeenCalled()
+      expect(test.reconnect).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds a hung probe at eight seconds before retiring and reconnecting', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const test = latencyHarness(null)
+
+      await Promise.resolve()
+      expect(test.probe).toHaveBeenCalledWith(test.cached, '/api/status', { timeoutMs: 8_000 })
+
+      await vi.advanceTimersByTimeAsync(7_999)
+      expect(test.retire).not.toHaveBeenCalled()
+      expect(test.reconnect).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+
+      await expect(test.pending).resolves.toBe(test.replacement)
+      expect(test.retire).toHaveBeenCalledOnce()
+      expect(test.reconnect).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('retires a dead cached descriptor and gives dispatch the replacement', async () => {
     const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
     const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
