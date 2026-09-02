@@ -7476,7 +7476,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                # Mark unresolved so the action handler's atomic-pop guard can
+                # Mark unresolved so the action handler's consume-marker guard can
                 # reject double-clicks (mirrors _approval_resolved).
                 self._clarify_resolved[msg_ts] = False
                 self._trim_oldest_dict_entries(
@@ -7584,6 +7584,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Unauthorized slash-confirm click by %s (%s) - ignoring",
                 user_name, user_id,
             )
+            await self._notify_unauthorized_click(channel_id, user_id, team_id)
             return
 
         # Authorization — reuse the exec-approval allowlist.
@@ -7705,6 +7706,30 @@ class SlackAdapter(BasePlatformAdapter):
             message.get("ts", ""),
         )
 
+    async def _notify_unauthorized_click(
+        self, channel_id: str, user_id: str, team_id: Optional[str]
+    ) -> None:
+        """Ephemeral 'not authorized' notice for a rejected button click.
+
+        Feedback, not silence (enterprise field report 2026-08-20: "buttons
+        often do nothing"): the clicker cannot distinguish an auth rejection
+        from a broken button unless we tell them. Best-effort — a failed
+        ephemeral send never blocks the rejection itself.
+        """
+        try:
+            await self._get_client(
+                channel_id, team_id=team_id or None
+            ).chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=(
+                    "You're not authorized to resolve this prompt — "
+                    "ask an authorized user to press the button."
+                ),
+            )
+        except Exception as exc:
+            logger.debug("[Slack] ephemeral auth notice failed: %s", exc)
+
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
         await ack()
@@ -7728,6 +7753,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",
                 user_name, user_id,
             )
+            await self._notify_unauthorized_click(channel_id, user_id, team_id)
             return
 
         # Only authorized users may click approval buttons.  Button clicks
@@ -7753,7 +7779,10 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
+        # Prevent double-clicks — first caller flips the marker to True and
+        # proceeds; later callers see True and return. The marker is SET, not
+        # popped: a popped key would be indistinguishable from a prompt this
+        # process never sent, and that distinction now matters (below).
         # Check both the workspace-scoped marker and the bare ts: the approval
         # may have been stored without a team id (metadata-poor send path)
         # while the click event carries one, and that mismatch must not
@@ -7761,7 +7790,33 @@ class SlackAdapter(BasePlatformAdapter):
         approval_key = self._workspace_message_marker(team_id, msg_ts)
         if msg_ts in self._approval_resolved:
             approval_key = msg_ts
-        if self._approval_resolved.pop(approval_key, True):
+        if approval_key in self._approval_resolved:
+            if self._approval_resolved[approval_key]:
+                return  # genuine double-click — already consumed
+            self._approval_resolved[approval_key] = True
+        else:
+            # Unknown ts: this prompt predates the current process (gateway
+            # restart) — the dict is in-process memory, so restart-orphaned
+            # prompts are absent, NOT already-resolved. Treating absent as
+            # resolved silently swallowed the first legitimate click
+            # (enterprise field report 2026-08-20).
+            #
+            # Do NOT resolve anything from this branch: the orphan's waiter
+            # died with the old process, and resolve_gateway_approval() is
+            # FIFO within the session — an orphaned click could otherwise
+            # approve a DIFFERENT, live command (review finding). Render the
+            # honest outcome directly and consume the key so double-clicks
+            # on the orphan stay no-ops.
+            self._approval_resolved[approval_key] = True
+            self._trim_oldest_dict_entries(
+                self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+            )
+            await self._render_approval_outcome(
+                channel_id, msg_ts, message, team_id,
+                "⌛ Approval expired — command was not run "
+                "(the gateway restarted since this prompt was sent; "
+                "re-run the task to get a fresh prompt)",
+            )
             return
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
@@ -7798,6 +7853,21 @@ class SlackAdapter(BasePlatformAdapter):
                 "(already timed out or resolved elsewhere)"
             )
 
+        await self._render_approval_outcome(
+            channel_id, msg_ts, message, team_id, decision_text
+        )
+
+        # (approval already resolved above; guard marker consumed in place)
+
+    async def _render_approval_outcome(
+        self,
+        channel_id: str,
+        msg_ts: str,
+        message: dict,
+        team_id: Optional[str],
+        decision_text: str,
+    ) -> None:
+        """Rewrite an approval message with its outcome and drop the buttons."""
         # Get original text from the section block
         original_text = ""
         for block in message.get("blocks", []):
@@ -7836,8 +7906,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # (approval already resolved above; state consumed by atomic pop)
-
     async def _update_clarify_message(
         self,
         channel_id: str,
@@ -7870,6 +7938,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
         await ack()
 
+        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
@@ -7887,6 +7956,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
                 user_name, user_id,
             )
+            await self._notify_unauthorized_click(channel_id, user_id, team_id)
             return
 
         # value packs ``clarify_id|<idx|other>``.
@@ -7895,10 +7965,20 @@ class SlackAdapter(BasePlatformAdapter):
             return
         clarify_id, token = value.split("|", 1)
 
-        # Double-click guard — atomic pop; first caller gets False (proceed),
-        # any later click gets the True default and bails (mirrors approval).
-        if self._clarify_resolved.pop(msg_ts, True):
-            return
+        # Double-click guard — first caller flips the marker and proceeds;
+        # later clicks bail (mirrors approval). An UNKNOWN ts is a prompt from
+        # before a gateway restart, not a resolved one: proceed — the clarify
+        # module's own expiry handling below renders the honest outcome
+        # (enterprise field report 2026-08-20: silent swallows).
+        if msg_ts in self._clarify_resolved:
+            if self._clarify_resolved[msg_ts]:
+                return
+            self._clarify_resolved[msg_ts] = True
+        else:
+            self._clarify_resolved[msg_ts] = True
+            self._trim_oldest_dict_entries(
+                self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
+            )
 
         # Preserve the original question so the resolved message keeps context.
         original_text = ""

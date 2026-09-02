@@ -841,3 +841,190 @@ class TestSlackReactionAuthorizationGate:
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
 
+
+
+# ===========================================================================
+# Silent-swallow fixes (enterprise field report 2026-08-20): clicks must
+# NEVER be silently ignored — every press gets feedback or resolution.
+# ===========================================================================
+
+class TestRestartOrphanedApprovalClick:
+    """A prompt sent before a gateway restart is unknown to the new
+    process's _approval_resolved dict. The first click on it must not be
+    silently swallowed: attempt resolution (0 pending → renders expired)."""
+
+    def _click_body(self, ts="9999.0001"):
+        return {
+            "message": {"ts": ts, "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "cmd"}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "flong", "id": "U_FLONG"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_unknown_ts_click_renders_expired_not_silence(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        # NOTE: no _approval_resolved entry for this ts — restart-orphaned.
+        ack = AsyncMock()
+        action = {"action_id": "hermes_approve_once", "value": "sess-key"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=0) as mock_resolve:
+            await adapter._handle_approval_action(ack, self._click_body(), action)
+
+        # CRITICAL: the orphan branch must NOT call the FIFO resolver — the
+        # orphan's waiter died with the old process, and a FIFO resolve could
+        # approve a DIFFERENT live command in the same session (salt review
+        # finding on the first version of this fix).
+        mock_resolve.assert_not_called()
+        assert mock_client.chat_update.called, (
+            "restart-orphaned click was silently swallowed — no feedback"
+        )
+        update_text = mock_client.chat_update.call_args[1]["text"]
+        assert "expired" in update_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_orphan_click_cannot_approve_a_live_pending_approval(self):
+        """End-to-end FIFO-hazard probe with the REAL approval queue: a live
+        pending approval for a different command must still be pending after
+        an orphaned click lands in the same session."""
+        from tools import approval as approval_mod
+
+        session_key = "orphan-fifo-probe-session"
+        approval_mod._gateway_queues.pop(session_key, None)
+        try:
+            entry = approval_mod._ApprovalEntry(
+                {"command": "deploy --prod", "description": "live command",
+                 "pattern_key": "dangerous", "pattern_keys": ["dangerous"]}
+            ) if hasattr(approval_mod, "_ApprovalEntry") else None
+            if entry is None:
+                pytest.skip("_ApprovalEntry not accessible")
+            approval_mod._gateway_queues.setdefault(session_key, []).append(entry)
+
+            adapter = _make_adapter()
+            _attach_auth_runner(adapter)
+            ack = AsyncMock()
+            body = self._click_body("8888.0001")
+            action = {"action_id": "hermes_approve_once", "value": session_key}
+            adapter._team_clients["T1"].chat_update = AsyncMock()
+
+            await adapter._handle_approval_action(ack, body, action)
+
+            queue = approval_mod._gateway_queues.get(session_key) or []
+            assert len(queue) == 1, (
+                "orphaned click consumed a LIVE pending approval for a "
+                "different command — FIFO hazard"
+            )
+        finally:
+            approval_mod._gateway_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_genuine_double_click_stays_silent(self):
+        """The double-click guard must survive the orphan fix: a ts that WAS
+        tracked and consumed by a first click stays a no-op on the second."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["5555.0001"] = False
+        ack = AsyncMock()
+        action = {"action_id": "hermes_approve_once", "value": "sess-key"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._handle_approval_action(ack, self._click_body("5555.0001"), action)
+            first_updates = mock_client.chat_update.call_count
+            await adapter._handle_approval_action(ack, self._click_body("5555.0001"), action)
+
+        assert mock_resolve.call_count == 1, "double-click resolved twice"
+        assert mock_client.chat_update.call_count == first_updates, (
+            "second click re-rendered the message"
+        )
+
+
+class TestUnauthorizedClickFeedback:
+    """An unauthorized clicker must receive ephemeral feedback, not silence."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_click_gets_ephemeral_notice(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = False
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_ATTACKER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "sess-key"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postEphemeral = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_resolve.assert_not_called()  # auth boundary unchanged
+        assert mock_client.chat_postEphemeral.called, (
+            "unauthorized click produced zero user feedback"
+        )
+        eph = mock_client.chat_postEphemeral.call_args[1]
+        assert eph["user"] == "U_ATTACKER"
+        assert "not authorized" in eph["text"].lower()
+
+
+class TestSiblingLanesNeverSilent:
+    """The same two contracts hold for clarify (and slash-confirm auth)."""
+
+    @pytest.mark.asyncio
+    async def test_restart_orphaned_clarify_click_renders_expired(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        # No _clarify_resolved entry — restart-orphaned prompt.
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "7777.0001", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "which one?"}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "flong", "id": "U_FLONG"},
+        }
+        action = {"action_id": "hermes_clarify_choice_0", "value": "cl-1|0"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=False):
+            await adapter._handle_clarify_action(ack, body, action)
+
+        assert mock_client.chat_update.called, (
+            "restart-orphaned clarify click silently swallowed"
+        )
+        rendered = mock_client.chat_update.call_args[1]["text"]
+        assert "expired" in rendered.lower()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_slash_confirm_click_gets_ephemeral(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "2222.3333", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_ATTACKER"},
+        }
+        action = {"action_id": "hermes_confirm_once", "value": "sess|cid"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postEphemeral = AsyncMock()
+
+        await adapter._handle_slash_confirm_action(ack, body, action)
+
+        assert mock_client.chat_postEphemeral.called
+        assert "not authorized" in mock_client.chat_postEphemeral.call_args[1]["text"].lower()
