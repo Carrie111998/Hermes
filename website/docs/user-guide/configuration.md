@@ -2072,6 +2072,7 @@ Supported fields:
 
 | Field | Renders | Example |
 | --- | --- | --- |
+| `bot` | Active Hermes profile name (multi-bot fleets) | `finance` |
 | `model` | Bare model id, vendor prefix dropped | `gpt-5.4` |
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
@@ -2080,6 +2081,20 @@ Supported fields:
 The default field set is `["model", "context_pct", "cwd"]`. `latency` is opt-in — add it to `fields` to use it. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
 
 The `/footer` slash command toggles this at runtime in any session.
+
+The `bot` field shows the profile that served the turn (resolved from the
+source's profile context — `source.profile`, then profile routing, then the
+active profile). To display a custom label instead of the profile name, set
+`display.runtime_footer.bot_name` (a per-platform override is also honored
+under `display.platforms.<platform>.runtime_footer.bot_name`):
+
+```yaml
+display:
+  runtime_footer:
+    enabled: true
+    fields: ["bot", "model", "context_pct"]
+    bot_name: "Jimmy_Fin_bot"
+```
 
 Example footer appended to a Telegram/Discord/Slack reply:
 

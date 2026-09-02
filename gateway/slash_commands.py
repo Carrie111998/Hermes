@@ -4451,12 +4451,23 @@ class GatewaySlashCommandsMixin:
         state = t("gateway.footer.state_on") if new_state else t("gateway.footer.state_off")
         example = ""
         if new_state:
-            # Show a preview using current agent state if available.
+            # Show a preview using current agent state if available. Resolve
+            # the bot label exactly as build_footer_line does for a real
+            # turn: bot_name override, then _footer_profile_label(source)
+            # (source.profile → routing → active profile), so the preview
+            # matches what real replies render even on multiplexed
+            # gateways.
             from gateway.runtime_footer import format_runtime_footer
+
+            bot_label = (
+                effective.get("bot_name")
+                or self._footer_profile_label(event.source)
+            )
             preview = format_runtime_footer(
                 model=_resolve_gateway_model(user_config) or None,
                 context_tokens=0,
                 context_length=None,
+                bot_name=bot_label,
                 fields=effective.get("fields") or ["model", "context_pct", "cwd"],
             )
             if preview:
