@@ -2214,6 +2214,12 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+        # Opt-in: when True, delegated subagents load the parent's SOUL.md
+        # identity on top of the ephemeral "focused subagent" prompt (inherit
+        # operating loop, host routing, conventions). DELEGATE_WITH_SOUL env
+        # var is honored as a fallback. Default False (subagents stay
+        # ephemeral-prompt-only).
+        "load_soul_identity": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
