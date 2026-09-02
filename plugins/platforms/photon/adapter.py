@@ -1498,6 +1498,32 @@ class PhotonAdapter(BasePlatformAdapter):
     @staticmethod
     def _find_listener_pids(port: int) -> List[int]:
         """PIDs listening on a local TCP port (empty if none/undeterminable)."""
+        if sys.platform == "win32":
+            # Use psutil on Windows (lsof is not available).
+            try:
+                import psutil
+                pids: List[int] = []
+                for conn in psutil.net_connections(kind="tcp"):
+                    if conn.laddr.port == port and conn.status == "LISTEN" and conn.pid:
+                        pids.append(conn.pid)
+                return pids
+            except Exception:
+                # Fallback: netstat parsing (slower, no deps).
+                try:
+                    out = subprocess.run(  # noqa: S603, S607
+                        ["netstat", "-ano", "-p", "TCP"],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5.0, check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    return []
+                pids = []
+                for line in out.stdout.splitlines():
+                    # Lines look like:  TCP    127.0.0.1:8789    0.0.0.0:0    LISTENING    1234
+                    if f":{port}" in line and "LISTENING" in line:
+                        parts = line.split()
+                        if parts and parts[-1].isdigit():
+                            pids.append(int(parts[-1]))
+                return pids
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
@@ -1510,6 +1536,16 @@ class PhotonAdapter(BasePlatformAdapter):
     @staticmethod
     def _pid_is_sidecar(pid: int) -> bool:
         """True if ``pid``'s command line is a Photon sidecar process."""
+        if sys.platform == "win32":
+            # Use psutil on Windows (ps is not available).
+            try:
+                import psutil
+                cmdline = " ".join(psutil.Process(pid).cmdline())
+                # Normalize backslashes to forward slashes for cross-platform matching.
+                cmdline = cmdline.replace("\\", "/")
+                return "photon/sidecar/index.mjs" in cmdline
+            except Exception:
+                return False
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["ps", "-p", str(pid), "-o", "command="],
@@ -1522,11 +1558,23 @@ class PhotonAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
+        if sys.platform == "win32":
+            try:
+                import psutil
+                return psutil.pid_exists(pid)
+            except Exception:
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except OSError:
+                    return False
         try:
-            os.kill(pid, 0)  # windows-footgun: ok — only called from _reap_stale_sidecar which win32-guards early
+            os.kill(pid, 0)
             return True
         except OSError:
             return False
+
+
 
     async def _reap_stale_sidecar(self) -> None:
         """Kill an orphaned sidecar squatting our port before spawning ours.
@@ -1539,8 +1587,9 @@ class PhotonAdapter(BasePlatformAdapter):
         orphans that predate it (or survived it). Listeners are verified by
         command line before being signalled.
         """
-        if sys.platform == "win32":  # lsof/ps; orphaning is a POSIX-only path
-            return
+        # On Windows, orphaning IS possible — the stdin-EOF watch helps but
+        # a fast gateway restart can still race the port release. Use psutil
+        # (or netstat fallback) to find and kill stale sidecars.
         try:
             async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
                 await client.post(
@@ -1549,8 +1598,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 )
         except httpx.RequestError:
             return  # nothing listening — the normal case
-        # Off the event loop: _find_listener_pids shells out to `lsof`
-        # (timeout=5s) and _pid_is_sidecar runs a `ps` per candidate pid
+        # Off the event loop: _find_listener_pids shells out to `lsof`/psutil
+        # (timeout=5s) and _pid_is_sidecar runs a `ps`/psutil per candidate pid
         # (timeout=5s each), so this inspection can hold the loop for
         # 5 + 5·N seconds. _reap_stale_sidecar is awaited from
         # _start_sidecar, which runs on every reconnect — exactly when a
@@ -1575,8 +1624,12 @@ class PhotonAdapter(BasePlatformAdapter):
                 pid, self._sidecar_port,
             )
             try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
+                if sys.platform == "win32":
+                    import psutil
+                    psutil.Process(pid).terminate()
+                else:
+                    os.kill(pid, signal.SIGTERM)
+            except (OSError, Exception):
                 pass
         deadline = time.time() + 3.0
         while time.time() < deadline and any(self._pid_alive(p) for p in stale):
@@ -1584,8 +1637,12 @@ class PhotonAdapter(BasePlatformAdapter):
         for pid in stale:
             if self._pid_alive(pid):
                 try:
-                    os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — unreachable on win32 (early return above)
-                except OSError:
+                    if sys.platform == "win32":
+                        import psutil
+                        psutil.Process(pid).kill()
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                except (OSError, Exception):
                     pass
         # Give the OS a beat to release the listening socket.
         await asyncio.sleep(0.2)
