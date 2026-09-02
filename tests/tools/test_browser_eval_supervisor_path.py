@@ -303,3 +303,86 @@ class TestEvaluateRuntimeDomNodeCrashRetry:
             assert calls == [True]
         finally:
             _stop_supervisor(sup)
+
+
+# ---------------------------------------------------------------------------
+# Initial page-target selection: tools.browser_supervisor._select_initial_page_target
+# ---------------------------------------------------------------------------
+
+
+class TestSelectInitialPageTarget:
+    """The supervisor must not attach to Chrome's New Tab when a real page exists.
+
+    Regression for the multi-tab wedge: ``_attach_initial_page`` used to grab
+    the first ``type == "page"`` entry from ``Target.getTargets``, which can
+    be the browser's own New Tab, so every supervisor-backed eval landed on
+    ``chrome://new-tab-page`` instead of the page Hermes navigated to.
+    """
+
+    @staticmethod
+    def _target(tid: str, url: str) -> dict:
+        return {"targetId": tid, "type": "page", "url": url}
+
+    def test_prefers_real_page_over_new_tab(self):
+        from tools.browser_supervisor import _select_initial_page_target
+
+        targets = [
+            self._target("t-newtab", "chrome://new-tab-page/"),
+            self._target("t-wiki", "https://en.wikipedia.org/wiki/Hermes_Agent"),
+        ]
+        picked = _select_initial_page_target(targets)
+        assert picked is not None
+        assert picked["targetId"] == "t-wiki"
+
+    def test_prefers_last_real_page_when_multiple(self):
+        from tools.browser_supervisor import _select_initial_page_target
+
+        targets = [
+            self._target("t-newtab", "chrome://new-tab-page/"),
+            self._target("t-old", "https://old.example.com/"),
+            self._target("t-latest", "https://latest.example.com/"),
+        ]
+        picked = _select_initial_page_target(targets)
+        assert picked is not None
+        assert picked["targetId"] == "t-latest"
+
+    def test_falls_back_to_internal_page_when_only_option(self):
+        from tools.browser_supervisor import _select_initial_page_target
+
+        targets = [
+            {"targetId": "t-bw", "type": "browser", "url": ""},
+            self._target("t-newtab", "chrome://new-tab-page/"),
+        ]
+        picked = _select_initial_page_target(targets)
+        assert picked is not None
+        assert picked["targetId"] == "t-newtab"
+
+    def test_falls_back_to_about_blank(self):
+        from tools.browser_supervisor import _select_initial_page_target
+
+        targets = [self._target("t-blank", "about:blank")]
+        picked = _select_initial_page_target(targets)
+        assert picked is not None
+        assert picked["targetId"] == "t-blank"
+
+    def test_returns_none_when_no_page_targets(self):
+        from tools.browser_supervisor import _select_initial_page_target
+
+        targets = [{"targetId": "t-bw", "type": "browser", "url": ""}]
+        picked = _select_initial_page_target(targets)
+        assert picked is None
+
+    def test_devtools_and_edge_prefixes_are_internal(self):
+        from tools.browser_supervisor import _is_internal_page_url
+
+        for url in (
+            "chrome://new-tab-page/",
+            "chrome-error://chromewebdata/",
+            "devtools://devtools/bundled/inspector.html",
+            "edge://newtab/",
+            "about:blank",
+        ):
+            assert _is_internal_page_url(url), url
+        assert not _is_internal_page_url("https://example.com/")
+        assert not _is_internal_page_url("")
+        assert not _is_internal_page_url(None)
