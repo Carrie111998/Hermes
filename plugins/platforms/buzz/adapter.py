@@ -935,6 +935,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._presence_task: Optional[asyncio.Task] = None
+        self._ws_connection = None
+        self._ws_send_lock = asyncio.Lock()
         self._presence_interval = _PRESENCE_INTERVAL
         self._presence_expiry = _PRESENCE_EXPIRY
         self._presence_margin = _PRESENCE_REFRESH_MARGIN
@@ -1027,34 +1029,43 @@ class BuzzAdapter(BasePlatformAdapter):
             input_text=input_text,
         )
 
-    async def _set_presence(self, status: str) -> bool:
-        """Publish a best-effort presence state to the Buzz relay."""
-        try:
-            code, _out, err = await self._run_cli(
-                ["users", "set-presence", "--status", status]
-            )
-        except Exception as exc:
-            logger.debug("Buzz: presence update to %s failed — %s", status, exc)
-            return False
-        if code != 0:
-            logger.debug(
-                "Buzz: presence update to %s failed — %s",
-                status,
-                _cli_error_message(err, code),
-            )
-            return False
-        return True
+    async def _send_ws(self, websocket, payload: list) -> None:
+        """Serialize all frames sharing the authenticated connection."""
+        async with self._ws_send_lock:
+            await websocket.send(json.dumps(payload, separators=(",", ":")))
 
-    async def _presence_loop(self) -> None:
-        """Refresh online presence until the adapter disconnects.
+    async def _publish_presence(self, websocket, status: str) -> None:
+        """Sign and publish a kind-20001 event on the authenticated socket.
 
-        Each sleep uses the effective cadence — the configured interval
-        clamped by :func:`_presence_refresh_interval` — so every refresh
-        lands at least the margin before the relay's presence TTL lapses,
-        including the first refresh after the connect-time publish.
+        Ephemeral kinds (20000-29999) are rejected by the relay's HTTP
+        bridge, so presence always rides the authenticated WebSocket. The
+        pure-Python secp256k1 signature is CPU-bound (~50ms); it runs in
+        the default executor so the inbound frame pump is never stalled.
+        """
+        build_presence_event = _load_nostr_auth().build_presence_event
+        event = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: build_presence_event(private_key=self._private_key, status=status),
+        )
+        await self._send_ws(websocket, ["EVENT", event])
+
+    async def _presence_heartbeat(self, websocket) -> None:
+        """Publish online immediately, then at the effective cadence.
+
+        Best-effort: a failed sign/send is logged and retried on the next
+        tick — it must never take down message delivery. Each sleep uses
+        the cadence from :func:`_presence_refresh_interval`, so every
+        publish lands at least the margin before the relay's 180-second
+        presence TTL lapses.
         """
         try:
             while True:
+                try:
+                    await self._publish_presence(websocket, "online")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Buzz: presence publish failed", exc_info=True)
                 await asyncio.sleep(
                     _presence_refresh_interval(
                         self._presence_interval,
@@ -1062,27 +1073,28 @@ class BuzzAdapter(BasePlatformAdapter):
                         self._presence_margin,
                     )
                 )
-                await self._set_presence("online")
         except asyncio.CancelledError:
             raise
 
-    async def _start_presence(self) -> None:
-        """Publish online presence and start its expiry-refresh task."""
-        await self._set_presence("online")
-        self._presence_task = asyncio.create_task(self._presence_loop())
-
     async def _stop_presence(self) -> None:
-        """Stop refreshing and publish offline presence best-effort."""
+        """Stop the heartbeat, then publish offline on the live socket.
+
+        Called from disconnect() *before* the WebSocket task is cancelled,
+        so the offline event still has an open socket to travel on. A
+        failed publish must not break shutdown (relay may already be gone);
+        cancellation still propagates.
+        """
         if self._presence_task and not self._presence_task.done():
             self._presence_task.cancel()
             await asyncio.gather(self._presence_task, return_exceptions=True)
         self._presence_task = None
+        websocket = self._ws_connection
+        self._ws_connection = None
+        if websocket is None:
+            return
         try:
-            await asyncio.wait_for(self._set_presence("offline"), timeout=5)
+            await asyncio.wait_for(self._publish_presence(websocket, "offline"), timeout=5)
         except Exception:
-            # Best-effort: never let presence block shutdown. (Timeouts are
-            # Exception subclasses on every supported Python, and
-            # CancelledError deliberately propagates.)
             pass
 
     # ── Connection lifecycle ──────────────────────────────────────────────
@@ -1203,8 +1215,6 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
-        # Publish online presence and refresh it against relay expiry.
-        await self._start_presence()
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -1231,6 +1241,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        # Presence: stop the heartbeat and publish offline on the live
+        # socket — this must happen BEFORE the WebSocket task is cancelled,
+        # because cancelling it closes the connection (the offline event
+        # needs the open socket to travel on). A failed publish must not
+        # break shutdown (relay may already be gone).
+        await self._stop_presence()
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -1245,9 +1261,6 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
-        # Presence: stop refreshing, then publish offline best-effort. A
-        # failed publish must not break shutdown (relay may already be gone).
-        await self._stop_presence()
         # Reaction lifecycle: cancel any in-flight transition tasks so
         # shutdown never leaks "task pending" warnings or hangs on a wedged
         # buzz-cli call.
@@ -2188,7 +2201,7 @@ class BuzzAdapter(BasePlatformAdapter):
             subscription_id,
             request_filter,
         ]
-        await websocket.send(json.dumps(request, separators=(",", ":")))
+        await self._send_ws(websocket, request)
 
     async def _subscribe_websocket(self, websocket) -> Dict[str, Optional[str]]:
         """Subscribe to every watched conversation plus membership events
@@ -2210,7 +2223,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     "since": max(self._membership_since - 1, 0),
                 },
             ]
-            await websocket.send(json.dumps(request, separators=(",", ":")))
+            await self._send_ws(websocket, request)
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
         return subscriptions
 
@@ -2281,6 +2294,29 @@ class BuzzAdapter(BasePlatformAdapter):
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
+                        self._ws_connection = websocket
+                        # First online publish happens inline before the
+                        # connection is reported ready; the heartbeat keeps
+                        # it fresh afterwards. Inline = no barrier window in
+                        # which cancellation could strand the heartbeat task.
+                        try:
+                            await self._publish_presence(websocket, "online")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning("Buzz: initial presence publish failed", exc_info=True)
+                        # The publish's executor await can silently consume a
+                        # cancellation delivered mid-signing on Python 3.11
+                        # (the loop then resumes with a pending cancel that is
+                        # never observed as terminal — shutdown would wedge
+                        # with orphan heartbeat/discovery tasks). Re-arm it
+                        # here, before any child task is spawned.
+                        loop_task = asyncio.current_task()
+                        if loop_task is not None and loop_task.cancelling():
+                            raise asyncio.CancelledError()
+                        self._presence_task = asyncio.create_task(
+                            self._presence_heartbeat(websocket)
+                        )
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
@@ -2359,13 +2395,36 @@ class BuzzAdapter(BasePlatformAdapter):
                                     logger.warning("Buzz: relay notice: %s", message[-1])
                         finally:
                             discovery_task.cancel()
-                            try:
-                                await discovery_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
+                            # gather(return_exceptions=True) reaps the child
+                            # without swallowing OUR OWN cancellation — a
+                            # bare `except CancelledError: pass` here would
+                            # resurrect the reconnect loop after shutdown.
+                            await asyncio.gather(discovery_task, return_exceptions=True)
+                            # Retire the heartbeat with this connection; the
+                            # reconnect's first inline publish renews online
+                            # immediately. No offline here — a transient drop
+                            # must not flap presence offline, and the relay
+                            # clears the lease when the socket closes anyway.
+                            if self._presence_task is not None:
+                                self._presence_task.cancel()
+                                await asyncio.gather(
+                                    self._presence_task, return_exceptions=True
+                                )
+                                self._presence_task = None
+                            if self._ws_connection is websocket:
+                                self._ws_connection = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    # On Python 3.11 a cancellation delivered inside
+                    # asyncio.wait_for() (e.g. mid-handshake) can surface as
+                    # TimeoutError instead of CancelledError (fixed in 3.12).
+                    # Retrying after that would resurrect this loop after
+                    # shutdown and wedge disconnect(); un-cancelling instead
+                    # propagates the shutdown.
+                    loop_task = asyncio.current_task()
+                    if loop_task is not None and loop_task.cancelling():
+                        raise asyncio.CancelledError() from e
                     self._ws_active = False
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)

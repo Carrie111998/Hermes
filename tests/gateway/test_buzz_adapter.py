@@ -92,7 +92,7 @@ def _make_adapter(extra=None):
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
     adapter._display_name = "Chip"
-    adapter._private_key = "nsec1test"
+    adapter._private_key = "00" * 31 + "03"
     # GatewayRunner installs this callback before intake starts. Attachment
     # tests are authorized by default and override the callback at the boundary.
     adapter.set_authorization_check(lambda *_args: True)
@@ -3184,49 +3184,45 @@ class TestBuzzAdapterLifecycle:
         assert adapter._lock_key is None
 
     @pytest.mark.asyncio
-    async def test_connect_publishes_online_and_disconnect_publishes_offline(self, monkeypatch):
-        """A connected Buzz agent must have a visible presence record."""
+    async def test_presence_publishes_on_authenticated_websocket_without_cli(self):
+        """Presence uses the already-authenticated inbound socket."""
         adapter = _make_adapter()
         cli = _ScriptedCli()
-        cli.script("users", "get", [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}])
-        cli.script("channels", "list", [{"channel_id": CHANNEL, "name": "general"}])
         adapter._run_cli = cli
-        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
-        monkeypatch.setattr(adapter, "_seed_channel", AsyncMock())
-        monkeypatch.setattr(adapter, "_discover_dms", AsyncMock())
-        monkeypatch.setattr(adapter, "_start_websocket", AsyncMock(return_value=True))
+        sent = []
 
-        assert await adapter.connect() is True
-        assert [
-            args for args, _input in cli.calls
-            if args[:2] == ["users", "set-presence"]
-        ] == [["users", "set-presence", "--status", "online"]]
+        class WebSocket:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
 
-        await adapter.disconnect()
-        assert [
-            args for args, _input in cli.calls
-            if args[:2] == ["users", "set-presence"]
-        ] == [
-            ["users", "set-presence", "--status", "online"],
-            ["users", "set-presence", "--status", "offline"],
-        ]
+        websocket = WebSocket()
+        await adapter._publish_presence(websocket, "online")
+
+        assert cli.calls == []
+        assert len(sent) == 1
+        assert sent[0][0] == "EVENT"
+        assert sent[0][1]["kind"] == 20001
+        assert sent[0][1]["content"] == "online"
+        # The event is self-authored: the signing key IS the subject.
+        assert sent[0][1]["pubkey"] == _buzz_mod._load_nostr_auth().public_key_hex(
+            "00" * 31 + "03"
+        )
 
     @pytest.mark.asyncio
-    async def test_presence_refreshes_until_cancelled(self):
+    async def test_presence_heartbeat_publishes_online_then_repeats(self):
         """The heartbeat republishes online presence before relay expiry."""
         adapter = _make_adapter()
         adapter._presence_interval = 0.001
         calls = []
         refreshed = asyncio.Event()
 
-        async def record_presence(status):
+        async def record_publish(websocket, status):
             calls.append(status)
             if len(calls) >= 2:
                 refreshed.set()
-            return True
 
-        adapter._set_presence = record_presence
-        task = asyncio.create_task(adapter._presence_loop())
+        adapter._publish_presence = record_publish
+        task = asyncio.create_task(adapter._presence_heartbeat(object()))
         try:
             await asyncio.wait_for(refreshed.wait(), timeout=1)
         finally:
@@ -3258,7 +3254,7 @@ class TestBuzzAdapterLifecycle:
 
     @pytest.mark.asyncio
     async def test_presence_first_and_repeat_refresh_lands_before_expiry(self):
-        """First refresh (and repeats) arrive before a short relay TTL lapses."""
+        """First publish (and repeats) arrive before a short relay TTL lapses."""
         adapter = _make_adapter()
         adapter._presence_interval = 0.05  # configured cadence would brush expiry
         adapter._presence_expiry = 0.06
@@ -3266,22 +3262,21 @@ class TestBuzzAdapterLifecycle:
         stamps = []
         done = asyncio.Event()
 
-        async def record_presence(status):
+        async def record_publish(websocket, status):
             stamps.append(time.monotonic())
             if len(stamps) >= 2:
                 done.set()
-            return True
 
-        adapter._set_presence = record_presence
+        adapter._publish_presence = record_publish
         start = time.monotonic()
-        task = asyncio.create_task(adapter._presence_loop())
+        task = asyncio.create_task(adapter._presence_heartbeat(object()))
         try:
             await asyncio.wait_for(done.wait(), timeout=2)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        # Effective cadence is expiry - margin = 0.02s; the first refresh
+        # Effective cadence is expiry - margin = 0.02s; the first publish
         # must land well before the 0.06s TTL, and the second on cadence.
         assert stamps[0] - start < adapter._presence_expiry
         assert 0 < stamps[1] - stamps[0] < 2 * (
@@ -3292,13 +3287,17 @@ class TestBuzzAdapterLifecycle:
     async def test_stop_presence_swallows_timeouts_but_not_cancellation(self):
         adapter = _make_adapter()
 
-        async def raise_cancelled(status):
+        async def raise_cancelled(websocket, status):
             raise asyncio.CancelledError()
 
         adapter._presence_task = None
-        adapter._set_presence = raise_cancelled
-        with pytest.raises(asyncio.CancelledError):
-            await adapter._stop_presence()
+        adapter._ws_connection = object()
+        adapter._publish_presence = raise_cancelled
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._stop_presence()
+        finally:
+            adapter._ws_connection = None
 
 
 # ── Credentials / requirements ────────────────────────────────────────────

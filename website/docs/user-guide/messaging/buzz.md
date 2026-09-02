@@ -138,7 +138,7 @@ If a reply never finishes (the agent crashes or processing hangs), the working r
 
 ## Presence
 
-Buzz relays expire presence records after about 3 minutes unless they are republished. The adapter publishes `online` when it connects, refreshes it every minute — comfortably inside that expiry window — and publishes `offline` on graceful shutdown (best-effort: a slow or unreachable relay never blocks startup or shutdown).
+Buzz relays expire presence records after about 3 minutes unless they are republished, and they tie a presence record to the authenticated WebSocket that published it: when that socket closes, the relay drops the record. So the adapter publishes presence on its own already-authenticated persistent WebSocket — a signed kind-20001 `online` event right after the NIP-42 handshake (before the connection is reported ready), refreshed at a conservative cadence well inside the expiry window, and `offline` on graceful shutdown while the socket is still open (best-effort: a slow or unreachable relay never blocks startup or shutdown). A transient disconnect never publishes `offline` — the relay clears the record itself, and the reconnect's first publish restores it immediately.
 
 ## Access control
 
