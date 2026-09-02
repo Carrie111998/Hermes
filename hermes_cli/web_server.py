@@ -1533,6 +1533,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # (`enabled`/`disabled` are list allow-lists omitted from DEFAULT_CONFIG) —
     # fold it into the agent tab rather than spawning a one-field orphan category.
     "plugins": "agent",
+    # `observability.service_name` is the only schema-surfaced observability
+    # field — keep it alongside the plugin settings it configures instead of
+    # creating a one-field dashboard tab.
+    "observability": "agent",
     # `doctor.live_probe_timeout` is the only schema-surfaced doctor field —
     # fold it into general rather than spawning a one-field orphan category.
     "doctor": "general",

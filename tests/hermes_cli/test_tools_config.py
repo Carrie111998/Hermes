@@ -2,6 +2,7 @@
 
 import logging
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -704,6 +705,22 @@ class TestBrowserUseCliInstalledForAllNonCamofoxBackends:
             _ensure_browser_use_cli()  # must not raise
 
         assert any("failed" in c.args[0] for c in warn.call_args_list)
+
+def test_langfuse_post_setup_persists_service_identity(monkeypatch):
+    """The supported Langfuse wizard writes its non-secret OTel identity."""
+    config = {}
+    saved = []
+    monkeypatch.setitem(sys.modules, "langfuse", object())
+    monkeypatch.setattr("hermes_cli.tools_config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda value: saved.append(value))
+    monkeypatch.setattr("hermes_cli.tools_config._prompt", lambda *args, **kwargs: "production-agent")
+    monkeypatch.setattr("hermes_cli.plugins_cmd._get_enabled_set", lambda: set())
+    monkeypatch.setattr("hermes_cli.plugins_cmd._save_enabled_set", lambda enabled: None)
+
+    _run_post_setup("langfuse")
+
+    assert config["observability"]["service_name"] == "production-agent"
+    assert saved == [config]
 
 
 class TestImagegenBackendRegistry:
