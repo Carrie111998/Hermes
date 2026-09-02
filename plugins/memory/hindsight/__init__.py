@@ -76,6 +76,10 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_RECALL_FAILURE_WARNING_INTERVAL_S = 600.0
+_RECALL_FAILURE_WARNING = (
+    "Hindsight recall is unavailable; continuing without recalled memory."
+)
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
 # AGENTS.md forbids shipping third-party attribution tags on-by-default until a
 # generic user-facing opt-in exists, so this stays unset unless the user sets it
@@ -801,6 +805,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_recall_returned = False
         self._last_recall_count = 0
         self._recall_indicator = True
+        # Automatic recall degrades to empty context on provider failure. Keep
+        # that behavior while making the outage visible without leaking query,
+        # endpoint, bank, or exception details. The monotonic timestamp is
+        # protected because background and synchronous recall may overlap.
+        self._last_recall_failure_warning_at: float | None = None
+        self._recall_failure_warning_lock = threading.Lock()
         # Deterministic retain indicator: emitted from sync_turn the moment a
         # retain is dispatched to the writer (see _emit_saving_indicator). Uses
         # the agent's status channel, injected via initialize(status_callback=).
@@ -1924,7 +1934,27 @@ class HindsightMemoryProvider(MemoryProvider):
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+            if self._prefetch_method == "recall":
+                self._report_recall_failure()
             return _RecallResult("", 0)
+
+    def _report_recall_failure(self) -> None:
+        """Emit one generic automatic-recall outage signal per ten minutes."""
+        now = time.monotonic()
+        with self._recall_failure_warning_lock:
+            previous = self._last_recall_failure_warning_at
+            if previous is not None and now - previous < _RECALL_FAILURE_WARNING_INTERVAL_S:
+                return
+            self._last_recall_failure_warning_at = now
+        logger.warning(_RECALL_FAILURE_WARNING)
+        if self._status_callback is not None:
+            try:
+                self._status_callback(_RECALL_FAILURE_WARNING)
+            except Exception:
+                logger.debug(
+                    "Hindsight recall failure status callback failed",
+                    exc_info=True,
+                )
 
     def _format_recall(self, result: str) -> str:
         if not result:

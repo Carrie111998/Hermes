@@ -6,6 +6,7 @@ turn counting, tags), and schema completeness.
 """
 
 import json
+import logging
 import os
 import re
 import stat
@@ -884,6 +885,68 @@ class TestRecallStatus:
         assert status is not None
         # Reflect synthesizes across memories → no discrete count (0).
         assert status.count == 0
+
+
+class TestAutomaticRecallFailureWarning:
+    def test_warning_is_generic_rate_limited_and_repeats_after_window(
+        self, provider, monkeypatch, caplog
+    ):
+        clock = 100.0
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.time.monotonic", lambda: clock
+        )
+        provider._run_hindsight_operation = MagicMock(
+            side_effect=RuntimeError("private endpoint and memory detail")
+        )
+        status_messages = []
+        provider._status_callback = status_messages.append
+
+        with caplog.at_level("DEBUG", logger="plugins.memory.hindsight"):
+            assert provider._do_recall("private query").text == ""
+            clock = 699.999
+            assert provider._do_recall("private query").text == ""
+            clock = 700.0
+            assert provider._do_recall("private query").text == ""
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert warnings == [
+            "Hindsight recall is unavailable; continuing without recalled memory.",
+            "Hindsight recall is unavailable; continuing without recalled memory.",
+        ]
+        assert status_messages == warnings
+        assert all("private" not in message for message in warnings)
+        debug = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG
+        ]
+        assert any("private endpoint and memory detail" in message for message in debug)
+
+    def test_reflect_failure_does_not_emit_recall_warning(
+        self, provider, caplog
+    ):
+        provider._prefetch_method = "reflect"
+        provider._run_hindsight_operation = MagicMock(
+            side_effect=RuntimeError("reflect unavailable")
+        )
+        with caplog.at_level("DEBUG", logger="plugins.memory.hindsight"):
+            assert provider._do_recall("query").text == ""
+        assert not [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+
+    def test_healthy_recall_remains_unchanged(self, provider, caplog):
+        with caplog.at_level("WARNING", logger="plugins.memory.hindsight"):
+            result = provider._do_recall("query")
+        assert result.count == 2
+        assert result.text == "- Memory 1\n- Memory 2"
+        assert not caplog.records
 
 
 # ---------------------------------------------------------------------------
