@@ -418,7 +418,15 @@ def append_entry(
                 import importlib
                 gc = importlib.import_module("guardclaw")
                 gef_dir = path.parent / ".guardclaw_curator_vault"
-                key_mgr = gc.Ed25519KeyManager.generate()
+                gef_dir.mkdir(parents=True, exist_ok=True)
+                key_path = gef_dir / "curator_signing_key.json"
+                if key_path.exists():
+                    loader = getattr(gc.Ed25519KeyManager, "load", gc.Ed25519KeyManager.from_file)
+                    key_mgr = loader(str(key_path))
+                else:
+                    key_mgr = gc.Ed25519KeyManager.generate()
+                    key_mgr.save(str(key_path))
+
                 gef_ledger = gc.GEFLedger(
                     key_manager=key_mgr,
                     agent_id=f"hermes-{entry['actor']}",
@@ -426,10 +434,16 @@ def append_entry(
                 )
                 gef_ledger.emit(
                     record_type=gc.RecordType.TOOL_RESULT,
-                    payload={"action": action, "skill": skill, "entry_id": entry["id"], "actor": entry["actor"]},
+                    payload={
+                        "action": action,
+                        "skill": skill,
+                        "entry_id": entry["id"],
+                        "actor": entry["actor"],
+                        "evidence": entry.get("evidence", {}),
+                    },
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("skill_ledger: cryptographic signing failed: %s", exc)
 
         return entry["id"]
     except Exception as e:
@@ -439,11 +453,28 @@ def append_entry(
 
 def verify_skill_ledger_integrity() -> Dict[str, Any]:
     """Verify cryptographic integrity of the skill mutation ledger if signing is active."""
+    gef_dir = ledger_path().parent / ".guardclaw_curator_vault"
+    if not os.environ.get("HERMES_AUDIT_SIGNING") and not gef_dir.exists():
+        return {"chain_valid": None, "status": "unsigned_ledger_active"}
+
     try:
         import importlib
         gc = importlib.import_module("guardclaw")
-        gef_dir = ledger_path().parent / ".guardclaw_curator_vault"
-        return gc.verify_ledger(str(gef_dir))
+        key_path = gef_dir / "curator_signing_key.json"
+        pinned_key = None
+        if key_path.exists():
+            loader = getattr(gc.Ed25519KeyManager, "load", gc.Ed25519KeyManager.from_file)
+            key_mgr = loader(str(key_path))
+            pinned_key = key_mgr.public_key_hex
+
+        summary = gc.verify_ledger(str(gef_dir))
+        if pinned_key and summary.get("chain_valid"):
+            if summary.get("signer_public_key") and summary.get("signer_public_key") != pinned_key:
+                summary["chain_valid"] = False
+                summary["failure_detail"] = "signer_key_mismatch"
+        return summary
+    except ImportError:
+        return {"chain_valid": None, "status": "guardclaw_not_installed"}
     except Exception as exc:
         return {"chain_valid": False, "error": str(exc)}
 
