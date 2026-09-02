@@ -1997,8 +1997,6 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         ctx_len = getattr(agent, "context_compressor", None)
         ctx_len = ctx_len.context_length if ctx_len else None
         ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None  # consume immediately
         anthropic_kwargs = _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
@@ -2236,8 +2234,6 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
     if _profile:
         _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if _ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None
 
         # Strip image parts for non-vision models that have provider profiles
         # (e.g. DeepSeek, Kimi). The legacy path below already does this, but
@@ -2271,8 +2267,6 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Reached only when get_provider_profile() returns None — i.e. a
     # completely unknown provider not in providers/ registry.
     _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-    if _ephemeral_out is not None:
-        agent._ephemeral_max_output_tokens = None
 
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
