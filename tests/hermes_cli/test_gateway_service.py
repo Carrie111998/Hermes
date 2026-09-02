@@ -1029,7 +1029,10 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "_graceful_restart_via_sigusr1",
-            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+            lambda pid, timeout, completion_probe=None: calls.append(
+                ("graceful", pid, timeout)
+            )
+            or True,
         )
         monkeypatch.setattr(
             gateway_cli,
@@ -1044,6 +1047,11 @@ class TestGatewaySystemServiceRouting:
             ),
         )
         monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_print_service_pid",
+            lambda domain, label: (True, 600),
+        )
         # KeepAlive revives the label on a fresh PID — replacement observed.
         monkeypatch.setattr(
             gateway_cli,
@@ -1091,7 +1099,9 @@ class TestGatewaySystemServiceRouting:
         )
         monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
         monkeypatch.setattr(
-            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout, completion_probe=None: True,
         )
         monkeypatch.setattr(
             gateway_cli,
@@ -1106,6 +1116,11 @@ class TestGatewaySystemServiceRouting:
             ),
         )
         monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_print_service_pid",
+            lambda domain, label: (True, 600),
+        )
 
         gateway_cli.launchd_restart()
 

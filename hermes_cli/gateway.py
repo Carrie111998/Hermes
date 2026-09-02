@@ -17,6 +17,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -304,7 +305,11 @@ def _request_gateway_self_restart(pid: int) -> bool:
     return True
 
 
-def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
+def _graceful_restart_via_sigusr1(
+    pid: int,
+    drain_timeout: float,
+    completion_probe: Callable[[], bool] | None = None,
+) -> bool:
     """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
 
     SIGUSR1 is wired in gateway/run.py to ``request_restart(via_service=True)``,
@@ -326,9 +331,10 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
             ``resolve_restart_exit_wait_budget(...)``.
 
     Returns:
-        True if the PID was signalled and exited within the timeout.
-        False if SIGUSR1 couldn't be sent or the process didn't exit in
-        time (caller should fall back to a harder restart path).
+        True if the PID was signalled and exited within the timeout, or if an
+        optional caller-specific completion probe observed the handoff.
+        False if SIGUSR1 couldn't be sent or neither completion condition was
+        reached in time (caller should fall back to a harder restart path).
     """
     if not hasattr(signal, "SIGUSR1"):
         return False
@@ -343,17 +349,30 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
         return False
 
     # Drain-wait: delegate to the shared PID-exit helper (0.5s poll, bounded).
-    return _wait_for_pid_exit(pid, max(drain_timeout, 1.0))
+    if completion_probe is None:
+        return _wait_for_pid_exit(pid, max(drain_timeout, 1.0))
+    return _wait_for_pid_exit(
+        pid,
+        max(drain_timeout, 1.0),
+        completion_probe=completion_probe,
+    )
 
 
-def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
+def _wait_for_pid_exit(
+    pid: int,
+    timeout: float,
+    *,
+    completion_probe: Callable[[], bool] | None = None,
+) -> bool:
     """Wait up to ``timeout`` seconds for ``pid`` to leave the process table.
 
     ``launchctl bootstrap`` of a label whose previous instance is still draining
     fails with EIO ("already loaded"), so callers that tear the gateway down
     must wait for the old process to actually exit before re-bootstrapping.
 
-    Returns True once the PID is gone (or was never alive), False on timeout.
+    Returns True once the PID is gone (or was never alive), or when an
+    optional caller-specific completion probe succeeds. Returns False on
+    timeout.
     """
     if pid <= 0:
         return True
@@ -370,6 +389,8 @@ def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
     deadline = _time.monotonic() + max(timeout, 0.0)
     while True:
         if not _pid_exists(pid):
+            return True
+        if completion_probe is not None and completion_probe():
             return True
         if _time.monotonic() >= deadline:
             return False
@@ -6048,11 +6069,32 @@ def launchd_restart():
             # updater's live output most of all, where a silent stop here
             # reads as "update stuck" (#44515).
             wait_budget = _get_restart_exit_wait_budget()
+            old_launchd_pid = None
+            try:
+                _loaded, old_launchd_pid = _launchd_print_service_pid(domain, label)
+            except (OSError, subprocess.TimeoutExpired):
+                # This pre-signal probe only enables the fast path. If it is
+                # unavailable, preserve the established old-PID exit wait.
+                pass
+
+            def launchd_replacement_running() -> bool:
+                if old_launchd_pid is None:
+                    return False
+                try:
+                    _loaded, service_pid = _launchd_print_service_pid(domain, label)
+                except (OSError, subprocess.TimeoutExpired):
+                    return False
+                return bool(service_pid and service_pid != old_launchd_pid)
+
             print(
                 f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
                 f"(up to {wait_budget:.0f}s)..."
             )
-            if _graceful_restart_via_sigusr1(pid, wait_budget):
+            if _graceful_restart_via_sigusr1(
+                pid,
+                wait_budget,
+                completion_probe=launchd_replacement_running,
+            ):
                 # The gateway exited with the planned-restart code. When
                 # launchd is actually supervising this label, KeepAlive
                 # revives it — do NOT kickstart (the replacement may already
@@ -6064,7 +6106,10 @@ def launchd_restart():
                 # PID appears before trusting KeepAlive — mirrors the systemd
                 # branch's replacement observation.
                 if _wait_for_launchd_service_pid(
-                    label, pid, timeout=15.0, domain=domain
+                    label,
+                    old_launchd_pid if old_launchd_pid is not None else pid,
+                    timeout=15.0,
+                    domain=domain,
                 ):
                     print("✓ Service restart requested")
                     _clear_launchd_unsupported_marker()
