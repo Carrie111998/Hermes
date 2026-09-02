@@ -4715,11 +4715,22 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 # Local commits on top of the remote tip — not behind.
                 print("✓ Already up to date.")
                 return
-            if counted is not None:
+            if counted is None:
+                # GitHub compare API returned no result (local SHA unknown to
+                # GitHub, e.g. shallow clone with local commits).  Fall back
+                # to a local merge-base check: if the remote tip is an
+                # ancestor of HEAD, we are up to date.
+                _mb = subprocess.run(
+                    git_cmd + ["merge-base", "--is-ancestor", target_sha, "HEAD"],
+                    cwd=_m().PROJECT_ROOT, capture_output=True, text=True,
+                )
+                if _mb.returncode == 0:
+                    print("✓ Already up to date.")
+                    return
+                print(f"⚕ Update available (behind {compare_branch}).")
+            else:
                 commits_word = "commit" if counted == 1 else "commits"
                 print(f"⚕ Update available: {counted} {commits_word} behind {compare_branch}.")
-            else:
-                print(f"⚕ Update available (behind {compare_branch}).")
             print(f"  Run '{recommended_update_command()}' to install.")
         return
 
