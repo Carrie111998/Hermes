@@ -791,11 +791,25 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
+def _protected_target_label(path: str) -> str:
+    """Shorten a matched target path for approval display (``~/`` prefix)."""
+    home = os.path.expanduser("~")
+    if home and home != "/" and (
+            path == home or path.startswith(home + os.sep)):
+        return "~" + path[len(home):]
+    return path
+
+
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None) -> str | None:
-    """Return a short label when ``filepath`` targets a protected
+    """Return a distinguishing label when ``filepath`` targets a protected
     agent-instruction file, else ``None``.
+
+    The label carries the matched path (not just the basename) so that a
+    multi-file patch touching several protected files with the same
+    basename (e.g. one SOUL.md per profile) lists every distinct target
+    in the approval card instead of collapsing to one name (#100361).
 
     Matching runs on BOTH the normalized input path and its realpath so
     neither a symlink pointing AT a protected file (#41351) nor a protected
@@ -828,10 +842,10 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         base = os.path.basename(candidate)
         base_lower = base.lower()
         if base_lower in _PROTECTED_INSTRUCTION_BASENAMES:
-            return base
+            return _protected_target_label(candidate)
         for pattern in extra_patterns:
             if fnmatch.fnmatch(base_lower, pattern.lower()):
-                return base
+                return _protected_target_label(candidate)
         # Project-local .hermes config dirs (e.g. <repo>/.hermes/config.yaml)
         # are loaded as project context and steer behavior the same way.
         # Scope: the file's IMMEDIATE parent must be ``.hermes`` — matching
@@ -840,7 +854,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         # hermes-agent repo itself at ~/.hermes/hermes-agent).
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if len(parts) >= 2 and parts[-2] == ".hermes":
-            return candidate
+            return _protected_target_label(candidate)
     return None
 
 
@@ -856,7 +870,8 @@ def _request_protected_instruction_approval(
     """
     targets = ", ".join(dict.fromkeys(reasons))
     description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
+        f"Write to {len(set(reasons))} protected agent-instruction "
+        f"file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )

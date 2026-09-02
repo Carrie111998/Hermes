@@ -616,6 +616,67 @@ class TestProtectedInstructionFiles:
         assert agents.read_text(encoding="utf-8") == "rules\n"
         assert len(approvals["calls"]) == 1
 
+    def test_patch_v4a_duplicate_basenames_list_every_target(
+        self, tmp_path, approvals
+    ):
+        """#100361: a multi-file patch whose protected targets share a
+        basename must list every distinct path (and the count) in the one
+        approval card — not collapse to a single basename label."""
+        from tools.file_tools import patch_tool
+        import json
+        alpha = tmp_path / "profiles" / "alpha" / "SOUL.md"
+        beta = tmp_path / "profiles" / "beta" / "SOUL.md"
+        alpha.parent.mkdir(parents=True)
+        beta.parent.mkdir(parents=True)
+        alpha.write_text("be kind\n", encoding="utf-8")
+        beta.write_text("be honest\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {alpha}\n"
+            "@@\n"
+            "-be kind\n"
+            "+be very kind\n"
+            f"*** Update File: {beta}\n"
+            "@@\n"
+            "-be honest\n"
+            "+be very honest\n"
+            "*** End Patch"
+        )
+        approvals["answer"] = "deny"
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert len(approvals["calls"]) == 1
+        call = approvals["calls"][0]
+        assert str(alpha) in call["command"], call["command"]
+        assert str(beta) in call["command"], call["command"]
+        assert "2 protected agent-instruction file(s)" in call["description"]
+        assert alpha.read_text(encoding="utf-8") == "be kind\n"
+        assert beta.read_text(encoding="utf-8") == "be honest\n"
+
+    def test_protected_reason_label_is_distinguishing(self, tmp_path):
+        """The reason label must carry the matched path, not the bare
+        basename, so distinct targets stay distinct after dedup."""
+        from tools.file_tools import _protected_instruction_reason
+        alpha = tmp_path / "profiles" / "alpha" / "SOUL.md"
+        label = _protected_instruction_reason(str(alpha))
+        assert label is not None
+        assert label != "SOUL.md"
+        assert "SOUL.md" in label
+        assert "alpha" in label
+
+    def test_protected_target_label_shortens_home(self, monkeypatch):
+        import tools.file_tools as ft
+        monkeypatch.setattr(
+            ft.os.path, "expanduser",
+            lambda p: "/home/tester" if p == "~" else p,
+        )
+        assert ft._protected_target_label(
+            "/home/tester/profiles/alpha/SOUL.md"
+        ) == "~/profiles/alpha/SOUL.md"
+        assert ft._protected_target_label(
+            "/srv/project/SOUL.md"
+        ) == "/srv/project/SOUL.md"
+
     def test_patch_v4a_approved_applies(self, tmp_path, approvals):
         from tools.file_tools import patch_tool
         import json
