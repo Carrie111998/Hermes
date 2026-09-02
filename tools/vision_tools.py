@@ -1878,6 +1878,29 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     region = args.get("region")
     task_id = kw.get("task_id")
 
+    # Gateway-native routing may already have placed these pixels in the
+    # current user turn. Avoid returning the same base64 payload again, while
+    # preserving region requests because crops provide new high-resolution
+    # detail that is not visible in the original attachment.
+    if region is None:
+        try:
+            from agent.native_vision_context import is_native_image_attached
+
+            if is_native_image_attached(image_url):
+                return json.dumps(
+                    {
+                        "success": True,
+                        "already_attached": True,
+                        "message": (
+                            "This image is already attached to the current user message. "
+                            "Inspect it directly with built-in vision; do not load it again."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+        except Exception:
+            logger.debug("Native image deduplication check failed", exc_info=True)
+
     # The fan-out cap lives inside the encode/resize step (offloaded to the
     # bounded _vision_cpu_executor), NOT around the whole analysis — so a
     # legitimate multi-image workflow keeps full request concurrency while the

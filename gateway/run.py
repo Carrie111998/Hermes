@@ -7063,6 +7063,7 @@ class TurnRunner:
             # content list. Consume-and-clear so subsequent turns on the same
             # runner instance don't re-attach stale images.
             _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
+            _attached_native_imgs = []
             if _native_imgs:
                 try:
                     from agent.image_routing import build_native_content_parts
@@ -7077,6 +7078,10 @@ class TurnRunner:
                         )
                     if any(p.get("type") == "image_url" for p in _parts):
                         _run_message: Any = _parts
+                        _skipped_set = set(_skipped)
+                        _attached_native_imgs = [
+                            path for path in _native_imgs if str(path) not in _skipped_set
+                        ]
                     else:
                         # All images failed to read — fall back to plain text.
                         _run_message = ctx.message
@@ -7121,7 +7126,10 @@ class TurnRunner:
             # inbound id (NOT event_message_id, which is the reply anchor).
             if ctx.inbound_message_id is not None:
                 _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            from agent.native_vision_context import scoped_native_image_refs
+
+            with scoped_native_image_refs(_attached_native_imgs):
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent

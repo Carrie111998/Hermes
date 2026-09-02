@@ -51,13 +51,20 @@ class CaptureAdapter(BasePlatformAdapter):
 
 class CaptureQueuedNativeImageAgent:
     calls = []
+    expected_native_refs = []
+    native_visibility = []
 
     def __init__(self, **kwargs):
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
+        from agent.native_vision_context import is_native_image_attached
+
         type(self).calls.append(message)
+        type(self).native_visibility.append(
+            [is_native_image_attached(ref) for ref in type(self).expected_native_refs]
+        )
         return {
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
@@ -93,6 +100,7 @@ def _make_runner(adapter):
 @pytest.mark.asyncio
 async def test_queued_followup_uses_pending_event_session_key_for_native_images(monkeypatch, tmp_path):
     CaptureQueuedNativeImageAgent.calls = []
+    CaptureQueuedNativeImageAgent.native_visibility = []
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -111,6 +119,11 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
     image_path = tmp_path / "queued-image.png"
     image_path.write_bytes(_ONE_BY_ONE_PNG)
+    missing_path = tmp_path / "missing-image.png"
+    CaptureQueuedNativeImageAgent.expected_native_refs = [
+        str(image_path),
+        str(missing_path),
+    ]
 
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -128,8 +141,8 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         text="describe this",
         message_type=MessageType.PHOTO,
         source=pending_source,
-        media_urls=[str(image_path)],
-        media_types=["image/png"],
+        media_urls=[str(image_path), str(missing_path)],
+        media_types=["image/png", "image/png"],
         message_id="queued-1",
     )
 
@@ -149,3 +162,8 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert CaptureQueuedNativeImageAgent.native_visibility[-1] == [True, False]
+
+    from agent.native_vision_context import is_native_image_attached
+
+    assert is_native_image_attached(str(image_path)) is False
