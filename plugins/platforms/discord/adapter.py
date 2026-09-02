@@ -473,6 +473,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_ROLES",
     "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS",
+    "DISCORD_ALLOW_DMS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
@@ -1615,6 +1616,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
 
+        msg_guild = getattr(message, "guild", None)
+        is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+        if is_dm and not self._discord_dms_enabled():
+            return False, False
+
         role_authorized = False
         if getattr(message.author, "bot", False):
             allow_bots = self._get_allow_bots()
@@ -1628,8 +1634,6 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return False, False
         else:
-            msg_guild = getattr(message, "guild", None)
-            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
             msg_channel_ids = None
             if not is_dm:
                 msg_channel_ids = {str(message.channel.id)}
@@ -6801,6 +6805,24 @@ class DiscordAdapter(BasePlatformAdapter):
         """Per-profile DISCORD_ALLOW_ALL_USERS flag."""
         raw = self._gate_raw("allow_all_users", "DISCORD_ALLOW_ALL_USERS")
         return str(raw or "").strip().lower() in {"true", "1", "yes"}
+
+    def _discord_dms_enabled(self) -> bool:
+        """Whether Discord DMs may enter this profile's LLM conversation path.
+
+        Behavioral configuration lives in ``discord.allow_dms``. The legacy
+        ``DISCORD_ALLOW_DMS`` secret-scope value remains supported during
+        migration, but an explicit profile value wins so multiplexed profiles
+        cannot change each other's policy through process globals. Existing
+        deployments retain their historical default: DMs are enabled.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if isinstance(extra, dict) and "allow_dms" in extra:
+            raw = extra.get("allow_dms")
+        else:
+            raw = self._gate_env("DISCORD_ALLOW_DMS")
+        if raw is None or str(raw).strip() == "":
+            return True
+        return str(raw).strip().lower() in {"true", "1", "yes", "on"}
 
     def _gateway_allow_all_users(self) -> bool:
         """Per-profile GATEWAY_ALLOW_ALL_USERS flag."""
