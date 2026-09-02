@@ -83,6 +83,27 @@ def test_search_memo_miss_across_providers_and_buckets():
     assert memo.lookup("firecrawl", "other", 5) is None   # different query
 
 
+def test_search_memo_isolates_by_profile():
+    """A multiplexed gateway process serves several profiles; profile B must
+    never receive profile A's cached response for the same provider/query,
+    since that response was fetched (and paid for) under A's credentials."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    memo = SearchMemo()
+    token_a = set_hermes_home_override("/profiles/a")
+    try:
+        memo.store("firecrawl", "q", 5, _ok_response())
+        assert memo.lookup("firecrawl", "q", 5) is not None
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override("/profiles/b")
+    try:
+        assert memo.lookup("firecrawl", "q", 5) is None
+    finally:
+        reset_hermes_home_override(token_b)
+
+
 def test_search_memo_expires_after_ttl(monkeypatch):
     memo = SearchMemo()
     memo.store("firecrawl", "q", 5, _ok_response())
