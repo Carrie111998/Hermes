@@ -5592,6 +5592,46 @@ def _fallback_destination(
     return _complete_fallback_destination(provider, base_url, api_mode, model)
 
 
+def _log_auxiliary_timeout_fallback(
+    *,
+    task: Optional[str],
+    started_at: float,
+    source_provider: Optional[str],
+    source_base_url: Optional[str],
+    fallback_client: Optional[Any],
+    fallback_model: Optional[str],
+    fallback_label: str,
+    async_mode: bool = False,
+) -> None:
+    """Log one secret-safe timeout diagnostic with the selected next route (#89445)."""
+    elapsed = max(0.0, time.monotonic() - started_at)
+    source_endpoint = base_url_hostname(str(source_base_url or "")) or "unknown"
+    mode = " (async)" if async_mode else ""
+
+    if fallback_client is None:
+        fallback = "none"
+    else:
+        destination = _fallback_destination(
+            task, fallback_client, fallback_model, fallback_label
+        )
+        fallback_provider = destination.provider or fallback_label or "unknown"
+        fallback_endpoint = base_url_hostname(destination.base_url) or "unknown"
+        fallback = (
+            f"{fallback_provider}/{destination.model or 'default'} "
+            f"(endpoint={fallback_endpoint})"
+        )
+
+    logger.warning(
+        "Auxiliary %s%s: timed out after %.1fs on %s (endpoint=%s); fallback=%s",
+        task or "call",
+        mode,
+        elapsed,
+        source_provider or "unknown",
+        source_endpoint,
+        fallback,
+    )
+
+
 def _replan_synchronous_cache_sections(
     messages: list,
     tools: Optional[list],
@@ -10529,6 +10569,7 @@ def _call_llm_impl(
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
+    request_attempt_started_at = time.monotonic()
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -10989,6 +11030,8 @@ def _call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -11033,6 +11076,16 @@ def _call_llm_impl(
                         failed_model=_chain_failed_model)
 
             if fb_client is not None:
+                if reason == "timeout":
+                    _log_auxiliary_timeout_fallback(
+                        task=task,
+                        started_at=request_attempt_started_at,
+                        source_provider=request_provider,
+                        source_base_url=_base_info or resolved_base_url,
+                        fallback_client=fb_client,
+                        fallback_model=fb_model,
+                        fallback_label=fb_label,
+                    )
                 _record_route_info(
                     route_info, _fallback_provider_from_label(fb_label), fb_model
                 )
@@ -11063,6 +11116,16 @@ def _call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+            if reason == "timeout" and fb_client is None:
+                _log_auxiliary_timeout_fallback(
+                    task=task,
+                    started_at=request_attempt_started_at,
+                    source_provider=request_provider,
+                    source_base_url=_base_info or resolved_base_url,
+                    fallback_client=None,
+                    fallback_model=None,
+                    fallback_label="",
+                )
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -11367,6 +11430,7 @@ async def _async_call_llm_impl(
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    request_attempt_started_at = time.monotonic()
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -11738,6 +11802,8 @@ async def _async_call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_timeout_error(first_err):
+                reason = "timeout"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -11782,6 +11848,17 @@ async def _async_call_llm_impl(
                         failed_model=_chain_failed_model)
 
             if fb_client is not None:
+                if reason == "timeout":
+                    _log_auxiliary_timeout_fallback(
+                        task=task,
+                        started_at=request_attempt_started_at,
+                        source_provider=request_provider,
+                        source_base_url=_client_base or resolved_base_url,
+                        fallback_client=fb_client,
+                        fallback_model=fb_model,
+                        fallback_label=fb_label,
+                        async_mode=True,
+                    )
                 # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
@@ -11822,6 +11899,17 @@ async def _async_call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+            if reason == "timeout" and fb_client is None:
+                _log_auxiliary_timeout_fallback(
+                    task=task,
+                    started_at=request_attempt_started_at,
+                    source_provider=request_provider,
+                    source_base_url=_client_base or resolved_base_url,
+                    fallback_client=None,
+                    fallback_model=None,
+                    fallback_label="",
+                    async_mode=True,
+                )
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
