@@ -13767,12 +13767,19 @@ def main():
     _op_secrets_cli.register_cli(secrets_op)
 
     def _dispatch_secrets(args):  # noqa: ANN001
-        sub = getattr(args, "secrets_command", None)
-        if sub is None:
+        """Print the most specific help for a secrets command with no action."""
+        source = getattr(args, "secrets_command", None)
+        if source in ("onepassword", "op", "1password"):
+            secrets_op.print_help()
+        elif source in ("bitwarden", "bw"):
+            secrets_bw.print_help()
+        else:
             secrets_parser.print_help()
-            return 0
-        return args.func(args)
+        return 0
 
+    # Child actions install concrete handlers.  This fallback handles only a
+    # missing source or a selected source without an action; it must not call
+    # args.func again because that is the fallback itself in those cases.
     secrets_parser.set_defaults(func=_dispatch_secrets)
 
     # =========================================================================

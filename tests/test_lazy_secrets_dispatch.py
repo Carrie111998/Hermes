@@ -108,6 +108,29 @@ class TestSecretsDispatchE2E:
         )
         assert "ImportError" not in result.stderr
 
+    def test_secrets_without_subcommand_shows_parent_help(self) -> None:
+        """`hermes secrets` must exit 0 with the parent command help."""
+        result = _run_hermes(["secrets"])
+        assert result.returncode == 0, (
+            f"secrets without a subcommand crashed:\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+        assert "usage: hermes secrets" in result.stdout.lower()
+        assert "onepassword" in result.stdout
+
+    def test_onepassword_without_action_shows_help(self) -> None:
+        """`hermes secrets onepassword` must show onepassword-specific help."""
+        result = _run_hermes(["secrets", "onepassword"])
+        assert result.returncode == 0, (
+            f"onepassword without an action crashed:\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+        assert "usage: hermes secrets onepassword" in result.stdout.lower()
+        assert "sync" in result.stdout
+        assert "recursionerror" not in result.stderr.lower()
+
     def test_onepassword_setup_help(self) -> None:
         """`hermes secrets onepassword setup --help` must exit 0."""
         result = _run_hermes(["secrets", "onepassword", "setup", "--help"])
