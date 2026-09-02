@@ -1226,12 +1226,7 @@ def _(rid, params: dict) -> dict:
     except ValueError as e:
         return _err(rid, 4017, str(e))
     agent = session.get("agent")
-    info = _session_info(agent, session) if agent is not None else {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-    }
+    info = _session_info(agent, session)
     _emit("session.info", params.get("session_id", ""), info)
     return _ok(rid, info)
 
@@ -1300,12 +1295,7 @@ def _(rid, params: dict) -> dict:
         except ValueError as e:
             return _err(rid, 4017, str(e))
         agent = live.get("agent")
-        info = _session_info(agent, live) if agent is not None else {
-            "cwd": resolved,
-            "branch": branch,
-            "project": _project_info_for_cwd(resolved),
-            "lazy": True,
-        }
+        info = _session_info(agent, live)
         _emit("session.info", live_sid, info)
 
     return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})
@@ -2892,10 +2882,11 @@ def _(rid, params: dict) -> dict:
             updated = _dt(meta.get(field), created)
             break
 
-    mirror = _metadata_mirror(session)
+    info = _session_info(agent, session)
     usage = _session_usage_snapshot(session)
-    provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
-    model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
+    provider = info.get("provider") or "unknown"
+    model = info.get("model") or "(unknown)"
+    reasoning = info.get("reasoning_effort") or "default"
     project = _project_info_for_cwd(_display_session_cwd(session))
     lines = [
         "Hermes TUI Status",
@@ -2911,6 +2902,8 @@ def _(rid, params: dict) -> dict:
     lines.extend(
         [
             f"Model: {model} ({provider})",
+            f"Reasoning: {reasoning}",
+            f"Fast: {'Yes' if info.get('fast') else 'No'}",
             f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
             f"Tokens: {int(usage.get('total') or 0):,}",

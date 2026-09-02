@@ -11436,6 +11436,35 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     assert "Agent Running: Yes" in out
 
 
+def test_session_status_reports_remote_reasoning_and_fast(monkeypatch):
+    server._sessions["sid"] = _session(agent=None, running=False)
+    server._sessions["sid"].update(
+        {
+            "agent": None,
+            "_compute_host_active": True,
+            "create_reasoning_override": {"enabled": True, "effort": "high"},
+            "create_service_tier_override": "priority",
+        }
+    )
+
+    class _DB:
+        def get_session(self, _key):
+            return {"started_at": 1_700_000_000}
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert isinstance(resp, dict) and "result" in resp, resp
+    out = resp["result"]["output"]
+    assert "Reasoning: high" in out
+    assert "Fast: Yes" in out
+
+
 def test_skills_reload_runs_in_gateway_process(monkeypatch):
     import agent.skill_commands as skill_commands
 
@@ -20730,10 +20759,19 @@ def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
     monkeypatch.setattr(server, "_project_info_for_cwd", lambda cwd: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
 
-    info = server._fallback_session_info({"cwd": "/projects/session-own-repo"})
+    info = server._fallback_session_info(
+        {
+            "agent": None,
+            "cwd": "/projects/session-own-repo",
+            "create_reasoning_override": {"enabled": True, "effort": "high"},
+            "create_service_tier_override": "priority",
+        }
+    )
 
     assert info["cwd"] == "/projects/session-own-repo"
     assert info["branch"] == "bb/feature"
+    assert info["reasoning_effort"] == "high"
+    assert info["fast"] is True
 
 
 def test_fallback_session_info_always_emits_branch(monkeypatch):

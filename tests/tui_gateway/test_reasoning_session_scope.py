@@ -52,6 +52,51 @@ class TestSessionInfoReasoningEffort:
         info = _session_info(_agent(None))
         assert info["reasoning_effort"] == ""
 
+    def test_remote_agent_reports_session_overrides(self) -> None:
+        info = _session_info(
+            None,
+            {
+                "create_reasoning_override": {"enabled": True, "effort": "high"},
+                "create_service_tier_override": "priority",
+                "_compute_host_active": True,
+            },
+        )
+        assert info["reasoning_effort"] == "high"
+        assert info["service_tier"] == "priority"
+        assert info["fast"] is True
+
+    def test_remote_agent_preserves_override_precedence_and_sentinels(self) -> None:
+        mirrored = _session_info(
+            None,
+            {
+                "_metadata_mirror": {
+                    "reasoning_effort": "medium",
+                    "service_tier": "flex",
+                },
+                "create_reasoning_override": {"enabled": True, "effort": "high"},
+                "create_service_tier_override": "priority",
+            },
+        )
+        assert mirrored["reasoning_effort"] == "medium"
+        assert mirrored["service_tier"] == "flex"
+        assert mirrored["fast"] is False
+
+        disabled = _session_info(
+            None,
+            {
+                "create_reasoning_override": {"enabled": False},
+                "create_service_tier_override": "",
+            },
+        )
+        assert disabled["reasoning_effort"] == "none"
+        assert disabled["service_tier"] == ""
+        assert disabled["fast"] is False
+
+        inherited = _session_info(None, {})
+        assert inherited["reasoning_effort"] == ""
+        assert inherited["service_tier"] == ""
+        assert inherited["fast"] is False
+
 
 class TestConfigSetReasoningSessionScope:
     """Session-targeted reasoning changes must not touch global config."""

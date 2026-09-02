@@ -7715,9 +7715,13 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
-    reasoning_config = getattr(agent, "reasoning_config", None)
-    reasoning_effort = ""
-    if isinstance(reasoning_config, dict):
+    reasoning_config = (
+        getattr(agent, "reasoning_config", None)
+        if agent is not None
+        else (session or {}).get("create_reasoning_override")
+    )
+    reasoning_effort = str(mirror.get("reasoning_effort") or "") if agent is None else ""
+    if not reasoning_effort and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             # Disabled must be distinguishable from unset ("" = provider
             # default). Reporting "" here made the desktop adopt the empty
@@ -7726,7 +7730,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
             reasoning_effort = "none"
         else:
             reasoning_effort = str(reasoning_config.get("effort", "") or "")
-    service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
+    if agent is None:
+        service_tier = (
+            mirror.get("service_tier")
+            or (session or {}).get("create_service_tier_override")
+            or ""
+        )
+    else:
+        service_tier = getattr(agent, "service_tier", None) or mirror.get("service_tier") or ""
     # Effective approval-bypass state — the same three sources that
     # check_all_command_guards() ORs together: persistent config
     # (approvals.mode=off), the process-scoped --yolo env, and the
@@ -7774,6 +7785,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
+        "lazy": agent is None and not mirror,
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
@@ -11299,29 +11311,15 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
-    # The SESSION's own workspace, not the gateway's launch directory. Reporting
-    # `_default_session_cwd()` here told a lazily-resumed session's client that
-    # its workspace was wherever the gateway process happened to start, so the
-    # desktop Files pane painted the wrong project even after the renderer
-    # rebound correctly (#71254). `branch` is always emitted ("" outside a git
-    # repo) so a client can clear a stale label instead of retaining it — the
-    # same contract `_lazy_session_info` above already follows.
     cwd = _session_cwd(session)
-    return {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-        "model": _resolve_model(),
-        "skills": {},
-        "tools": {},
-        # A lazy session (agent not built yet) is still served by *this* backend,
-        # so it must advertise the current contract. Desktop feeds this straight
-        # into reportBackendContract(); a missing field is read as contract 0 and
-        # a current backend is falsely flagged "out of date" (#68392). The sibling
-        # session.create shape (_lazy_resume_info) already carries it (#36112).
-        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-    }
+    info = _session_info(None, dict(session))
+    info.update(
+        cwd=cwd,
+        branch=_git_branch_for_cwd(cwd),
+        project=_project_info_for_cwd(cwd),
+        lazy=True,
+    )
+    return info
 
 
 def _reconcile_display_with_live(
