@@ -225,3 +225,77 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_command_hook_rewrite_carries_metadata_to_native_handler(monkeypatch):
+    """Authenticated command hooks can attach reset-time intent without disk markers."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    event = _make_event("/help")
+    event.metadata = {"existing": {"keep": True}}
+    expected_key = build_session_key(event.source)
+    seen_context = {}
+    seen_metadata = {}
+
+    async def _emit_collect(event_type, ctx):
+        if event_type == "command:help":
+            seen_context.update(ctx)
+            return [
+                {
+                    "decision": "rewrite",
+                    "command_name": "status",
+                    "raw_args": "",
+                    "metadata": {
+                        "session_commands": {"action": "newall", "nonce": "n1"}
+                    },
+                }
+            ]
+        return []
+
+    async def _status_handler(event):
+        seen_metadata.update(event.metadata)
+        return "status ok"
+
+    runner.hooks.emit_collect = AsyncMock(side_effect=_emit_collect)
+    runner._handle_status_command = _status_handler
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "status ok"
+    assert seen_context["session_key"] == expected_key
+    assert seen_metadata == {
+        "existing": {"keep": True},
+        "session_commands": {"action": "newall", "nonce": "n1"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_command_cannot_attach_rewrite_metadata(monkeypatch):
+    """Command hooks are post-auth: rejected senders cannot mutate event state."""
+    runner = _make_runner()
+    runner._is_user_authorized = (
+        lambda source, *, allow_adapter_delegation=True: False
+    )
+    runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "ignore"
+    event = _make_event("/status")
+
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[
+            {
+                "decision": "rewrite",
+                "command_name": "new",
+                "metadata": {"untrusted": {"action": "reset"}},
+            }
+        ]
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    assert event.metadata == {}
+    runner.hooks.emit_collect.assert_not_awaited()

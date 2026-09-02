@@ -18,6 +18,14 @@ Events:
 
 Errors in hooks are caught and logged but never block the main pipeline.
 
+Recognized gateway ``command:<name>`` hooks run after user authorization and
+slash-command access control. They may return a decision dict. A ``rewrite``
+decision accepts ``command_name`` and ``raw_args`` plus an optional ``metadata``
+dict. Metadata is merged onto the in-flight message event, survives native
+destructive-command confirmation, and is exposed as ``command_metadata`` on
+``session:end``, ``session:reset``, and plugin ``on_session_reset`` only when the
+rewritten reset actually executes.
+
 Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
   user_id      -- platform user id of the sender
@@ -46,6 +54,9 @@ from typing import Any, Callable, Dict, List, Optional
 import yaml
 
 from hermes_cli.config import get_hermes_home
+
+
+COMMAND_REWRITE_METADATA_SUPPORTED = True
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"

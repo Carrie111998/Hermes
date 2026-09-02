@@ -266,6 +266,7 @@ class GatewaySlashCommandsMixin:
             "platform": source.platform.value if source.platform else "",
             "user_id": source.user_id,
             "session_key": session_key,
+            "command_metadata": dict(event.metadata or {}),
         })
 
         # Emit session:reset hook
@@ -273,6 +274,7 @@ class GatewaySlashCommandsMixin:
             "platform": source.platform.value if source.platform else "",
             "user_id": source.user_id,
             "session_key": session_key,
+            "command_metadata": dict(event.metadata or {}),
         })
 
         # Resolve session config info to surface to the user, scoped to the
@@ -337,6 +339,7 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=_new_sid,
+                command_metadata=dict(event.metadata or {}),
             )
         except Exception:
             pass

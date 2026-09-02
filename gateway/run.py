@@ -19577,6 +19577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
+                "session_key": _quick_key,
                 "command": canonical,
                 "raw_command": command,
                 "args": raw_args,
@@ -19614,6 +19615,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not new_command:
                         continue
                     new_args = str(hook_result.get("raw_args", "")).strip()
+                    new_metadata = hook_result.get("metadata")
+                    if isinstance(new_metadata, dict):
+                        event.metadata = {
+                            **(event.metadata or {}),
+                            **new_metadata,
+                        }
                     event.text = f"/{new_command} {new_args}".strip()
                     command = event.get_command()
                     _cmd_def = _resolve_cmd(command) if command else None

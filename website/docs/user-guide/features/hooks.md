@@ -77,19 +77,37 @@ async def handle(event_type: str, context: dict):
 |-------|---------------|--------------|
 | `gateway:startup` | Gateway process starts | `platforms` (list of active platform names) |
 | `session:start` | New messaging session created | `platform`, `user_id`, `session_id`, `session_key` |
-| `session:end` | Session ended (before reset) | `platform`, `user_id`, `session_key` |
-| `session:reset` | User ran `/new` or `/reset` | `platform`, `user_id`, `session_key` |
+| `session:end` | Session ended (before reset) | `platform`, `user_id`, `session_key`, `command_metadata` |
+| `session:reset` | User ran `/new` or `/reset` | `platform`, `user_id`, `session_key`, `command_metadata` |
 | `session:compress` | Context compression completed for a session | `platform`, `session_id`, `old_session_id` (empty when compacted in place), `in_place` (bool — `true` = transcript compacted on the same id, `false` = rotated from `old_session_id`), `compression_count` |
 | `agent:start` | Agent begins processing a message | `platform`, `user_id`, `chat_id`, `thread_id` (forum-topic / thread root id; empty when not in a thread), `chat_type` (`"dm"` \| `"group"` \| `"forum"`; empty if unknown), `session_id`, `message` (truncated to 500 chars) |
 | `agent:step` | Each iteration of the tool-calling loop | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
 | `agent:end` | Agent finishes processing | same keys as `agent:start`, plus `response` (truncated to 500 chars) |
 | `reaction:added` | An emoji reaction was added to a message the bot can see (Slack adapter currently). Requires the `reactions:read` scope + the `reaction_added` bot event subscription; the bot must be a member of the channel. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
 | `reaction:removed` | An emoji reaction was removed from a message the bot can see. Requires the `reaction_removed` bot event subscription. | same shape as `reaction:added` |
-| `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
+| `command:*` | Any recognized slash command, after authorization and slash-command access control | `platform`, `user_id`, `session_key`, `command`, `raw_command`, `args`, `raw_args` |
 
 #### Wildcard Matching
 
 Handlers registered for `command:*` fire for any `command:` event (`command:model`, `command:reset`, etc.). Monitor all slash commands with a single subscription.
+
+#### Command Decisions and Reset Metadata
+
+Recognized gateway command hooks may return a decision dict. `deny` blocks the command, `handled` returns the hook's message without core dispatch, and `rewrite` re-resolves `command_name` with `raw_args`. A rewrite may also return a `metadata` dict. Hermes merges that dict onto the in-flight message event, carries it through native destructive-command confirmation, and exposes it as `command_metadata` on `session:end`, `session:reset`, and the plugin `on_session_reset` hook only if the reset executes. Cancellation and expiry emit no reset event, so they cannot leak rewrite intent into a later command.
+
+```python
+def handle(event_type: str, context: dict):
+    if event_type != "command:archive-and-new":
+        return None
+    return {
+        "decision": "rewrite",
+        "command_name": "new",
+        "raw_args": context.get("raw_args", ""),
+        "metadata": {"my_plugin": {"action": "archive"}},
+    }
+```
+
+Use a namespaced top-level key such as `my_plugin` so independent hooks do not overwrite each other's metadata.
 
 :::tip Threaded replies
 A handler posting a follow-up message into the same Telegram forum topic should include `message_thread_id=int(thread_id)` when `chat_type == "forum"` and `thread_id` is non-empty.
