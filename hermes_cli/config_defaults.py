@@ -1258,7 +1258,8 @@ DEFAULT_CONFIG = {
             "prefer_fast_model": False,  # opt in to provider fast tier; auto otherwise uses the main model
             "base_url": "",
             "api_key": "",
-            "timeout": 30,
+            "timeout": 10,
+            "max_concurrency": 1,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
