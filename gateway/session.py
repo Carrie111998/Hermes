@@ -1043,12 +1043,24 @@ def build_channel_continuity_note(
     if not prev:
         return None
 
+    root = (getattr(entry, "metadata", None) or {}).get(
+        "continuity_root_session_id"
+    )
+    root_hint = ""
+    if root and root != prev:
+        root_hint = (
+            f" The original session in this auto-reset lineage is "
+            f"session_id: {root}."
+        )
+
     where = "thread" if source.thread_id else "channel"
     return (
         f"[System note: This {where} had an earlier Hermes session "
-        f"(session_id: {prev}) that was auto-reset. If the user refers to "
+        f"(session_id: {prev}) that was auto-reset.{root_hint} If the user refers to "
         f"earlier work here, or the request depends on this {where}'s history, "
-        f"use the session_search tool to recall that prior session before "
+        f"use the session_search tool to recall the immediate prior session "
+        f"and, when the request points back to the original topic, the original "
+        f"lineage session before "
         f"acting — do not assume an unrelated recent session is the right "
         f"context.]"
     )
@@ -2352,6 +2364,43 @@ class SessionStore:
             reset_had_activity=bool(had_activity),
         )
 
+    def _continuity_root_session_id(
+        self,
+        session_id: str,
+        *,
+        expected_session_key: str,
+        max_depth: int = 256,
+    ) -> str:
+        """Return the oldest durable parent in one gateway routing lineage.
+
+        Auto-resets already persist ``parent_session_id`` in ``state.db``.  Walk
+        that existing chain once when creating the next session, rather than
+        making the model rediscover a potentially long reset lineage one hop at
+        a time.  Stop at routing-key boundaries and malformed/cyclic rows.
+        """
+        if not self._db:
+            return session_id
+        current = session_id
+        seen = set()
+        for _ in range(max_depth):
+            if current in seen:
+                break
+            seen.add(current)
+            try:
+                row = self._db.get_session(current)
+            except Exception:
+                break
+            if not row:
+                break
+            row_key = row.get("session_key")
+            if row_key and row_key != expected_session_key:
+                break
+            parent = row.get("parent_session_id")
+            if not parent:
+                break
+            current = str(parent)
+        return current
+
     def _find_gateway_session_row(
         self,
         *,
@@ -3142,6 +3191,14 @@ class SessionStore:
             # Create a candidate outside the lock, then publish only if another
             # worker has not already populated this routing key.
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            continuity_metadata: Dict[str, Any] = {}
+            if was_auto_reset and prev_session_id:
+                continuity_metadata["continuity_root_session_id"] = (
+                    self._continuity_root_session_id(
+                        prev_session_id,
+                        expected_session_key=session_key,
+                    )
+                )
             candidate = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
@@ -3151,6 +3208,7 @@ class SessionStore:
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
+                metadata=continuity_metadata,
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
