@@ -471,8 +471,6 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 else iter_skill_index_files(scan_dir, "SKILL.md")
             )
             for skill_md in _iter:
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
-                    continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
                     frontmatter, body = _parse_frontmatter(content)
