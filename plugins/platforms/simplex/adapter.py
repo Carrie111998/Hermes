@@ -276,9 +276,9 @@ class SimplexAdapter(
         if ignored_allow_entries:
             logger.warning(
                 "SimpleX: %d non-numeric SIMPLEX_ALLOWED_USERS entries do not "
-                "authorize DMs; display names are ignored. Keep an entry only "
-                "if it is an exact group memberId, otherwise migrate to a "
-                "stable contactId from /contacts",
+                "authorize DMs; display names and group memberIds are ignored. "
+                "Use stable contactId values from /contacts. Group access is "
+                "controlled separately by SIMPLEX_GROUP_ALLOWED",
                 len(ignored_allow_entries),
             )
 
@@ -1644,9 +1644,15 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", {}) or {}
     env_ws_url = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
-    ws_url = env_ws_url or extra.get("ws_url", "ws://127.0.0.1:5225")
-    if not ws_url:
-        return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
+    configured_ws_url = str(env_ws_url or extra.get("ws_url", "")).strip()
+    if _profile_scoped() and not configured_ws_url:
+        return {
+            "error": (
+                "SimpleX standalone send: SIMPLEX_WS_URL is required for the "
+                "active profile"
+            )
+        }
+    ws_url = configured_ws_url or "ws://127.0.0.1:5225"
 
     async def _send_confirmed(
         ws,

@@ -228,6 +228,32 @@ async def test_secondary_standalone_send_uses_profile_daemon(
 
 
 @pytest.mark.asyncio
+async def test_secondary_standalone_send_without_profile_daemon_fails_closed(
+    monkeypatch, secondary_profile_scope
+):
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://default-daemon:5225")
+
+    import websockets
+
+    connect = MagicMock()
+    monkeypatch.setattr(websockets, "connect", connect)
+
+    result = await _simplex._standalone_send(
+        SimpleNamespace(extra={}),
+        "42",
+        "hello",
+    )
+
+    assert result == {
+        "error": (
+            "SimpleX standalone send: SIMPLEX_WS_URL is required for the "
+            "active profile"
+        )
+    }
+    connect.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_connect_holds_scoped_listener_lock_until_disconnect(monkeypatch):
     adapter = _adapter()
     acquire = MagicMock(return_value=True)

@@ -99,10 +99,11 @@ SIMPLEX_GROUP_ALLOWED=12,34          # specific group IDs
 SIMPLEX_GROUP_ALLOWED=*              # any group the bot is in
 ```
 
-Group messages still pass the sender allowlist. Hermes uses a member's numeric
-`memberContactId` when the group member is also a direct contact. For an
-unlinked member, add that membership's exact opaque `memberId` to
-`SIMPLEX_ALLOWED_USERS`; a display name never authorizes either form.
+An allowed group is the authorization boundary: every member of that group may
+invoke Hermes, even when the member is not listed in `SIMPLEX_ALLOWED_USERS`
+or paired as a direct-message contact. Prefer specific group IDs.
+`SIMPLEX_GROUP_ALLOWED=*` authorizes every member of every group the bot joins.
+Direct-message authorization remains separate and unchanged.
 
 Address groups by prefixing the chat ID with `group:`, e.g.
 `simplex:group:12` as a cron `deliver=` target or in a `hermes send` call.
