@@ -2235,6 +2235,17 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
 
     adapter = MatrixAdapter(pconfig)
+    # An ephemeral password login must never run on the live gateway's
+    # device: matrix.org (and any one-token-per-device homeserver) revokes
+    # the existing session when a second login lands on the same device_id,
+    # leaving the live adapter deaf with M_UNKNOWN_TOKEN until restart
+    # (#95253). With no access token this sender has to login, so drop the
+    # configured device id and let the homeserver issue a fresh device for
+    # this throwaway connection; the persistent adapter's stable E2EE
+    # identity (MATRIX_DEVICE_ID) is untouched. Token-authenticated sends
+    # never login, so their device resolution stays as-is.
+    if not getattr(adapter, "_access_token", ""):
+        adapter._device_id = ""
     try:
         connected = await adapter.connect()
         if not connected:
