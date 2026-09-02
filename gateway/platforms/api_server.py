@@ -61,11 +61,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
-# names a profile this gateway does not serve (→ 404). Distinct from None
-# (no prefix / multiplexing off → handle as the default profile).
+# Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix or
+# X-Hermes-Profile header names a profile this gateway does not serve (→ 404).
+# Distinct from None (no selector / multiplexing off → default profile).
 _PROFILE_REJECTED = object()
-
+_PROFILE_CONFLICT = object()
 
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves.
@@ -83,8 +83,8 @@ def _prefix_names_served_profile(profile: str) -> bool:
     except Exception:
         return False
 
-# Profile selected by the /p/<profile>/ URL prefix for the current request.
-# Set by the profile-prefix middleware; read by handlers / _run_agent.
+# Profile selected by the URL prefix or X-Hermes-Profile request header. Set by
+# the profile middleware before authentication; read by handlers / _run_agent.
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
@@ -2098,20 +2098,28 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _resolve_request_profile(self, request: "web.Request"):
-        """Resolve + validate the /p/<profile>/ URL prefix on an API request.
+        """Resolve + validate the request's profile selector.
+
+        The established ``/p/<profile>/`` prefix and ``X-Hermes-Profile``
+        header are equivalent. The header lets API clients select a profile
+        without rewriting every endpoint path. Selection happens in middleware
+        before authentication, SessionDB access, config loading, or agent
+        creation, so the selected profile's own key and runtime scope remain
+        authoritative.
 
         Returns:
-          - ``None`` when no profile prefix is present, or when multiplexing
-            is off and the prefix names this gateway's own profile (the
-            request is handled as the serving profile).
+          - ``None`` when no selector is present, or multiplexing is off.
           - the profile name (str) when present, multiplexing is on, and the
             profile is one this gateway serves.
-          - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured, or names a profile this single-profile
-            gateway does not serve (handler/middleware returns 404).
+          - ``_PROFILE_REJECTED`` when the selector is unknown/unconfigured,
+            or names a profile this single-profile gateway does not serve.
+          - ``_PROFILE_CONFLICT`` when prefix and header disagree.
         """
-        profile = (request.match_info.get("profile") or "").strip()
-        if not profile:
+        raw_path_profile = (request.match_info.get("profile") or "").strip()
+        raw_header_profile = (
+            request.headers.get("X-Hermes-Profile") or ""
+        ).strip()
+        if not (raw_path_profile or raw_header_profile):
             return None
         runner = getattr(self, "gateway_runner", None)
         cfg = getattr(runner, "config", None)
@@ -2130,7 +2138,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 else _PROFILE_REJECTED
             )
         try:
-            from hermes_cli.profiles import profiles_to_serve
+            from hermes_cli.profiles import normalize_profile_name, profiles_to_serve
+
+            path_profile = (
+                normalize_profile_name(raw_path_profile) if raw_path_profile else ""
+            )
+            header_profile = (
+                normalize_profile_name(raw_header_profile)
+                if raw_header_profile
+                else ""
+            )
+            if path_profile and header_profile and path_profile != header_profile:
+                return _PROFILE_CONFLICT
+            profile = path_profile or header_profile
 
             served = {
                 name
@@ -2177,11 +2197,19 @@ class APIServerAdapter(BasePlatformAdapter):
         return _profile_runtime_scope(get_profile_dir(profile))
 
     def _make_profile_prefix_middleware(self):
-        """Reject unknown /p/<profile>/ prefixes and scope the request home."""
+        """Resolve the request profile and scope auth/config/session access."""
 
         @web.middleware
         async def profile_prefix_middleware(request: "web.Request", handler):
             profile = self._resolve_request_profile(request)
+            if profile is _PROFILE_CONFLICT:
+                return web.json_response(
+                    _openai_error(
+                        "X-Hermes-Profile conflicts with the URL profile prefix",
+                        code="profile_selector_conflict",
+                    ),
+                    status=400,
+                )
             if profile is _PROFILE_REJECTED:
                 return web.json_response(
                     {"error": "Unknown or unconfigured profile"},
@@ -3484,6 +3512,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "profile_header": "X-Hermes-Profile",
                 "cors": bool(self._cors_origins),
                 # Browser-extension control is always advertised so clients
                 # can feature-detect it, but remains disabled until
