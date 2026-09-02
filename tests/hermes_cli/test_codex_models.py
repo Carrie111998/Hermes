@@ -15,6 +15,26 @@ CHATGPT_REJECTED_CODEX_PRO_SLUGS = {
 }
 
 
+def _fetch_live_models(monkeypatch, entries):
+    import sys
+
+    from hermes_cli import codex_models
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"models": entries}
+
+    class _FakeHttpx:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            return _FakeResp()
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    return codex_models._fetch_models_from_api(access_token="tok")
+
+
 def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch):
     """OAuth fallback retains real models but never synthesizes rejected ones."""
     retained_models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
@@ -35,14 +55,21 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
 
 
-def test_picker_synthesizes_900k_variants_for_verified_slugs():
+def test_picker_synthesizes_900k_variants_for_verified_slugs(monkeypatch, tmp_path):
     """Every live-verified large-context slug gets an explicit ``-900k``
     picker variant directly after its base entry; slugs that genuinely
     enforce 272K (gpt-5.5, gpt-5.4-mini) never get one. Base slugs stay
     in the list as the cheaper 272K default."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     model_ids = get_codex_model_ids()  # offline curated path
 
-    for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4"):
+    for base in (
+        "gpt-daybreak-blue-latest",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.4",
+    ):
         assert base in model_ids
         assert f"{base}-900k" in model_ids
         assert model_ids.index(f"{base}-900k") == model_ids.index(base) + 1
@@ -76,6 +103,16 @@ def test_setup_wizard_codex_import_resolves():
 
 
 
+def test_live_picker_synthesizes_daybreak_900k_variant(monkeypatch):
+    models = _fetch_live_models(
+        monkeypatch,
+        [{"slug": "gpt-daybreak-blue-latest", "priority": 0}],
+    )
+
+    assert "gpt-daybreak-blue-latest" in models
+    assert "gpt-daybreak-blue-latest-900k" in models
+
+
 def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     """Regression: gpt-5.3-codex-spark is returned by the live Codex backend
     with ``supported_in_api: false`` because it isn't in the public OpenAI
@@ -83,29 +120,18 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     accounts, so we must not drop it on that flag. visibility=hidden is
     the separate signal that *should* still filter entries out.
     """
-    import sys
-    from hermes_cli import codex_models
-
-    class _FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {
-                "models": [
-                    {"slug": "gpt-5.5", "priority": 0, "supported_in_api": True},
-                    {"slug": "gpt-5.3-codex-spark", "priority": 7, "supported_in_api": False},
-                    {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
-                ]
-            }
-
-    class _FakeHttpx:
-        @staticmethod
-        def get(url, headers=None, timeout=None):
-            return _FakeResp()
-
-    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
-
-    models = codex_models._fetch_models_from_api(access_token="tok")
+    models = _fetch_live_models(
+        monkeypatch,
+        [
+            {"slug": "gpt-5.5", "priority": 0, "supported_in_api": True},
+            {
+                "slug": "gpt-5.3-codex-spark",
+                "priority": 7,
+                "supported_in_api": False,
+            },
+            {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
+        ],
+    )
 
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
@@ -238,4 +264,3 @@ class TestNormalizeModelForProvider:
         assert changed is True
         # Uses first from available list
         assert cli.model == "gpt-5.3-codex"
-

@@ -61,12 +61,10 @@ def test_default_openai_endpoint_intersects_account_access(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
 
-    curated = M._PROVIDER_MODELS["openai-api"]
-    # Account only serves the first two curated models.
-    live = list(curated[:2]) + ["text-embedding-3-large", "whisper-1"]
+    daybreak = "gpt-daybreak-blue-latest"
+    # Account serves two curated models plus unrelated API products.
+    live = ["gpt-5.6-sol", daybreak, "text-embedding-3-large", "whisper-1"]
     with patch.object(M, "fetch_api_models", return_value=live):
         result = M.provider_model_ids("openai-api", force_refresh=True)
 
-    assert result == list(curated[:2])
-
-
+    assert result == [daybreak, "gpt-5.6-sol"]
