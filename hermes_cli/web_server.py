@@ -8368,11 +8368,13 @@ def _catalog_provider_env_metadata() -> dict:
 
     Returns ``{env_var: {provider, provider_label, description, url, is_password,
     advanced}}`` for every API-key provider in the unified ``provider_catalog()``
-    (i.e. the ``hermes model`` universe). This is what lets the desktop Keys tab
-    render a card for a provider even when its env var was never hand-added to
-    ``OPTIONAL_ENV_VARS`` — closing the drift where CLI-configurable providers
-    (openai-api, kilocode, novita, tencent-tokenhub, copilot, …) were missing
-    from the GUI.
+    (i.e. the ``hermes model`` universe). When multiple providers intentionally
+    share one env var, ``provider_profiles`` preserves every provider identity
+    while the legacy singular fields keep describing the first provider. This
+    is what lets the desktop Keys tab render a card for a provider even when its
+    env var was never hand-added to ``OPTIONAL_ENV_VARS`` — closing the drift
+    where CLI-configurable providers (openai-api, kilocode, novita,
+    tencent-tokenhub, copilot, …) were missing from the GUI.
 
     Hand ``OPTIONAL_ENV_VARS`` prose is layered ON TOP of this in the endpoint;
     this only supplies membership + grouping + sensible fallbacks.
@@ -8396,21 +8398,47 @@ def _catalog_provider_env_metadata() -> dict:
     }
 
     meta: dict = {}
+
+    def _profile(entry: dict) -> dict:
+        """Return the provider-specific part of a shared credential row."""
+        return {
+            "provider": entry["provider"],
+            "provider_label": entry["provider_label"],
+            "description": entry["description"],
+            "url": entry["url"],
+            "primary": bool(entry.get("provider_primary")),
+        }
+
+    def _add_provider_env(env_var: str, entry: dict) -> None:
+        """Add one provider without discarding peers that share ``env_var``."""
+        existing = meta.get(env_var)
+        if existing is None:
+            meta[env_var] = entry
+            return
+
+        if existing.get("provider") == entry.get("provider"):
+            return
+
+        profiles = existing.setdefault("provider_profiles", [_profile(existing)])
+        if not any(p.get("provider") == entry.get("provider") for p in profiles):
+            profiles.append(_profile(entry))
+
     for d in provider_catalog():
         if d.tab != "keys":
             continue
         # API-key vars: the first is the primary (password) field; any aliases
         # are kept as additional password fields so users can clear them too.
-        for env_var in d.api_key_env_vars:
+        for index, env_var in enumerate(d.api_key_env_vars):
             if env_var in _non_provider_keys:
                 continue  # don't hijack a shared tool/messaging credential
-            meta.setdefault(
+            _add_provider_env(
                 env_var,
                 {
                     "provider": d.slug,
                     "provider_label": d.label,
                     "description": d.description,
                     "url": d.signup_url or None,
+                    "provider_primary": index == 0,
                     "is_password": True,
                     "advanced": False,
                     "category": "provider",
@@ -8506,6 +8534,11 @@ def _get_env_vars_sync(profile: Optional[str] = None):
             # CLI `hermes model` picker uses (not desktop-only prefix guesses).
             "provider": cat_meta.get("provider", ""),
             "provider_label": cat_meta.get("provider_label", ""),
+            # One credential may intentionally serve multiple built-in routes
+            # (for example alibaba and alibaba-cn both use DASHSCOPE_API_KEY).
+            # Preserve those provider identities so Desktop can render distinct
+            # cards that edit the same underlying env var.
+            "provider_profiles": cat_meta.get("provider_profiles", []),
             # True when this key exists in the user's .env but is NOT in any
             # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
             # arbitrary/custom env var the user added directly. Surfaced so the
