@@ -10272,7 +10272,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 _observe_type = self._media_message_type(_m)
                 _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
                 if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
+                    _event.text = self._clean_bot_trigger_text(_event.text)
                 await self._cache_observed_media(_m, _event)
                 self._observe_unmentioned_group_message(
                     _m, _event.message_type, update_id=update.update_id, event=_event
@@ -10287,7 +10287,7 @@ class TelegramAdapter(BasePlatformAdapter):
         
         # Add caption as text
         if msg.caption:
-            event.text = self._clean_bot_trigger_text(msg.caption)
+            event.text = self._clean_bot_trigger_text(event.text)
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -10840,6 +10840,37 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return None
 
+    @staticmethod
+    def _message_text_with_link_targets(message: Message) -> str:
+        """Preserve URLs hidden behind Telegram ``text_link`` entities.
+
+        Telegram keeps a hyperlink's target on the entity rather than in the
+        message text.  Without explicitly carrying those targets into the
+        gateway event, forwarded article labels such as ``Article`` and
+        ``Comments`` reach the agent with no actionable URL.
+        """
+        base_text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        link_targets: list[str] = []
+
+        entity_groups = (
+            getattr(message, "entities", None) or [],
+            getattr(message, "caption_entities", None) or [],
+        )
+        for entities in entity_groups:
+            for entity in entities:
+                entity_type = str(getattr(entity, "type", "")).split(".")[-1].lower()
+                if entity_type != "text_link":
+                    continue
+                url = str(getattr(entity, "url", "") or "").strip()
+                if url and url not in link_targets and url not in base_text:
+                    link_targets.append(url)
+
+        if not link_targets:
+            return base_text
+
+        separator = "\n\n" if base_text else ""
+        return f"{base_text}{separator}[Linked URLs]:\n" + "\n".join(link_targets)
+
     def _build_message_event(
         self,
         message: Message,
@@ -10985,6 +11016,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         reply_to_text = None
 
+        base_text = self._message_text_with_link_targets(message)
+
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt
         _chat_id_str = str(chat.id)
@@ -10995,7 +11028,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=base_text,
             message_type=msg_type,
             source=source,
             raw_message=message,

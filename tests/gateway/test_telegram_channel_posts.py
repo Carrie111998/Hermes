@@ -148,3 +148,50 @@ def test_build_message_event_uses_channel_identity_for_channel_posts(telegram_ad
     assert event.platform_update_id == 12345
 
 
+def _text_link(url):
+    return SimpleNamespace(type="text_link", url=url)
+
+
+def test_build_message_event_preserves_hidden_text_link_targets(telegram_adapter_cls):
+    adapter = _make_adapter(telegram_adapter_cls)
+    msg = _make_channel_message("Article · Comments")
+    msg.entities = [
+        _text_link("https://example.com/article"),
+        _text_link("https://news.ycombinator.com/item?id=123"),
+        _text_link("https://example.com/article"),
+    ]
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.text == (
+        "Article · Comments\n\n"
+        "[Linked URLs]:\n"
+        "https://example.com/article\n"
+        "https://news.ycombinator.com/item?id=123"
+    )
+
+
+def test_build_message_event_preserves_caption_text_link_targets(telegram_adapter_cls):
+    adapter = _make_adapter(telegram_adapter_cls)
+    msg = _make_channel_message(None)
+    msg.caption = "Read the report"
+    msg.caption_entities = [_text_link("https://example.com/report")]
+
+    event = adapter._build_message_event(msg, MessageType.DOCUMENT)
+
+    assert event.text == (
+        "Read the report\n\n"
+        "[Linked URLs]:\n"
+        "https://example.com/report"
+    )
+
+
+def test_build_message_event_does_not_repeat_visible_link_targets(telegram_adapter_cls):
+    adapter = _make_adapter(telegram_adapter_cls)
+    msg = _make_channel_message("https://example.com/article")
+    msg.entities = [_text_link("https://example.com/article")]
+
+    event = adapter._build_message_event(msg, MessageType.TEXT)
+
+    assert event.text == "https://example.com/article"
+
