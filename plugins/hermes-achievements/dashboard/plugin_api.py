@@ -253,6 +253,47 @@ def save_checkpoint(data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_safe(data), indent=2, sort_keys=True), encoding="utf-8")
 
 
+_STATS_MERGE_SKIP = {"session_id", "title", "started_at", "last_active", "source"}
+
+
+def _merge_stats_monotonic(cached: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
+    """Element-wise max of a session's fresh stats with its cached scan.
+
+    Session transcripts are lossy: context compaction rewrites a session's
+    messages (and bumps ``last_active``), which invalidates the fingerprint
+    and forces re-analysis of the *smaller* surviving transcript. Real
+    activity only ever adds events, so a per-session metric that goes DOWN
+    between scans is an artifact of history compression, not of usage —
+    keep the max so lifetime totals never silently regress. Collection
+    fields (e.g. ``model_names``) merge by union for the same reason.
+    Session metadata (`_STATS_MERGE_SKIP`) always takes the fresh value.
+    """
+    merged = dict(fresh)
+    for key, old in cached.items():
+        if key in _STATS_MERGE_SKIP:
+            continue
+        new = merged.get(key)
+        old_is_bool, new_is_bool = isinstance(old, bool), isinstance(new, bool)
+        if new is None:
+            # A fresh analysis that omits or blanks a metric is a partial answer,
+            # not a zero -- a newer analyzer that no longer emits a field must not
+            # erase what an older scan measured.
+            merged[key] = old
+        elif old_is_bool and new_is_bool:
+            merged[key] = old or new
+        elif isinstance(old, (int, float)) and isinstance(new, (int, float)) and not (old_is_bool or new_is_bool):
+            merged[key] = max(old, new)
+        elif isinstance(old, (int, float)) and isinstance(new, (int, float)):
+            # Type drift (bool <-> count) between analyzer versions: keep the
+            # count. Coercing a count through bool() would turn 400 into True,
+            # which sums downstream as 1 -- a worse regression than compaction.
+            merged[key] = new if not new_is_bool else old
+        elif isinstance(old, (set, list)) and isinstance(new, (set, list)):
+            union = set(old) | set(new)
+            merged[key] = union if isinstance(new, set) else sorted(union)
+    return merged
+
+
 def session_fingerprint(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "last_active": meta.get("last_active"),
@@ -651,6 +692,10 @@ def scan_sessions(
             else:
                 messages = db.get_messages(sid)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
+                if isinstance(cached_stats, dict):
+                    # Same session, changed fingerprint: the transcript may have
+                    # been compacted. Merge monotonically so counts never drop.
+                    stats = _merge_stats_monotonic(cached_stats, stats)
                 rescanned += 1
 
             stats["session_id"] = sid
@@ -815,6 +860,14 @@ def evidence_for(definition: Dict[str, Any], sessions: List[Dict[str, Any]]) -> 
     return None
 
 
+def _tier_rank(definition: Dict[str, Any], tier_name: Optional[str]) -> int:
+    """Position of ``tier_name`` in the definition's ascending tier ladder; -1 if none."""
+    if not tier_name:
+        return -1
+    ladder = [t.get("name") for t in sorted(definition.get("tiers", []), key=lambda t: t.get("threshold", 0))]
+    return ladder.index(tier_name) if tier_name in ladder else -1
+
+
 def _compute_from_scan(scan: Dict[str, Any], *, is_partial: bool = False) -> Dict[str, Any]:
     """Evaluate every achievement definition against a scan result.
 
@@ -832,9 +885,29 @@ def _compute_from_scan(scan: Dict[str, Any], *, is_partial: bool = False) -> Dic
         result = evaluate_definition(definition, aggregate)
         unlock_id = definition["id"]
         if not is_partial and result["unlocked"] and unlock_id not in unlocks:
-            unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "evidence": evidence_for(definition, scan.get("sessions", []))}
+            unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "highest_tier": result.get("tier"), "evidence": evidence_for(definition, scan.get("sessions", []))}
         item = {**definition, **result}
-        if result["unlocked"]:
+        recorded = unlocks.get(unlock_id)
+        if recorded and not is_partial and result["unlocked"]:
+            # Track the best tier ever reached so the floor below can restore
+            # it, not just the first one earned.
+            if _tier_rank(definition, result.get("tier")) > _tier_rank(definition, recorded.get("highest_tier")):
+                recorded["highest_tier"] = result.get("tier")
+        if recorded:
+            # Unlock floor: state.json is the durable record of what was
+            # earned; the live aggregate can lose its backing when compaction
+            # shrinks session history. Once earned, never displayed as
+            # un-earned -- and never at a lower tier than was reached. The
+            # floor survives compaction only: /reset-state drops state.json,
+            # the scan checkpoint and the snapshot together, so a deliberate
+            # reset clears it along with the evidence.
+            floor_tier = recorded.get("highest_tier") or recorded.get("first_tier")
+            if not result["unlocked"]:
+                item["unlocked"] = True
+                item["state"] = "unlocked"
+            if _tier_rank(definition, floor_tier) > _tier_rank(definition, item.get("tier")):
+                item["tier"] = floor_tier
+        if item["unlocked"]:
             item["unlocked_at"] = unlocks.get(unlock_id, {}).get("unlocked_at")
             item["evidence"] = unlocks.get(unlock_id, {}).get("evidence") or evidence_for(definition, scan.get("sessions", []))
         evaluated.append(display_achievement(item))
@@ -1072,6 +1145,10 @@ async def rescan():
 
 @router.post("/reset-state")
 async def reset_state():
+    """Full reset: drops ``state.json`` (recorded unlocks, i.e. the unlock
+    floor), the scan checkpoint (cached per-session stats, i.e. the monotonic
+    merge's memory) and the snapshot, together. After this nothing earned is
+    remembered -- the floor protects against compaction, not against a reset."""
     global _SNAPSHOT_CACHE, _SNAPSHOT_CACHE_AT
     save_state({"unlocks": {}})
     _SNAPSHOT_CACHE = None
