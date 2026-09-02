@@ -4423,6 +4423,106 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/reasoning" in result["final_response"]
 
+    def test_length_structured_reasoning_exhausted_skips_continuation(self, agent):
+        """Structured reasoning with no visible content must not trigger continuation."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="",
+            reasoning="internal reasoning",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Structured reasoning exhausted the output budget just like an
+        # inline <think> block: continuing would only make the model reason again.
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert "reasoning" in result["error"].lower()
+        assert "output tokens" in result["error"].lower()
+        assert result["final_response"] is not None
+        assert "Thinking Budget Exhausted" in result["final_response"]
+        assert "/thinkon" in result["final_response"]
+
+    def test_length_structured_reasoning_content_exhausted_skips_continuation(self, agent):
+        """reasoning_content with no visible content must also skip continuation."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="",
+            reasoning_content="internal reasoning",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert "reasoning" in result["error"].lower()
+        assert "output tokens" in result["error"].lower()
+        assert "Thinking Budget Exhausted" in result["final_response"]
+
+    def test_length_structured_reasoning_with_visible_content_still_continues(self, agent):
+        """Visible truncated content must continue even when structured reasoning exists."""
+        self._setup_agent(agent)
+        first = _mock_response(
+            content="Part 1 ",
+            reasoning="internal reasoning",
+            finish_reason="length",
+        )
+        second = _mock_response(
+            content="Part 2",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert "Part 1" in result["final_response"]
+        assert "Part 2" in result["final_response"]
+
+
+    def test_length_empty_content_without_reasoning_still_continues(self, agent):
+        """Empty content without reasoning remains a normal truncation."""
+        self._setup_agent(agent)
+        first = _mock_response(
+            content="",
+            finish_reason="length",
+        )
+        second = _mock_response(
+            content="Recovered response",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert "Recovered response" in result["final_response"]
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
