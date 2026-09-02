@@ -86,6 +86,26 @@ _HARDLINE_BLOCK = [
     "true && mkfs.ext4 /dev/sda1",
     "sudo mkfs.ext4 /dev/sda1",
     "nohup mkfs /dev/sdb",
+    # Assignment prefixes and doas/xargs wrappers also reach command
+    # position (#93402 review): POSIX runs the word after leading VAR=VAL
+    # assignments, doas is sudo's BSD equivalent, and `| xargs mkfs` puts
+    # mkfs at the pipeline tail's command position.
+    "FOO=bar mkfs.ext4 /dev/sda1",
+    "FOO=1 BAR=2 mkfs /dev/sdb",
+    "doas mkfs.ext4 /dev/sda1",
+    "printf '%s\\n' /dev/sdb | xargs mkfs",
+    # Wrappers interleave with assignments/env in any order — the anchor
+    # must not depend on a fixed sudo-then-env-then-wrapper sequence.
+    "env FOO=bar sudo mkfs.ext4 /dev/sda1",
+    "nohup FOO=bar mkfs /dev/sdb",
+    # Shell carriers surface their quoted payload at command position
+    # (behavior already provided by the payload variants; pinned here).
+    "bash -c 'mkfs.ext4 /dev/sda1'",
+    # Every other _CMDPOS rule benefits from the same widened anchor.
+    "FOO=bar reboot",
+    "doas shutdown -h now",
+    "FOO=bar rm -rf /",
+    "xargs rm -rf /",
     # Raw block device overwrites
     "dd if=/dev/zero of=/dev/sda bs=1M",
     "dd if=/dev/urandom of=/dev/nvme0n1",
@@ -191,6 +211,11 @@ _HARDLINE_ALLOW = [
     # the word appears in an argument, not at a command position.
     'echo "does this workflow use mkfs anywhere?"',
     "echo 'run mkfs.ext4 on the backup disk later'",
+    # An assignment prefix inside quotes is prose, and `xargs grep mkfs`
+    # runs grep with mkfs as its argument — neither puts mkfs at a command
+    # position (#93402 review gap probes, negative side).
+    'echo "set FOO=bar; mkfs /dev/sda1"',
+    "echo a | xargs grep mkfs",
     # Word-boundary protection
     "mkfs_helper --version",
     # systemctl non-destructive verbs

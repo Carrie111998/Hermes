@@ -495,16 +495,24 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # patterns so they don't fire on "echo reboot" or "grep 'shutdown' log".
 # Matches: start of string, after command separators (; && || | newline),
 # after subshell openers ( `$(` or backtick ), optionally consuming
-# leading wrapper commands (sudo, env VAR=VAL, exec, nohup, setsid).
+# leading wrapper commands (sudo, env VAR=VAL, bare VAR=VAL assignments,
+# doas, xargs, exec, nohup, setsid) in any order.
 _CMDPOS = (
     # Real ;/&/| separators are converted to newlines by the quote-aware
     # _mark_command_starts pass. Keeping them in this flat regex mistakes
     # quoted regex/data (for example grep '(safe|rm -rf /)') for commands.
     r'(?:^|[\n`]|\$\()'            # start position
     r'\s*'                          # optional whitespace
-    r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
-    r'(?:env\s+(?:\w+=\S*\s+)*)?'   # optional env with VAR=VAL pairs
-    r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
+    # Optional repeated assignments/wrappers in ANY order. POSIX puts the
+    # real command word after any leading VAR=VAL assignments (`FOO=bar
+    # mkfs …` runs mkfs), and sudo/env/doas/xargs interleave freely with
+    # them (`env X=1 sudo mkfs …`, `nohup FOO=bar doas …`), so each unit
+    # repeats here in one group rather than as fixed-order singletons —
+    # a fixed order let `env X=1 sudo mkfs …` and `nohup FOO=bar mkfs …`
+    # slip past the anchor (#93402 review). `xargs` only counts at a
+    # command position (after a separator, from `_mark_command_starts`),
+    # so an argument named xargs never matches.
+    r'(?:(?:sudo(?:\s+-[^\s]+)*|[A-Za-z_]\w*=\S*|env(?:\s+\w+=\S*)*|doas|xargs|exec|nohup|setsid|time)\s+)*'
     r'\s*'
 )
 
