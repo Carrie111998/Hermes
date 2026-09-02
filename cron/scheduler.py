@@ -3930,6 +3930,8 @@ _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
 def _parse_script_timeout(value: Any, source: str) -> tuple[bool, Optional[int]]:
     """Parse one timeout source, distinguishing unlimited from invalid."""
     try:
+        if isinstance(value, bool):
+            raise TypeError
         numeric = float(value)
         if numeric == 0:
             return True, None

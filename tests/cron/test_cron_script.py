@@ -108,24 +108,41 @@ class TestRunJobScript:
 
         assert sched._get_script_timeout() is None
 
-    @pytest.mark.parametrize("configured", [-1, "not-a-number"])
+    @pytest.mark.parametrize(
+        ("source", "configured"),
+        [
+            ("config", -1),
+            ("config", "not-a-number"),
+            ("config", False),
+            ("module", False),
+        ],
+    )
     def test_invalid_config_timeout_warns_and_uses_default(
-        self, cron_env, monkeypatch, caplog, configured,
+        self, cron_env, monkeypatch, caplog, source, configured,
     ):
         from cron import scheduler as sched
 
         monkeypatch.setattr(sched, "_SCRIPT_TIMEOUT", sched._DEFAULT_SCRIPT_TIMEOUT)
         monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
-        monkeypatch.setattr(
-            sched,
-            "load_config",
-            lambda: {"cron": {"script_timeout_seconds": configured}},
-        )
+        if source == "module":
+            monkeypatch.setattr(sched, "_SCRIPT_TIMEOUT", configured)
+            monkeypatch.setattr(sched, "load_config", lambda: {})
+        else:
+            monkeypatch.setattr(
+                sched,
+                "load_config",
+                lambda: {"cron": {"script_timeout_seconds": configured}},
+            )
 
         with caplog.at_level("WARNING", logger=sched.__name__):
             assert sched._get_script_timeout() == sched._DEFAULT_SCRIPT_TIMEOUT
 
-        assert "script_timeout_seconds" in caplog.text
+        expected_source = (
+            "patched _SCRIPT_TIMEOUT"
+            if source == "module"
+            else "cron.script_timeout_seconds"
+        )
+        assert expected_source in caplog.text
 
     def test_unlimited_script_can_finish_without_deadline(self, cron_env, monkeypatch):
         from cron import scheduler as sched
