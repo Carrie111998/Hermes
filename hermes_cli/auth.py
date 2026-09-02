@@ -1987,6 +1987,13 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         if real_home_env and _same_path(root_path, Path(real_home_env) / ".hermes" / "auth.json"):
             return None
     profile_path = _auth_file_path()
+    if _same_path(profile_path, root_path):
+        # The profile's auth.json IS the root store — e.g. symlinked by
+        # dotfiles-managed deployments (#101356). ``_global_auth_file_path``
+        # only same-path-checks the directories, so a symlinked file slips
+        # through; reading one file as both stores would match every row
+        # against itself and strip the shared credential through the symlink.
+        return None
     profile_home = profile_path.parent
     root_home = root_path.parent
     profile_singleton = profile_home / ".anthropic_oauth.json" if provider_id == "anthropic" else None

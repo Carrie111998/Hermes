@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -450,3 +451,25 @@ def test_heal_is_a_noop_in_classic_mode(fleet):
     before = (fleet["root"] / "auth.json").read_text()
     assert heal_forked_single_use_oauth_grants("anthropic") is None
     assert (fleet["root"] / "auth.json").read_text() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+def test_heal_is_a_noop_when_profile_store_symlinks_to_root(fleet):
+    """A profile auth.json symlinked to the root file is ONE shared store, not
+    a fork — the heal must not read it as two stores and strip the shared
+    credential through the symlink (#101356)."""
+    from hermes_cli.auth import heal_forked_single_use_oauth_grants
+
+    kid = _profile(fleet, "kid")
+    kid.mkdir(parents=True, exist_ok=True)
+    kid_auth = kid / "auth.json"
+    if kid_auth.is_symlink() or kid_auth.exists():
+        kid_auth.unlink()
+    kid_auth.symlink_to(fleet["root"] / "auth.json")
+
+    fleet["use"](kid)
+    before = (fleet["root"] / "auth.json").read_text()
+    assert heal_forked_single_use_oauth_grants("anthropic") is None
+    assert (fleet["root"] / "auth.json").read_text() == before
+    assert fleet["rows"](fleet["root"]), "shared grant was stripped from the root store"
+    assert (kid / "auth.json").is_symlink()
