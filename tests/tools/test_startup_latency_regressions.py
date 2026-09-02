@@ -134,6 +134,26 @@ class TestLazyMcpSdk:
         assert mcp_tool.ClientSession is not None
         assert mcp_tool.stdio_client is not None
 
+    def test_ensure_mcp_sdk_completes_partially_bound_state(self):
+        """One pre-bound SDK symbol must not skip the complete lazy import."""
+        import importlib.util
+        import subprocess
+
+        if importlib.util.find_spec("mcp") is None:
+            pytest.skip("mcp SDK not installed")
+        code = (
+            "import tools.mcp_tool as m; "
+            "m.ClientSession = object(); "
+            "assert m._ensure_mcp_sdk() is True; "
+            "assert 'StdioServerParameters' in vars(m); "
+            "assert 'stdio_client' in vars(m)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+
     def test_ensure_respects_patched_unavailable(self):
         from tools import mcp_tool
 
