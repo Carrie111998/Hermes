@@ -698,6 +698,104 @@ class TestSecurityScanGate:
         with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
             assert _guard_agent_created_enabled() is False
 
+    @staticmethod
+    def _ask_result():
+        # Coupled to INSTALL_POLICY on purpose: the agent-created row routes
+        # a "dangerous" verdict to "ask" → should_allow_install returns None
+        # (allowed is None), which is the branch these tests exercise. If the
+        # matrix is ever reordered, this fixture silently changes meaning.
+        from tools.skills_guard import ScanResult, Finding
+
+        finding = Finding(
+            pattern_id="test", severity="critical", category="exfiltration",
+            file="SKILL.md", line=1, match="curl $TOKEN", description="test",
+        )
+        return ScanResult(
+            skill_name="test",
+            source="agent-created",
+            trust_level="agent-created",
+            verdict="dangerous",
+            findings=[finding],
+            summary="dangerous",
+        )
+
+    def test_ask_verdict_blocks_normal_write(self, tmp_path):
+        """Outside the approval replay an "ask" verdict still blocks the
+        agent's own write (fail-closed for the unattended path)."""
+        from tools.skill_manager_tool import _security_scan_skill
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()), \
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass:
+            bypass.get.return_value = False
+            result = _security_scan_skill(tmp_path)
+
+        assert result is not None
+        assert "Security scan blocked" in result
+
+    def test_ask_verdict_blocks_when_only_staging_bypass_set(self, tmp_path):
+        """Regression (#94358 review): the operations[] batch executor
+        (#97295) sets _skill_gate_bypass — "skip the staging gate" loop
+        prevention, no human involved. The ask-override must key off
+        _skill_approval_bypass ("a human approved this exact write") instead,
+        so an agent-driven batch can never satisfy an "ask" verdict."""
+        from tools.skill_manager_tool import (
+            _security_scan_skill,
+            _skill_gate_bypass,
+        )
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()):
+            token = _skill_gate_bypass.set(True)
+            try:
+                result = _security_scan_skill(tmp_path)
+            finally:
+                _skill_gate_bypass.reset(token)
+
+        assert result is not None
+        assert "Security scan blocked" in result
+
+    def test_ask_verdict_yields_to_human_approval_replay(self, tmp_path, caplog):
+        """The reported deadlock (#94353): /skills approve replays the exact
+        write a human just reviewed. An "ask" verdict means "needs a human
+        decision" — the approval IS that decision, so the replay proceeds
+        with the findings logged for the audit trail. The override keys off
+        _skill_approval_bypass, the human-decision var, not the staging-gate
+        _skill_gate_bypass."""
+        import logging
+
+        from tools.skill_manager_tool import _security_scan_skill
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()), \
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass, \
+             caplog.at_level(logging.WARNING, logger="tools.skill_manager_tool"):
+            bypass.get.return_value = True
+            result = _security_scan_skill(tmp_path)
+
+        assert result is None
+        assert any(
+            "approved despite scan findings" in r.message for r in caplog.records
+        )
+
+    def test_hard_denial_blocks_even_during_approval_replay(self, tmp_path):
+        """Fail-closed pin: a hard denial is policy, not judgment — the
+        human approval replay must NOT override it."""
+        from tools.skill_manager_tool import _security_scan_skill
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()), \
+             patch(
+                 "tools.skill_manager_tool.should_allow_install",
+                 return_value=(False, "hard denial (blocklist)"),
+             ), \
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass:
+            bypass.get.return_value = True
+            result = _security_scan_skill(tmp_path)
+
+        assert result is not None
+        assert "Security scan blocked" in result
+
     def test_guard_flag_quoted_false_stays_disabled(self):
         """Quoted 'false' from YAML edits must not enable the guard."""
         from tools.skill_manager_tool import _guard_agent_created_enabled
