@@ -21,7 +21,14 @@ from hermes_time import now as _hermes_now
 # dashboard operations that temporarily enter another profile cannot leak that
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+
+# Terminal-row cap. ``None`` resolves from ``cron.execution_retention`` at prune
+# time (mirrors ``cron.output_retention`` in cron/jobs.py), so a config change
+# takes effect without a reinstall. Assigning an int overrides config outright —
+# the sentinel is ``None`` rather than the default value so that a test or
+# embedder setting the override to exactly 1000 is still honoured.
+_DEFAULT_MAX_TERMINAL_EXECUTIONS = 1000
+MAX_TERMINAL_EXECUTIONS: Optional[int] = None
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -126,8 +133,32 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
+def _max_terminal_executions() -> int:
+    """Resolve the ledger's terminal-row cap from ``cron.execution_retention``.
+
+    Mirrors ``_cron_output_keep`` in cron/jobs.py. ``load_config_readonly`` is
+    safe here because this path only reads.
+    """
+    if MAX_TERMINAL_EXECUTIONS is not None:  # test/embedder override
+        return max(0, int(MAX_TERMINAL_EXECUTIONS))
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(cron_cfg, dict):
+            return _DEFAULT_MAX_TERMINAL_EXECUTIONS
+        keep = int(cron_cfg.get("execution_retention", _DEFAULT_MAX_TERMINAL_EXECUTIONS))
+    except Exception:
+        return _DEFAULT_MAX_TERMINAL_EXECUTIONS
+    # A non-positive cap would delete every terminal row on each write, losing
+    # the audit trail the ledger exists to keep, so it falls back rather than
+    # being honoured. Use the module override for a deliberate zero.
+    return keep if keep > 0 else _DEFAULT_MAX_TERMINAL_EXECUTIONS
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    limit = _max_terminal_executions()
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions

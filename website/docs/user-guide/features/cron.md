@@ -334,6 +334,20 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+Terminal rows are capped at 1000 by default. Raise the cap when a busy fleet
+needs a longer audit window:
+
+```yaml
+cron:
+  execution_retention: 2500   # default 1000
+```
+
+The new cap applies on the next terminal execution write. This is a **row cap,
+not a day count** — estimate it from the fleet's measured runs per day plus
+headroom for schedule growth. Raising the cap cannot restore rows that were
+already pruned, so a longer window accumulates from the change onward. A
+non-positive value falls back to the default rather than wiping the ledger.
+
 ### Repeated-failure review nudge
 
 Each job tracks a `failure_streak` — consecutive failed runs (delivery

@@ -83,6 +83,92 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def _config_cap(monkeypatch, executions, cron_cfg):
+    """Point the cap resolver at a fake config and clear the module override."""
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", None)
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config, "load_config_readonly", lambda: {"cron": cron_cfg}
+    )
+
+
+def test_retention_cap_is_driven_by_cron_execution_retention(monkeypatch, tmp_path):
+    """``cron.execution_retention`` must actually bound the ledger.
+
+    Regression: the cap was a hard-coded module constant, so an operator who set
+    ``cron.execution_retention`` saw the value echoed by ``hermes config get``
+    while pruning silently kept using the built-in 1000-row default.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _config_cap(monkeypatch, executions, {"execution_retention": 5})
+
+    assert executions._max_terminal_executions() == 5
+    for index in range(9):
+        row = executions.create_execution(f"done-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+
+    records = executions.list_executions(limit=100)
+    assert len([row for row in records if row["status"] == "completed"]) == 5
+
+
+def test_retention_cap_rejects_unusable_config_values(monkeypatch, tmp_path):
+    """Missing, non-numeric, non-positive, and malformed values fall back.
+
+    A non-positive value would delete every terminal row on each write, so it is
+    not honoured as "prune everything"; the module override exists for that.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    default = executions._DEFAULT_MAX_TERMINAL_EXECUTIONS
+
+    for cron_cfg in (
+        {},
+        {"execution_retention": 0},
+        {"execution_retention": -1},
+        {"execution_retention": "lots"},
+        {"execution_retention": None},
+        "not-a-mapping",
+    ):
+        _config_cap(monkeypatch, executions, cron_cfg)
+        assert executions._max_terminal_executions() == default, cron_cfg
+
+
+def test_retention_module_override_beats_config(monkeypatch, tmp_path):
+    """An explicit int override stays authoritative for tests and embedders."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _config_cap(monkeypatch, executions, {"execution_retention": 5000})
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 2)
+
+    assert executions._max_terminal_executions() == 2
+
+
+def test_retention_override_equal_to_default_is_honoured(monkeypatch, tmp_path):
+    """The sentinel is ``None``, so an override of exactly 1000 still wins.
+
+    Guards the alternative sentinel design (``!= _DEFAULT``), under which an
+    override set to the default value is silently ignored and config leaks back
+    in.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _config_cap(monkeypatch, executions, {"execution_retention": 7})
+    monkeypatch.setattr(
+        executions, "MAX_TERMINAL_EXECUTIONS", executions._DEFAULT_MAX_TERMINAL_EXECUTIONS
+    )
+
+    assert executions._max_terminal_executions() == 1000
+
+
+def test_execution_retention_is_a_registered_config_default():
+    """``hermes config set cron.execution_retention`` must recognise the key.
+
+    Without the defaults entry the setting is unknown to the config surface, so
+    an operator cannot set it through the supported path.
+    """
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["execution_retention"] == 1000
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
