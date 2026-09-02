@@ -132,12 +132,14 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    triggered_skill_context: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default), plus any auto-loaded triggered skill
+    content.  Both are appended to the *API copy* of the user message only
+    — the stored content stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -158,6 +160,8 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if triggered_skill_context:
+        injections.append(triggered_skill_context)
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -1562,6 +1566,35 @@ def build_turn_context(
             except Exception:
                 pass
 
+    # ── Trigger-based skill auto-loading ──────────────────────────────
+    # Evaluate skill trigger patterns against the user message text.
+    # Reuses canonical filtering from prompt_builder — no parallel scanner.
+    # Injected via the api_content sidecar (same cache-safe path as memory).
+    triggered_skill_context = ""
+    try:
+        if isinstance(user_message, str) and user_message.strip():
+            from agent.skill_trigger_loader import (
+                format_triggered_skill_content,
+                get_triggered_skills,
+            )
+            from agent.prompt_builder import get_visible_skill_entries
+
+            _entries = get_visible_skill_entries()
+            if _entries:
+                _matched = get_triggered_skills(user_message, _entries)
+                if _matched:
+                    blocks = [
+                        format_triggered_skill_content(e) for e in _matched
+                    ]
+                    blocks = [b for b in blocks if b]
+                    if blocks:
+                        triggered_skill_context = (
+                            "\n\n[Triggered skills for this request:]\n\n"
+                            + "\n\n".join(blocks)
+                        )
+    except Exception:
+        logger.debug("Skill trigger evaluation failed", exc_info=True)
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next
@@ -1587,7 +1620,8 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
+            triggered_skill_context=triggered_skill_context,
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

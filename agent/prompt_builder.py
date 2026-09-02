@@ -1667,6 +1667,8 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "triggers": list(frontmatter.get("triggers", []) or []),
+        "rel_path": str(rel_path),
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1830,7 +1832,7 @@ def build_skills_system_prompt(
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
 
-        return _build_skills_system_prompt_inner(
+        result, _entries = _build_skills_system_prompt_inner(
             skills_dir,
             external_dirs,
             available_tools,
@@ -1838,6 +1840,50 @@ def build_skills_system_prompt(
             compact_categories,
             project_dirs=project_dirs,
         )
+        return result
+    finally:
+        if _home_token is not None:
+            reset_hermes_home_override(_home_token)
+
+
+def get_visible_skill_entries(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: "Path | None" = None,
+) -> list[dict]:
+    """Return filtered visible entries from the skills snapshot pipeline.
+
+    These are the same entries that ``build_skills_system_prompt`` uses
+    for the system-prompt skill index, after platform/environment/disabled
+    filtering.  Designed for use by the trigger-based skill loader.
+
+    When any filter parameter is ``None`` the corresponding gate accepts
+    all skills (backward compat — identical to the default index build).
+    """
+    if skills_dir_override is not None:
+        skills_dir = Path(skills_dir_override)
+        _home_token = set_hermes_home_override(str(skills_dir.parent))
+    else:
+        skills_dir = get_skills_dir()
+        _home_token = None
+    try:
+        external_dirs = get_all_skills_dirs()[1:]
+        from agent.skill_utils import get_project_skills_dirs
+        project_dirs = get_project_skills_dirs()
+
+        if not skills_dir.exists() and not external_dirs and not project_dirs:
+            return []
+
+        _, visible = _build_skills_system_prompt_inner(
+            skills_dir,
+            external_dirs,
+            available_tools,
+            available_toolsets,
+            compact_categories,
+            project_dirs=project_dirs,
+        )
+        return visible
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1850,7 +1896,7 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
-) -> str:
+) -> tuple[str, list[dict]]:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
@@ -1870,6 +1916,11 @@ def _build_skills_system_prompt_inner(
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            # Old-format cached strings get wrapped to maintain the
+            # (result, visible_entries) contract.
+            if isinstance(cached, str):
+                cached = (cached, [])
+                _SKILLS_PROMPT_CACHE[cache_key] = cached
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
@@ -2156,12 +2207,12 @@ def _build_skills_system_prompt_inner(
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
+        _SKILLS_PROMPT_CACHE[cache_key] = (result, visible_entries)
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
-    return result
+    return result, visible_entries
 
 
 # =========================================================================
