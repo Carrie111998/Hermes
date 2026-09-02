@@ -10864,6 +10864,20 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_target(args) -> tuple[str, str]:
+    """Resolve ``hermes update``'s branch-or-release target."""
+    version = getattr(args, "update_version", None)
+    if version is None:
+        # Compatibility for direct/internal callers that predate the parser's
+        # distinct destination from the global ``hermes --version`` boolean.
+        legacy_version = getattr(args, "version", None)
+        version = legacy_version if isinstance(legacy_version, str) else None
+    version = (version or "").strip()
+    if version:
+        return "tag", version
+    return "branch", _resolve_update_branch(args)
+
+
 def _size_delta_label(saved_mb: float) -> str:
     """Human label for a before/after database size delta, in MB.
 
@@ -10928,12 +10942,12 @@ def cmd_update(args):
         sys.exit(2)
 
     if getattr(args, "check", False):
-        # --check honors --branch so the "any new commits?" answer matches
-        # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
+        # --check honors the same branch/release target as apply mode.
+        target_kind, target = _resolve_update_target(args)
         _self()._cmd_update_check(
-            branch=branch,
+            branch=target if target_kind == "branch" else "main",
             branch_explicit=bool(getattr(args, "branch", None)),
+            version=target if target_kind == "tag" else None,
         )
         return
 
