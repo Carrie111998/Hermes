@@ -719,19 +719,45 @@ def show_status(args):
             except Exception as e:
                 print(f"  OpenRouter:   {check_mark(False)} error: {e}")
         
-        # Check gateway port
+        # Check the gateway control plane.
+        #
+        # The gateway's local coordination surface is a Unix domain socket
+        # ($HERMES_HOME/gateway.sock) on POSIX and a named pipe
+        # (\\.\pipe\hermes-gateway-<home-hash>) on Windows — never a TCP port
+        # (see gateway/control_socket.py). The probe this replaced dialled
+        # 127.0.0.1:18789, a port no Hermes process has ever bound, and read
+        # "in use" as "gateway likely running". So ANY unrelated listener on
+        # 18789 — OpenClaw's default, or this repo's own `hermes meet node run`
+        # — was reported as the gateway, and a perfectly healthy gateway on the
+        # pipe always read as "available" (#101195). Probe the real endpoint
+        # and print it: a connectable socket with a well-formed `identify`
+        # answer IS liveness, and naming the endpoint is what stops the next
+        # reader from inventing a transport Hermes does not use.
         try:
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', 18789))
-            sock.close()
-            # Port in use = gateway likely running
-            port_in_use = result == 0
-            # This is informational, not necessarily bad
-            print(f"  Port 18789:   {'in use' if port_in_use else 'available'}")
-        except OSError:
-            pass
+            from gateway.control_socket import (
+                identify_gateway,
+                resolve_client_socket_path,
+                resolve_server_socket_path,
+                windows_pipe_name,
+            )
+
+            hermes_home = get_hermes_home()
+            if sys.platform == "win32":
+                endpoint = windows_pipe_name(hermes_home)
+            else:
+                # Prefer the live path; fall back to where a gateway WOULD bind
+                # so the endpoint is still nameable while nothing is running.
+                live_path = resolve_client_socket_path(hermes_home)
+                endpoint = str(live_path or resolve_server_socket_path(hermes_home)[0])
+
+            # identify_gateway never raises — None is "nobody answered".
+            answered = identify_gateway(hermes_home, timeout=1) is not None
+            print(f"  Control:      {check_mark(answered)} {'answering' if answered else 'no answer'}")
+            print(f"  Endpoint:     {endpoint}")
+        except Exception as e:
+            # A diagnostic that swallows its own failure is how #101195 got
+            # misdiagnosed in the first place. Say what broke.
+            print(f"  Control:      {check_mark(False)} probe failed: {e}")
 
     print()
     print(color("─" * 60, Colors.DIM))
