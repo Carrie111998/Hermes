@@ -794,8 +794,11 @@ class TestBedrockContextLength:
         the next 1M Claude generation fails here instead of under-reporting its
         window by ~8x.
 
-        Dotted aliases (``claude-opus-4.8``) are skipped: Bedrock model IDs use
-        hyphens, so they have no Bedrock counterpart.
+        DEFAULT_CONTEXT_LENGTHS spells revisions with dots
+        (``claude-opus-4.8``) while Bedrock model IDs use hyphens
+        (``claude-opus-4-8``). Normalize rather than skip dotted names, so a
+        future 1M model that only ever gets a dotted alias cannot escape the
+        pairing.
         """
         from agent.bedrock_adapter import get_bedrock_context_length
         from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
@@ -803,10 +806,11 @@ class TestBedrockContextLength:
         mismatched = []
         with patch("agent.bedrock_adapter.probe_bedrock_context_length") as mock_probe:
             for name, expected in DEFAULT_CONTEXT_LENGTHS.items():
-                if not name.startswith("claude-") or expected < 1_000_000 or "." in name:
+                if not name.startswith("claude-") or expected < 1_000_000:
                     continue
+                bedrock_name = name.replace(".", "-")
                 actual = get_bedrock_context_length(
-                    f"anthropic.{name}", probe=False
+                    f"anthropic.{bedrock_name}", probe=False
                 )
                 if actual != expected:
                     mismatched.append((name, expected, actual))

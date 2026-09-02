@@ -1418,7 +1418,10 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # generally available (no beta header required as of April 2026). Sonnet
     # 4.5 and Sonnet 4 had their `context-1m-2025-08-07` beta retired on
     # April 30, 2026, so they are standard 200K; Haiku 4.5 is 200K.
-    # Opus 5 is 1M by default on Bedrock as well, per its model card:
+    # Opus 5 was added to agent/model_metadata.py DEFAULT_CONTEXT_LENGTHS as
+    # 1M but never here, so this table contradicted the invariant stated three
+    # lines below and the Bedrock path resolved 128K for a 1M model. Its
+    # Bedrock model card agrees it is 1M by default:
     # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html
     # These 1M entries must match agent/model_metadata.py
     # DEFAULT_CONTEXT_LENGTHS or the agent compresses context prematurely;
