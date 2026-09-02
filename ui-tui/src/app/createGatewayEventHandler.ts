@@ -706,7 +706,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     if (recoverSidRef && recoverSid) {
       recoverSidRef.current = null
-      resumeById(recoverSid)
+      resumeById(recoverSid, { fallbackToNew: true })
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
@@ -717,7 +717,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     if (STARTUP_RESUME_ID) {
       patchUiState({ status: 'resuming…' })
-      resumeById(STARTUP_RESUME_ID)
+      resumeById(STARTUP_RESUME_ID, { fallbackToNew: true })
       scheduleStartupPrompt()
 
       return
@@ -744,7 +744,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           if (target) {
             patchUiState({ status: 'resuming most recent…' })
-            resumeById(target)
+            resumeById(target, { fallbackToNew: true })
             scheduleStartupPrompt()
 
             return

@@ -45,6 +45,7 @@ import {
   inlineErrorMessage,
   isProviderSetupError,
   isSessionBusyError,
+  isSessionNotFoundError,
   isTargetSessionBusy,
   releaseSubmitInFlight,
   SessionRecoveryAborted,
@@ -546,8 +547,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // would fork a contextless chat against whichever profile is active.
         try {
           await resumeStoredSession(routedStoredSessionId)
-        } catch {
-          return abortForSessionSwitch(null)
+        } catch (err) {
+          // A definitive "session not found" means the durable row is gone
+          // from every store (deleted or pruned), so no retry of this resume
+          // can ever succeed. Fall through: the direct session.resume rung
+          // below re-verifies against the owning profile and, on the same
+          // verdict, hands the send to the new-chat create instead of parking
+          // the composer against a dead id forever.
+          if (!isSessionNotFoundError(err)) {
+            return abortForSessionSwitch(null)
+          }
         }
 
         const routedResumeDrift = sessionDriftReason()
@@ -585,6 +594,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           seedOptimistic(sessionId)
         }
       }
+
+      // The stored target was proven deleted (resume 4007-ed on the owning
+      // profile). Routes the send to the new-chat create instead of the
+      // "conversation exists, rebind its runtime" tail below.
+      let storedTargetGone = false
 
       if (!sessionId && targetStoredSessionId) {
         // A target stored session exists but its runtime binding is gone (the
@@ -632,28 +646,45 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               activeSessionIdRef.current = sessionId
             }
           }
-        } catch {
+        } catch (err) {
           // A target stored conversation is not a new-chat draft. If its
           // runtime cannot be rebound, stop here rather than silently replacing
           // it with a contextless session (#55578). For a background/queued
           // drain this abort is a no-op on foreground state (both helpers are
           // targetIsCurrentView-guarded) and simply drops the queued send.
-          return abortForSessionSwitch(null)
+          //
+          // One exception: a DEFINITIVE "session not found" from session.resume
+          // means the stored row itself is gone from every store (deleted or
+          // pruned out from under the client), so the rebind can never succeed
+          // — aborting parks the composer against a dead id forever, with the
+          // auto-drain burning its attempts on the same doomed resume. For the
+          // conversation the user is actually looking at, hand the send to the
+          // new-chat create below instead; a drain targeting a background
+          // session keeps the conservative abort.
+          if (!(isSessionNotFoundError(err) && targetIsCurrentView())) {
+            return abortForSessionSwitch(null)
+          }
+
+          storedTargetGone = true
+
+          notify({ kind: 'info', title: copy.sessionUnavailable, message: copy.staleSessionRestarted })
         }
 
-        const resumeSettleDrift = sessionDriftReason()
+        if (!storedTargetGone) {
+          const resumeSettleDrift = sessionDriftReason()
 
-        if (resumeSettleDrift) {
-          console.warn('[submit-drift-abort]', resumeSettleDrift, { phase: 'post-resume-settle' })
+          if (resumeSettleDrift) {
+            console.warn('[submit-drift-abort]', resumeSettleDrift, { phase: 'post-resume-settle' })
 
-          return abortForSessionSwitch(sessionId)
+            return abortForSessionSwitch(sessionId)
+          }
+
+          if (!sessionId) {
+            return abortForSessionSwitch(null)
+          }
+
+          seedOptimistic(sessionId)
         }
-
-        if (!sessionId) {
-          return abortForSessionSwitch(null)
-        }
-
-        seedOptimistic(sessionId)
       }
 
       if (!sessionId) {

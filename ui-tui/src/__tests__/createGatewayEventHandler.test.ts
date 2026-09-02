@@ -1052,7 +1052,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed'))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed', { fallbackToNew: true }))
     expect(newSession).not.toHaveBeenCalled()
     // One-shot: the ref is consumed so a later ordinary restart forges/resumes
     // per config instead of re-resuming the recovered session.
@@ -1083,7 +1083,7 @@ describe('createGatewayEventHandler', () => {
 
     createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-most-recent'))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-most-recent', { fallbackToNew: true }))
     expect(newSession).not.toHaveBeenCalled()
   })
 
@@ -1179,7 +1179,7 @@ describe('createGatewayEventHandler', () => {
 
     createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('env-explicit'))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('env-explicit', { fallbackToNew: true }))
     expect(newSession).not.toHaveBeenCalled()
   })
 

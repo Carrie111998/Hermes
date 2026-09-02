@@ -3081,6 +3081,7 @@ export interface Translations {
     audioReadFailed: string
     sessionUnavailable: string
     createSessionFailed: string
+    staleSessionRestarted: string
     promptFailed: string
     providerCredentialRequired: string
     emptySlashCommand: string
