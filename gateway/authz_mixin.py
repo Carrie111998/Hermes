@@ -611,6 +611,15 @@ class GatewayAuthorizationMixin:
             if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
+        # Adapter-verified authorization can intentionally carry no sender id, as
+        # with a shared observed channel session. The marker is trusted only when
+        # delegation is enabled and is the literal bool set by the adapter.
+        if (
+            allow_adapter_delegation
+            and getattr(source, "role_authorized", False) is True
+        ):
+            return True
+
         if not user_id:
             return False
 
@@ -679,15 +688,6 @@ class GatewayAuthorizationMixin:
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
         if platform_allow_all_var and _auth_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
-            return True
-
-        # Adapter-verified authorization: a connector may remove sender identity
-        # only after its bound authorization callback returns literal True. Compare
-        # with ``is True`` so MagicMock sources cannot auto-authorize in tests.
-        if (
-            allow_adapter_delegation
-            and getattr(source, "role_authorized", False) is True
-        ):
             return True
 
         # Check pairing store. A pairing entry is a first-class authorization

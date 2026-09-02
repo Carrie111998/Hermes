@@ -866,8 +866,16 @@ class MattermostAdapter(BasePlatformAdapter):
         cached = self._sender_is_bot_cache.get(sender_id)
         if cached is not None:
             return not cached
-        user = await self._api_get(f"users/{sender_id}")
-        if not isinstance(user, dict):
+        try:
+            user = await self._api_get(f"users/{sender_id}")
+        except Exception:
+            logger.warning(
+                "Mattermost: sender lookup failed; skipping passive observation (user=%s)",
+                sender_id,
+                exc_info=True,
+            )
+            return False
+        if not isinstance(user, dict) or not user.get("id"):
             logger.warning(
                 "Mattermost: sender lookup failed; skipping passive observation (user=%s)",
                 sender_id,
