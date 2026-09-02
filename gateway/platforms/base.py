@@ -5281,8 +5281,13 @@ class BasePlatformAdapter(ABC):
                     # Skip a crafted ~\x00 path rather than aborting extraction
                     # and dropping every other attachment in the response.
                     continue
-                if expanded not in seen_paths:
-                    seen_paths.add(expanded)
+                # Dedupe on a canonicalized path so the same file referenced via
+                # different separator styles (forward slashes from the MEDIA tag
+                # vs. native backslashes from extensionless resolution on
+                # Windows) collapses to one entry instead of delivering twice.
+                canonical = os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
+                if canonical not in seen_paths:
+                    seen_paths.add(canonical)
                     media.append((expanded, is_voice))
 
         for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(scan_content):
@@ -5293,10 +5298,11 @@ class BasePlatformAdapter(ABC):
             if resolved is None:
                 continue
             safe = resolved[0]
-            if safe not in seen_paths:
+            safe_canonical = os.path.normcase(os.path.normpath(os.path.abspath(safe)))
+            if safe_canonical not in seen_paths:
                 _safe_ext = os.path.splitext(safe)[1].lower()
                 media.append((safe, has_voice_tag and _safe_ext in _AUDIO_EXTS))
-                seen_paths.add(safe)
+                seen_paths.add(safe_canonical)
 
         # Remove the delivered MEDIA tags from the user-visible text. Mask a
         # length-equal copy of ``cleaned`` (same union of protected regions) to
