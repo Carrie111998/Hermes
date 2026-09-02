@@ -43,6 +43,7 @@ class RealtimeEvent:
     call_id: str | None = None
     tool_name: str | None = None
     item_id: str | None = None
+    role: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
     emission_id: UUID = field(default_factory=uuid4, compare=False, repr=False)
 
@@ -51,8 +52,15 @@ class RealtimeEvent:
         return cls(type=RealtimeEventType.AUDIO, audio_bytes=pcm, item_id=item_id)
 
     @classmethod
-    def transcript(cls, text: str, *, final: bool = False) -> "RealtimeEvent":
-        return cls(type=RealtimeEventType.TRANSCRIPT, text=text, final=final)
+    def transcript(
+        cls, text: str, *, final: bool = False, role: str | None = None
+    ) -> "RealtimeEvent":
+        return cls(
+            type=RealtimeEventType.TRANSCRIPT,
+            text=text,
+            final=final,
+            role=role,
+        )
 
     @classmethod
     def tool_call(
@@ -80,6 +88,11 @@ class RealtimeSession(abc.ABC):
     @abc.abstractmethod
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         """Return a Hermes-dispatched tool result to the voice model."""
+
+    async def add_context(self, item_id: str, text: str) -> None:
+        """Append silent system context while a Hermes tool call is in flight."""
+
+        raise NotImplementedError("realtime provider does not support context updates")
 
     async def truncate_response(self, boundary: HeardAudioBoundary) -> None:
         """Truncate provider history to heard audio when supported."""

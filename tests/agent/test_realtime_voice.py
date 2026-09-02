@@ -22,6 +22,7 @@ class FakeSession(RealtimeSession):
         self._events = events
         self.audio: list[bytes] = []
         self.tool_results: list[tuple[str, str]] = []
+        self.context: list[tuple[str, str]] = []
         self.cancelled = False
         self.cancellation_boundaries: list[HeardAudioBoundary | None] = []
         self.cancellation_operations: list[str] = []
@@ -36,6 +37,9 @@ class FakeSession(RealtimeSession):
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         self.tool_results.append((call_id, output))
+
+    async def add_context(self, item_id: str, text: str) -> None:
+        self.context.append((item_id, text))
 
     async def cancel_response(self) -> None:
         self.cancelled = True
@@ -106,7 +110,7 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
     session = FakeSession(
         [
             RealtimeEvent.audio(b"reply-pcm"),
-            RealtimeEvent.transcript("hello", final=True),
+            RealtimeEvent.transcript("hello", final=True, role="user"),
             RealtimeEvent.tool_call("call-1", "terminal", {"command": "pwd"}),
         ]
     )
@@ -120,6 +124,7 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
     coordinator = RealtimeVoiceCoordinator(provider, dispatch_tool=dispatch)
     await coordinator.open(instructions="Hermes owns tools", tools=[{"name": "terminal"}], voice="eve")
     await coordinator.send_audio(b"user-pcm")
+    await coordinator.add_context("progress-1", "checked repository")
     observed = [event async for event in coordinator.events()]
     await coordinator.close()
 
@@ -129,6 +134,7 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
         "voice": "eve",
     }
     assert session.audio == [b"user-pcm"]
+    assert session.context == [("progress-1", "checked repository")]
     assert dispatched == [("terminal", {"command": "pwd"})]
     assert session.tool_results == [("call-1", "/safe/workspace")]
     assert [event.type for event in observed] == [
@@ -136,6 +142,7 @@ async def test_coordinator_keeps_tool_dispatch_in_hermes(provider_name: str):
         RealtimeEventType.TRANSCRIPT,
         RealtimeEventType.TOOL_CALL,
     ]
+    assert observed[1].role == "user"
     assert session.closed is True
 
 

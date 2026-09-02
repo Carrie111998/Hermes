@@ -66,6 +66,13 @@ class RealtimeVoiceCoordinator:
     async def send_audio(self, pcm: bytes) -> None:
         await self._require_session().send_audio(pcm)
 
+    async def add_context(self, item_id: str, text: str) -> None:
+        """Append silent progress context to the active provider session."""
+
+        if not item_id or not text.strip():
+            return
+        await self._require_session().add_context(item_id, text)
+
     def report_audio_heard(self, event: RealtimeEvent, *, audio_end_ms: int) -> bool:
         """Record playback progress only for audio emitted by this open epoch."""
         if (
