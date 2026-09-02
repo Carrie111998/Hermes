@@ -140,3 +140,28 @@ def test_e2e_scrubbed_env_resolves_bare_hermes_under_minimal_parent_path(monkeyp
     # duplicate the entry.
     env2 = build_subprocess_env(env, scrub_secrets=True)
     assert env2["PATH"].split(os.pathsep).count(bin_dir) == 1
+
+
+# ---------------------------------------------------------------------------
+# HERMES_EXEC_ASK default for spawned workers
+# ---------------------------------------------------------------------------
+
+
+def test_exec_ask_defaults_to_on_for_worker_children(monkeypatch):
+    """Regression (R1): a scheduler/cron process started by systemd — not via
+    start_gateway() — has no HERMES_EXEC_ASK in its env, so worker children
+    built by build_subprocess_env() inherited the parent verbatim and fell
+    open on dangerous commands. The factory must default ask-mode ON while
+    still honoring an explicit parent value.
+    """
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    env = build_subprocess_env()
+    assert env.get("HERMES_EXEC_ASK") == "1"
+
+
+def test_exec_ask_explicit_parent_value_is_honored(monkeypatch):
+    """An explicit parent value wins over the default (e.g. an explicit '0'
+    from a trusted automation parent must not be flipped back to '1')."""
+    monkeypatch.setenv("HERMES_EXEC_ASK", "0")
+    env = build_subprocess_env()
+    assert env.get("HERMES_EXEC_ASK") == "0"
