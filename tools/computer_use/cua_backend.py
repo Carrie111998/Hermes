@@ -482,6 +482,12 @@ def _is_real_app_window(w: Dict[str, Any]) -> bool:
     )
 
 
+def _is_cua_driver_self_window(w: Dict[str, Any]) -> bool:
+    """Return True for the authorization daemon's own native window."""
+    app_name = str(w.get("app_name", "")).strip().lower()
+    return re.sub(r"[\s_-]+", "", app_name) == "cuadriver"
+
+
 def _select_capture_target(
     windows: List[Dict[str, Any]],
     *,
@@ -492,15 +498,24 @@ def _select_capture_target(
 
     Callers pass windows already sorted by ``z_index`` descending (higher =
     frontmost). When ordering is informative, keep that frontmost contract.
-    For unqualified default captures (no app filter and no exact
-    pid/window_id) on Linux, desktop/shell helper windows (GNOME ``ding``
-    "Desktop Icons", ``@!x,y;BDHF`` backdrop helpers) are skipped first —
-    they are targetable X11 windows but capture as empty. Then, when every
-    remaining candidate shares the same ``z_index`` (tied or unknown, the
-    common Linux/X11 case), prefer ``_NET_ACTIVE_WINDOW`` over list order
-    (#58026). Exact-target captures must not pay for an ``xprop`` probe.
+    Implicit captures skip the authorization daemon's own windows because
+    cua-driver intentionally refuses to capture its own process. If no other
+    on-screen window exists, preserve the old target so the driver reports its
+    normal refusal. Exact pid/window targets remain untouched.
+
+    For unqualified default captures (no app filter and no exact pid/window_id)
+    on Linux, desktop/shell helper windows (GNOME ``ding`` "Desktop Icons",
+    ``@!x,y;BDHF`` backdrop helpers) are skipped first — they are targetable
+    X11 windows but capture as empty. Then, when every remaining candidate
+    shares the same ``z_index`` (tied or unknown, the common Linux/X11 case),
+    prefer ``_NET_ACTIVE_WINDOW`` over list order (#58026). Exact-target
+    captures must not pay for an ``xprop`` probe.
     """
     candidates = [w for w in windows if not w["off_screen"]]
+    if not exact_target:
+        external = [w for w in candidates if not _is_cua_driver_self_window(w)]
+        if external:
+            candidates = external
     pool = candidates
     if not exact_target and not app_requested and sys.platform == "linux":
         real_apps = [w for w in candidates if _is_real_app_window(w)]
