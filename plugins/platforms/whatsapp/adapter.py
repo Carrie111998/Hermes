@@ -338,6 +338,19 @@ from gateway.platforms.base import (
 from utils import env_int
 
 
+_VALID_OUTBOUND_MODES = frozenset({"normal", "never"})
+_OUTBOUND_DISABLED_ERROR = "WhatsApp outbound sends are disabled by outbound_mode=never"
+
+
+def _normalize_outbound_mode(value: Any) -> str:
+    """Normalize the bridge send policy, failing closed on bad values."""
+    mode = str(value or "normal").strip().lower()
+    if mode in _VALID_OUTBOUND_MODES:
+        return mode
+    logger.error("Invalid WhatsApp outbound_mode %r; disabling outbound sends", value)
+    return "never"
+
+
 def _is_allowed_bridge_path(url: str) -> bool:
     """Return True only when an absolute path from the bridge resolves inside a
     known Hermes media cache directory.
@@ -468,6 +481,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._outbound_mode = _normalize_outbound_mode(
+            config.extra.get("outbound_mode")
+        )
         self._dm_policy = str(config.extra.get("dm_policy") or _wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
         # (setup wizard / pairing mirror). Select by key *presence* so an
@@ -545,6 +561,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not math.isfinite(parsed) or parsed < 0:
             return float(default)
         return parsed
+
+    def _effective_outbound_mode(self) -> str:
+        """Return normal for legacy test doubles that bypass ``__init__``."""
+        return getattr(self, "_outbound_mode", "normal")
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -688,7 +708,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                running_outbound_mode = _normalize_outbound_mode(
+                                    data.get("outboundMode")
+                                )
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_outbound_mode == self._effective_outbound_mode()
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -706,7 +732,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "WhatsApp bridge configuration changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -737,6 +763,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            bridge_env["WHATSAPP_OUTBOUND_MODE"] = self._effective_outbound_mode()
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
@@ -979,6 +1006,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        if self._effective_outbound_mode() == "never":
+            return SendResult(success=False, error=_OUTBOUND_DISABLED_ERROR)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1045,6 +1074,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        if self._effective_outbound_mode() == "never":
+            return SendResult(success=False, error=_OUTBOUND_DISABLED_ERROR)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1078,6 +1109,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        if self._effective_outbound_mode() == "never":
+            return SendResult(success=False, error=_OUTBOUND_DISABLED_ERROR)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1132,6 +1165,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         remain gateway-owned and add text fallback plus explicit confirmation
         semantics before approval prompts are ever mapped onto polls.
         """
+        if self._effective_outbound_mode() == "never":
+            return SendResult(success=False, error=_OUTBOUND_DISABLED_ERROR)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1216,6 +1251,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a native WhatsApp location pin via the Baileys bridge."""
+        if self._effective_outbound_mode() == "never":
+            return SendResult(success=False, error=_OUTBOUND_DISABLED_ERROR)
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -1321,6 +1358,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if self._effective_outbound_mode() == "never":
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1410,6 +1449,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _send_read_receipt(self, data: Dict[str, Any]) -> None:
         """Mark a policy-accepted inbound message as read via the bridge."""
+        if self._effective_outbound_mode() == "never":
+            return
         if not self._send_read_receipts or not self._http_session:
             return
         key = data.get("readReceiptKey")
@@ -1758,6 +1799,8 @@ async def _standalone_send(
     ``/send`` message beforehand.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+    if _normalize_outbound_mode(extra.get("outbound_mode")) == "never":
+        return {"error": _OUTBOUND_DISABLED_ERROR}
     try:
         import aiohttp
     except ImportError:
@@ -1890,9 +1933,9 @@ def interactive_setup() -> None:
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
     """Translate config.yaml whatsapp: keys into WHATSAPP_* env vars.
 
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    Implements the apply_yaml_config_fn contract (#24849). Legacy bridge
+    settings continue to flow through env; outbound_mode is returned as a
+    type-preserving PlatformConfig extra because it is behavioral config.
     """
     import json as _json
     if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
@@ -1918,6 +1961,12 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+    if "outbound_mode" in whatsapp_cfg:
+        return {
+            "outbound_mode": _normalize_outbound_mode(
+                whatsapp_cfg.get("outbound_mode")
+            )
+        }
     return None
 
 
