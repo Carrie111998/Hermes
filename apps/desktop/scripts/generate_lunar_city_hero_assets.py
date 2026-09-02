@@ -513,6 +513,60 @@ def add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, tar
         chamfer(f"{asset_id}_medic_cross_vertical_mesh", (x, y - 0.286, height * 0.56), (0.035, 0.012, 0.09), mats["red"], target, asset_id, "character", role, "medic-cross-vertical")
 
 
+def add_building_surface_detail(asset_id, role, x, y, base, accent_mat, target, mats):
+    for row, z in enumerate((0.48, 0.82, 1.18, 1.54, 1.9)):
+        seam = lunar.curve(
+            f"{asset_id}_hull_panel_seam_{row}",
+            [(x - 2.12, y + 1.64, base + z), (x - 0.9, y + 1.72, base + z + 0.03), (x + 0.9, y + 1.72, base + z + 0.03), (x + 2.12, y + 1.64, base + z)],
+            0.009,
+            mats["dark"],
+            target,
+        )
+        add_asset_metadata(seam, asset_id, "building", role, "recessed-hull-panel-seam")
+    for col, dx in enumerate((-1.9, -1.25, -0.55, 0.55, 1.25, 1.9)):
+        conduit = lunar.curve(
+            f"{asset_id}_vertical_power_conduit_{col}",
+            [(x + dx, y + 1.66, base + 0.34), (x + dx * 0.96, y + 1.73, base + 1.02), (x + dx * 0.88, y + 1.66, base + 1.88)],
+            0.012,
+            accent_mat,
+            target,
+        )
+        add_asset_metadata(conduit, asset_id, "building", role, "glowing-power-conduit")
+    for col, dx in enumerate((-1.72, -0.86, 0.0, 0.86, 1.72)):
+        ellipsoid(f"{asset_id}_roof_sensor_dome_{col}", (x + dx, y + 0.24, base + 2.43), (0.18, 0.14, 0.075), mats["glass"], target, asset_id, "building", role, "roof-sensor-dome", 18, 8)
+        cylinder(f"{asset_id}_roof_sensor_pin_{col}", (x + dx, y + 0.24, base + 2.56), 0.012, 0.18, accent_mat, target, asset_id, "building", role, "roof-sensor-pin", 8)
+    for side in (-1, 1):
+        rail = lunar.curve(
+            f"{asset_id}_door_guard_rail_{side}",
+            [(x + side * 1.02, y - 1.82, base + 0.24), (x + side * 1.18, y - 1.83, base + 0.66), (x + side * 1.0, y - 1.8, base + 1.08)],
+            0.025,
+            mats["gold"],
+            target,
+        )
+        add_asset_metadata(rail, asset_id, "building", role, "door-guard-rail")
+    if role == "research":
+        for i in range(5):
+            cylinder(f"{asset_id}_sample_canister_{i}", (x - 1.35 + i * 0.34, y + 0.24, base + 0.58), 0.055, 0.42, mats["glass"], target, asset_id, "building", role, "sample-canister", 18)
+    elif role in {"knowledge", "archive"}:
+        for i in range(6):
+            chamfer(f"{asset_id}_book_spine_detail_{i}", (x - 1.55 + i * 0.28, y + 1.0, base + 1.36), (0.045, 0.018, 0.22), accent_mat, target, asset_id, "building", role, "book-spine-detail")
+    elif role == "creative":
+        for i in range(4):
+            ellipsoid(f"{asset_id}_paint_glow_blob_{i}", (x - 0.62 + i * 0.36, y - 0.74, base + 0.2), (0.07, 0.035, 0.026), accent_mat, target, asset_id, "building", role, "paint-glow-blob", 14, 6)
+    elif role == "governance":
+        for i in range(3):
+            chamfer(f"{asset_id}_banner_hanging_panel_{i}", (x - 0.56 + i * 0.56, y + 1.0, base + 1.38), (0.18, 0.018, 0.45), mats["violet"], target, asset_id, "building", role, "banner-hanging-panel")
+    elif role == "engineering":
+        for i in range(4):
+            cylinder(f"{asset_id}_tool_wall_socket_{i}", (x - 1.1 + i * 0.72, y + 0.9, base + 0.92), 0.04, 0.08, mats["gold"], target, asset_id, "building", role, "tool-wall-socket", 12, rotation=(1.57, 0, 0))
+    elif role == "medical":
+        chamfer(f"{asset_id}_medical_cross_bar", (x, y + 1.38, base + 1.55), (0.34, 0.018, 0.065), mats["red"], target, asset_id, "building", role, "medical-cross-bar")
+        chamfer(f"{asset_id}_medical_cross_stem", (x, y + 1.38, base + 1.55), (0.08, 0.018, 0.32), mats["red"], target, asset_id, "building", role, "medical-cross-stem")
+    elif role == "review":
+        for i in range(3):
+            chamfer(f"{asset_id}_review_status_chip_{i}", (x - 0.42 + i * 0.42, y - 1.78, base + 1.08), (0.12, 0.018, 0.05), mats["green"] if i == 0 else mats["amber"], target, asset_id, "building", role, "review-status-chip")
+
+
 def chamfer(name, location, scale, mat, target, asset_id, kind, role, component, rotation=None):
     obj = lunar.chamfered_box_asset(name, (1, 1, 1), mat, target, 0.09)
     obj.location = location
@@ -590,6 +644,7 @@ def make_building(asset_id, role, title, accent, x, y, target, mats):
     else:
         for i in range(5):
             chamfer(f"{asset_id}_review_screen_{i}", (x - 1.55 + i * 0.78, y + 0.68, base + 0.82), (0.26, 0.025, 0.19), mats["glass"], target, asset_id, "building", role, "review-screen")
+    add_building_surface_detail(asset_id, role, x, y, base, accent_mat, target, mats)
     label(f"{asset_id}_asset_label", f"{title} HERO ASSET", (x, y - 2.5, base + 0.16), mats["text"], target, 0.15)
 
 
@@ -818,6 +873,21 @@ def main():
     scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
     scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
     scene["sculpted_character_limb_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction") == "continuous_tapered_limb_skin")
+    scene["building_detail_components"] = sum(1 for obj in bpy.data.objects if obj.get("asset_kind") == "building" and obj.get("component") in {
+        "recessed-hull-panel-seam",
+        "glowing-power-conduit",
+        "roof-sensor-dome",
+        "roof-sensor-pin",
+        "door-guard-rail",
+        "sample-canister",
+        "book-spine-detail",
+        "paint-glow-blob",
+        "banner-hanging-panel",
+        "tool-wall-socket",
+        "medical-cross-bar",
+        "medical-cross-stem",
+        "review-status-chip",
+    })
     pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
     quality_entries = asset_quality_entries()
     lod_entries = lod_budget_entries()
@@ -836,6 +906,7 @@ def main():
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
         "sculptedCharacterCoreComponentCount": scene["sculpted_character_core_components"],
         "sculptedCharacterLimbComponentCount": scene["sculpted_character_limb_components"],
+        "buildingDetailComponentCount": scene["building_detail_components"],
         "proceduralPbrMaterialCount": len(pbr_materials),
         "proceduralPbrMaterials": pbr_materials,
         "assetQuality": quality_entries,
@@ -883,6 +954,7 @@ def main():
             "usesContinuousCharacterCoreMeshes": scene["sculpted_character_core_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 2,
             "usesContinuousCharacterLimbMeshes": scene["sculpted_character_limb_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 4,
             "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
+            "usesDetailedBuildingFacades": scene["building_detail_components"] >= len(BUILDINGS) * 20,
             "tracksPerAssetQuality": len(quality_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
             "tracksLodBudgets": len(lod_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
         },

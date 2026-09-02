@@ -77,6 +77,7 @@ describe('Lunar City asset manifest', () => {
         sculptedSurfaceCount: number
       }>
       buildingPreview: string
+      buildingDetailComponentCount: number
       buildings: Array<{ collection: string; id: string }>
       characterPreview: string
       children: Array<{ collection: string; id: string }>
@@ -100,6 +101,7 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.workers).toHaveLength(6)
     expect(manifest.children).toHaveLength(4)
     expect(manifest.heroMeshComponentCount).toBeGreaterThan(600)
+    expect(manifest.buildingDetailComponentCount).toBeGreaterThanOrEqual(160)
     expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(148)
     expect(manifest.sculptedCharacterCoreComponentCount).toBeGreaterThanOrEqual(36)
     expect(manifest.sculptedCharacterLimbComponentCount).toBeGreaterThanOrEqual(72)
@@ -109,6 +111,7 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.validation.usesContinuousSculptedSurfaces).toBe(true)
     expect(manifest.validation.usesContinuousCharacterCoreMeshes).toBe(true)
     expect(manifest.validation.usesContinuousCharacterLimbMeshes).toBe(true)
+    expect(manifest.validation.usesDetailedBuildingFacades).toBe(true)
     expect(manifest.validation.usesProceduralPbrMaterials).toBe(true)
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)

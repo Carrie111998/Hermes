@@ -4,7 +4,7 @@
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - archive",
-      "heroComponentCount": 35,
+      "heroComponentCount": 64,
       "id": "archive",
       "lodPolicy": [
         "hero",
@@ -12,14 +12,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 35,
+      "proceduralPbrMaterialCount": 64,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - arts-studio",
-      "heroComponentCount": 30,
+      "heroComponentCount": 57,
       "id": "arts-studio",
       "lodPolicy": [
         "hero",
@@ -27,7 +27,7 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 30,
+      "proceduralPbrMaterialCount": 57,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
@@ -94,7 +94,7 @@
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - council-hall",
-      "heroComponentCount": 24,
+      "heroComponentCount": 50,
       "id": "council-hall",
       "lodPolicy": [
         "hero",
@@ -102,14 +102,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 24,
+      "proceduralPbrMaterialCount": 50,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - engineering-workshop",
-      "heroComponentCount": 28,
+      "heroComponentCount": 55,
       "id": "engineering-workshop",
       "lodPolicy": [
         "hero",
@@ -117,7 +117,7 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 28,
+      "proceduralPbrMaterialCount": 55,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
@@ -244,7 +244,7 @@
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - library",
-      "heroComponentCount": 35,
+      "heroComponentCount": 64,
       "id": "library",
       "lodPolicy": [
         "hero",
@@ -252,14 +252,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 35,
+      "proceduralPbrMaterialCount": 64,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - research-lab",
-      "heroComponentCount": 28,
+      "heroComponentCount": 56,
       "id": "research-lab",
       "lodPolicy": [
         "hero",
@@ -267,14 +267,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 28,
+      "proceduralPbrMaterialCount": 56,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - review-office",
-      "heroComponentCount": 27,
+      "heroComponentCount": 53,
       "id": "review-office",
       "lodPolicy": [
         "hero",
@@ -282,14 +282,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 27,
+      "proceduralPbrMaterialCount": 53,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
     {
       "animationRigWireCount": 0,
       "collection": "Hero Asset - triage-clinic",
-      "heroComponentCount": 24,
+      "heroComponentCount": 49,
       "id": "triage-clinic",
       "lodPolicy": [
         "hero",
@@ -297,7 +297,7 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 24,
+      "proceduralPbrMaterialCount": 49,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 4
     },
@@ -393,6 +393,7 @@
     }
   ],
   "blend": "lunar-city/hero-assets/lunar-city-hero-assets.blend",
+  "buildingDetailComponentCount": 217,
   "buildingPreview": "lunar-city/hero-assets/lunar-city-hero-buildings.png",
   "buildings": [
     {
@@ -552,7 +553,7 @@
     }
   ],
   "glb": "lunar-city/hero-assets/lunar-city-hero-assets.glb",
-  "heroMeshComponentCount": 637,
+  "heroMeshComponentCount": 854,
   "leaders": [
     {
       "animationClips": [
@@ -1463,6 +1464,7 @@
     "usesContinuousCharacterCoreMeshes": true,
     "usesContinuousCharacterLimbMeshes": true,
     "usesContinuousSculptedSurfaces": true,
+    "usesDetailedBuildingFacades": true,
     "usesProceduralPbrMaterials": true,
     "usesSeparateHeroAssetScene": true
   },
