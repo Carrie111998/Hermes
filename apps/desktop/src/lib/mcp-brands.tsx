@@ -46,35 +46,35 @@ export interface McpBrand {
 }
 
 export const MCP_BRAND_ICONS: Record<string, McpBrand> = {
-  airtable: { Icon: SiAirtable, color: '#18BFFF' },
-  asana: { Icon: SiAsana, color: '#F06A6A' },
-  atlassian: { Icon: SiAtlassian, color: '#0052CC' },
-  datadog: { Icon: SiDatadog, color: '#632CA6' },
-  figma: { Icon: SiFigma, color: '#F24E1E' },
+  airtable: { Icon: SiAirtable, color: '#609FB7' },
+  asana: { Icon: SiAsana, color: '#BF7D7D' },
+  atlassian: { Icon: SiAtlassian, color: '#426394' },
+  datadog: { Icon: SiDatadog, color: '#684D89' },
+  figma: { Icon: SiFigma, color: '#B5705B' },
   github: { Icon: SiGithub, color: '#181717', monochrome: true },
-  gitlab: { Icon: SiGitlab, color: '#FC6D26' },
-  hugging_face: { Icon: SiHuggingface, color: '#FFD21E' },
-  huggingface: { Icon: SiHuggingface, color: '#FFD21E' },
-  intercom: { Icon: SiIntercom, color: '#6AFDEF' },
-  linear: { Icon: SiLinear, color: '#5E6AD2' },
-  n8n: { Icon: SiN8n, color: '#EA4B71' },
-  netlify: { Icon: SiNetlify, color: '#00C7B7' },
+  gitlab: { Icon: SiGitlab, color: '#BB8367' },
+  hugging_face: { Icon: SiHuggingface, color: '#B9A864' },
+  huggingface: { Icon: SiHuggingface, color: '#B9A864' },
+  intercom: { Icon: SiIntercom, color: '#79C3BC' },
+  linear: { Icon: SiLinear, color: '#7B81B5' },
+  n8n: { Icon: SiN8n, color: '#BC7989' },
+  netlify: { Icon: SiNetlify, color: '#42948D' },
   notion: { Icon: SiNotion, color: '#000000', monochrome: true },
-  paypal: { Icon: SiPaypal, color: '#003087' },
-  postgres: { Icon: SiPostgresql, color: '#4169E1' },
-  postgresql: { Icon: SiPostgresql, color: '#4169E1' },
-  sentry: { Icon: SiSentry, color: '#362D59' },
+  paypal: { Icon: SiPaypal, color: '#425F94' },
+  postgres: { Icon: SiPostgresql, color: '#6F80B3' },
+  postgresql: { Icon: SiPostgresql, color: '#6F80B3' },
+  sentry: { Icon: SiSentry, color: '#594D89' },
   square: { Icon: SiSquare, color: '#3E4348', monochrome: true },
-  stripe: { Icon: SiStripe, color: '#635BFF' },
-  supabase: { Icon: SiSupabase, color: '#3FCF8E' },
+  stripe: { Icon: SiStripe, color: '#7D79C3' },
+  supabase: { Icon: SiSupabase, color: '#65A98A' },
   'unreal-engine': { Icon: SiUnrealengine, color: '#0E1128', monochrome: true },
   vercel: { Icon: SiVercel, color: '#000000', monochrome: true },
-  webflow: { Icon: SiWebflow, color: '#146EF5' },
-  zapier: { Icon: SiZapier, color: '#FF4A00' }
+  webflow: { Icon: SiWebflow, color: '#567BB3' },
+  zapier: { Icon: SiZapier, color: '#B06B4F' }
 }
 
-/** Inline-glyph color for a brand: monochrome marks inherit the surrounding
- *  text color; branded marks use the brand color. */
+/** Inline-glyph color for a brand: source marks are rendered as one quiet,
+ * low-saturation color; black/white marks inherit the surrounding text color. */
 export const brandGlyphStyle = (brand: McpBrand): { color: string } | undefined =>
   brand.monochrome ? undefined : { color: brand.color }
 
