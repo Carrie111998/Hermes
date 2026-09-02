@@ -2559,9 +2559,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 
-        # Track searches to detect *consecutive* repeated search loops.
-        # Include pagination args so users can page through truncated
-        # results without tripping the repeated-search guard.
+        # Include pagination, output shape, and context args so callers can
+        # change the requested search without tripping the repeat guard.
         search_key = (
             "search",
             pattern,
@@ -2570,6 +2569,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             file_glob or "",
             limit,
             offset,
+            output_mode,
+            context,
         )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
