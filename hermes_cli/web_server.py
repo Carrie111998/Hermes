@@ -17822,7 +17822,13 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    peer = ws.client.host if ws.client else "?"
+    auth_reason, cred = _ws_auth_reason(ws)
+    if auth_reason is not None:
+        _log.warning(
+            "ws auth rejected reason=%s mode=%s cred=%s peer=%s",
+            auth_reason, _ws_auth_mode(), cred, peer,
+        )
         await ws.close(code=4401)
         return
 

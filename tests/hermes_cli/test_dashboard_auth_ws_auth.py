@@ -290,6 +290,71 @@ class TestWsAuthOkGated:
             assert "ws_ticket_rejected" in content
 
 
+class TestGatewayWsAuthRejectionLogging:
+    """`/api/ws` must log an auth rejection the same way `/api/pty` does.
+
+    Before this fix, `gateway_ws` called the boolean `_ws_auth_ok` and
+    discarded the rejection reason, so a bad/missing credential on
+    `/api/ws` closed the socket with no log line at all (see #93235:
+    "`/api/ws` auth rejections are invisible in the logs").
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_credential_is_logged_before_close(self, loopback_app, caplog):
+        ws = _fake_ws(query={}, path="/api/ws")
+
+        closed = {}
+
+        async def fake_close(code=None, reason=None):
+            closed["code"] = code
+
+        ws.close = fake_close
+
+        with caplog.at_level("WARNING", logger="hermes_cli.web_server"):
+            await web_server.gateway_ws(ws)
+
+        assert closed["code"] == 4401
+        assert any(
+            "ws auth rejected" in record.message and "reason=no_credential" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fixture_name, query, expected_reason",
+        [
+            ("loopback_app", {"token": "wrong-token"}, "token_mismatch"),
+            ("gated_app", {"ticket": "never-minted"}, "ticket_invalid"),
+            ("gated_app", {"internal": "never-minted"}, "internal_invalid"),
+        ],
+    )
+    async def test_other_rejection_reasons_are_logged_before_close(
+        self, request, fixture_name, query, expected_reason, caplog
+    ):
+        """Pin the remaining three machine-parseable reasons (see
+        _ws_auth_reason's docstring) through the same gateway_ws log line
+        exercised above for no_credential."""
+        request.getfixturevalue(fixture_name)
+        ws = _fake_ws(query=query, path="/api/ws")
+
+        closed = {}
+
+        async def fake_close(code=None, reason=None):
+            closed["code"] = code
+
+        ws.close = fake_close
+
+        with caplog.at_level("WARNING", logger="hermes_cli.web_server"):
+            await web_server.gateway_ws(ws)
+
+        assert closed["code"] == 4401
+        assert any(
+            "ws auth rejected" in record.message
+            and f"reason={expected_reason}" in record.message
+            for record in caplog.records
+        )
+
+
 class TestWsRequestIsAllowedGated:
     """Bug fix: in gated mode, the WS peer-IP loopback check must be
     bypassed.
