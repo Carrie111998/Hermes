@@ -190,13 +190,80 @@ class TestSend:
 
         assert result.success is True
         payload = mock_client.post.call_args.kwargs["json"]
+        assert payload["msgtype"] == "image"
+        assert payload["image"]["picURL"] == "https://example.com/demo.png"
+
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uploads_and_sends_media_id(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._upload_media = AsyncMock(return_value="@image-media")
+        adapter._send_webhook_json = AsyncMock(return_value=MagicMock(success=True))
+
+        result = await adapter.send_image_file(
+            "chat-123",
+            "/tmp/demo.png",
+            caption="Preview",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter._upload_media.assert_awaited_once_with("/tmp/demo.png", media_type="image")
+        payload = adapter._send_webhook_json.await_args.kwargs["payload"]
         assert payload["msgtype"] == "markdown"
-        assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
+        assert "Preview" in payload["markdown"]["text"]
+        assert "![image](@image-media)" in payload["markdown"]["text"]
 
 
-# ---------------------------------------------------------------------------
-# Connect / disconnect
-# ---------------------------------------------------------------------------
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_and_sends_file(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._upload_media = AsyncMock(return_value="@file-media")
+        adapter._send_webhook_json = AsyncMock(return_value=MagicMock(success=True))
+
+        result = await adapter.send_document(
+            "chat-123",
+            "/tmp/demo.pdf",
+            file_name="report.pdf",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        adapter._upload_media.assert_awaited_once_with("/tmp/demo.pdf", media_type="file")
+        payload = adapter._send_webhook_json.await_args.kwargs["payload"]
+        assert payload["msgtype"] == "file"
+        assert payload["file"] == {
+            "mediaId": "@file-media",
+            "fileName": "report.pdf",
+            "fileType": "pdf",
+        }
+
+
+    @pytest.mark.asyncio
+    async def test_http_200_nonzero_errcode_is_failure(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        response = MagicMock(status_code=200, text='{"errcode": 400}',
+                             json=lambda: {"errcode": 400, "errmsg": "rejected"})
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        adapter._http_client = client
+
+        result = await adapter.send(
+            "chat-123",
+            "Hello",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is False
+        assert "rejected" in result.error
+
+
 
 
 class TestConnect:

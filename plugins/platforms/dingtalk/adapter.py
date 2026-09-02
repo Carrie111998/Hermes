@@ -29,6 +29,7 @@ Configuration in config.yaml:
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import traceback
@@ -1099,30 +1100,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             "markdown": {"title": "Hermes", "text": normalized},
         }
 
-        try:
-            resp = await self._http_client.post(
-                session_webhook, json=payload, timeout=15.0
-            )
-            if resp.status_code < 300:
-                # Webhook path: fire Done only for final replies, same as
-                # the card path.
-                if is_final_reply:
-                    self._fire_done_reaction(chat_id)
-                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-            body = resp.text
-            logger.warning(
-                "[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200]
-            )
-            return SendResult(
-                success=False, error=f"HTTP {resp.status_code}: {body[:200]}"
-            )
-        except httpx.TimeoutException:
-            return SendResult(
-                success=False, error="Timeout sending message to DingTalk"
-            )
-        except Exception as e:
-            logger.error("[%s] Send error: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        return await self._send_webhook_json(
+            chat_id=chat_id,
+            session_webhook=session_webhook,
+            payload=payload,
+            reply_to=reply_to,
+        )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""
@@ -1136,20 +1119,28 @@ class DingTalkAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an image via DingTalk markdown.
-
-        DingTalk's session webhook only supports text/markdown payloads, not
-        native image/file attachments. For remote image URLs, render the image
-        inline with markdown so the user still sees the image. Local files need
-        OpenAPI media upload and are handled separately.
-        """
-        image_block = f"![image]({image_url})"
-        content = f"{caption}\n\n{image_block}" if caption else image_block
-        return await self.send(
+        """Send a remote image using DingTalk's native image payload."""
+        session_webhook = self._resolve_session_webhook(chat_id, metadata)
+        if not session_webhook:
+            return SendResult(
+                success=False,
+                error="No valid session_webhook available. Reply must follow an incoming message.",
+            )
+        payload = {"msgtype": "image", "image": {"picURL": image_url}}
+        if caption:
+            caption_result = await self.send(
+                chat_id=chat_id,
+                content=caption,
+                reply_to=None,
+                metadata=metadata,
+            )
+            if not caption_result.success:
+                return caption_result
+        return await self._send_webhook_json(
             chat_id=chat_id,
-            content=content,
+            session_webhook=session_webhook,
+            payload=payload,
             reply_to=reply_to,
-            metadata=metadata,
         )
 
     async def send_image_file(
@@ -1161,13 +1152,27 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """DingTalk webhook replies cannot send local image files directly."""
-        return SendResult(
-            success=False,
-            error=(
-                "DingTalk session webhook replies do not support local image uploads. "
-                "Only markdown/text replies are supported without OpenAPI media upload."
-            ),
+        """Upload a local image, then send it as markdown via media_id."""
+        session_webhook = self._resolve_session_webhook(chat_id, metadata)
+        if not session_webhook:
+            return SendResult(
+                success=False,
+                error="No valid session_webhook available. Reply must follow an incoming message.",
+            )
+        media_id = await self._upload_media(image_path, media_type="image")
+        if not media_id:
+            return SendResult(success=False, error="Failed to upload DingTalk image media")
+        image_block = f"![image]({media_id})"
+        content = f"{caption}\n\n{image_block}" if caption else image_block
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {"title": "Hermes", "text": self._normalize_markdown(content)},
+        }
+        return await self._send_webhook_json(
+            chat_id=chat_id,
+            session_webhook=session_webhook,
+            payload=payload,
+            reply_to=reply_to,
         )
 
     async def send_document(
@@ -1180,13 +1185,40 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """DingTalk webhook replies cannot send local file attachments directly."""
-        return SendResult(
-            success=False,
-            error=(
-                "DingTalk session webhook replies do not support local file attachments. "
-                "Only markdown/text replies are supported without OpenAPI message send."
-            ),
+        """Upload a local file, then send it as a DingTalk file attachment."""
+        session_webhook = self._resolve_session_webhook(chat_id, metadata)
+        if not session_webhook:
+            return SendResult(
+                success=False,
+                error="No valid session_webhook available. Reply must follow an incoming message.",
+            )
+        media_id = await self._upload_media(file_path, media_type="file")
+        if not media_id:
+            return SendResult(success=False, error="Failed to upload DingTalk file media")
+
+        effective_name = file_name or os.path.basename(file_path)
+        payload = {
+            "msgtype": "file",
+            "file": {
+                "mediaId": media_id,
+                "fileName": effective_name,
+                "fileType": self._guess_file_type(effective_name),
+            },
+        }
+        if caption:
+            caption_result = await self.send(
+                chat_id=chat_id,
+                content=caption,
+                reply_to=None,
+                metadata=metadata,
+            )
+            if not caption_result.success:
+                return caption_result
+        return await self._send_webhook_json(
+            chat_id=chat_id,
+            session_webhook=session_webhook,
+            payload=payload,
+            reply_to=reply_to,
         )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -1211,6 +1243,121 @@ class DingTalkAdapter(BasePlatformAdapter):
                 self._session_webhooks.pop(chat_id, None)
                 return None
         return info
+
+    def _resolve_session_webhook(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        metadata = metadata or {}
+        session_webhook = metadata.get("session_webhook")
+        if session_webhook:
+            return session_webhook
+        webhook_info = self._get_valid_webhook(chat_id)
+        if not webhook_info:
+            logger.warning(
+                "[%s] No valid session_webhook for chat_id=%s",
+                self.name,
+                chat_id,
+            )
+            return None
+        session_webhook, _ = webhook_info
+        return session_webhook
+
+    async def _send_webhook_json(
+        self,
+        *,
+        chat_id: str,
+        session_webhook: str,
+        payload: Dict[str, Any],
+        reply_to: Optional[str],
+    ) -> SendResult:
+        """Send a webhook payload and treat DingTalk API errors as failures."""
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        try:
+            resp = await self._http_client.post(
+                session_webhook, json=payload, timeout=15.0
+            )
+            if resp.status_code < 300:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = None
+                if isinstance(body, dict) and body.get("errcode") not in (None, 0, "0"):
+                    error = str(body.get("errmsg") or body.get("message") or "DingTalk rejected the request")
+                    logger.warning(
+                        "[%s] DingTalk webhook rejected payload: errcode=%s errmsg=%s",
+                        self.name,
+                        body.get("errcode"),
+                        error[:200],
+                    )
+                    return SendResult(success=False, error=error[:200])
+                if reply_to is not None:
+                    self._fire_done_reaction(chat_id)
+                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+            body_text = str(getattr(resp, "text", ""))
+            logger.warning(
+                "[%s] Send failed HTTP %d: %s",
+                self.name,
+                resp.status_code,
+                body_text[:200],
+            )
+            return SendResult(
+                success=False, error=f"HTTP {resp.status_code}: {body_text[:200]}"
+            )
+        except httpx.TimeoutException:
+            return SendResult(success=False, error="Timeout sending message to DingTalk")
+        except Exception as exc:
+            logger.error("[%s] Send error: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _upload_media(self, path: str, *, media_type: str) -> Optional[str]:
+        if media_type not in {"image", "file"}:
+            raise ValueError(f"unsupported DingTalk media type: {media_type}")
+        token = await self._get_access_token()
+        if not token or not self._http_client:
+            return None
+
+        mime_type, _ = mimetypes.guess_type(path)
+        filename = os.path.basename(path)
+        upload_url = (
+            "https://oapi.dingtalk.com/media/upload"
+            f"?access_token={token}&type={media_type}"
+        )
+        try:
+            with open(path, "rb") as fh:
+                response = await self._http_client.post(
+                    upload_url,
+                    files={"media": (filename, fh, mime_type or "application/octet-stream")},
+                    timeout=60.0,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] DingTalk media upload failed for %s: %s",
+                self.name,
+                path,
+                exc,
+            )
+            return None
+
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        if response.status_code >= 300 or not isinstance(body, dict) or body.get("errcode") not in (0, "0"):
+            logger.warning(
+                "[%s] DingTalk media upload failed HTTP %s body=%s",
+                self.name,
+                response.status_code,
+                str(getattr(response, "text", ""))[:300],
+            )
+            return None
+        media_id = str(body.get("media_id") or "").strip()
+        return media_id or None
+
+    @staticmethod
+    def _guess_file_type(path_or_name: str) -> str:
+        _, ext = os.path.splitext(path_or_name)
+        return ext.lstrip(".").lower() or "bin"
 
     async def _create_and_stream_card(
         self,
