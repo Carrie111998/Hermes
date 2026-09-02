@@ -2928,11 +2928,39 @@ def get_service_name() -> str:
     return f"{_SERVICE_BASE}-{suffix}"
 
 
+def _systemd_user_unit_dir() -> Path:
+    """The account home that owns the systemd user session (#98699).
+
+    ``Path.home()`` trusts the process ``HOME``, which profile isolation may
+    point at ``{HERMES_HOME}/home`` — the *active* profile's, not even the one
+    selected with ``-p``. A unit written there is invisible to
+    ``systemctl --user``: ``gateway install`` reports success while the
+    service never exists. ``systemctl --user`` targets the login user's
+    session, so resolve the account home explicitly: the recorded real home
+    first, then the passwd entry, and only fall back to ``HOME``-derived
+    resolution when neither resolves (non-POSIX).
+    """
+    explicit = os.environ.get("HERMES_REAL_HOME", "").strip()
+    if explicit:
+        return Path(explicit) / ".config" / "systemd" / "user"
+    try:
+        import pwd  # windows-footgun: ok — POSIX-only module inside try/except
+
+        pw_dir = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX-only module inside try/except
+    except Exception:
+        pw_dir = ""
+    if pw_dir:
+        return Path(pw_dir) / ".config" / "systemd" / "user"
+    from hermes_constants import get_real_home
+
+    return Path(get_real_home()) / ".config" / "systemd" / "user"
+
+
 def get_systemd_unit_path(system: bool = False) -> Path:
     name = get_service_name()
     if system:
         return Path("/etc/systemd/system") / f"{name}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+    return _systemd_user_unit_dir() / f"{name}.service"
 
 
 class UserSystemdUnavailableError(RuntimeError):
@@ -3244,7 +3272,7 @@ def _legacy_unit_search_paths() -> list[tuple[bool, Path]]:
     real filesystem paths.
     """
     return [
-        (False, Path.home() / ".config" / "systemd" / "user"),
+        (False, _systemd_user_unit_dir()),
         (True, Path("/etc/systemd/system")),
     ]
 
