@@ -3384,6 +3384,62 @@ class PluginContext:
         )
         return count
 
+    def register_aux_provider(
+        self,
+        name: str,
+        builder: Callable,
+        *,
+        aliases: tuple = (),
+    ) -> PluginRegistration:
+        """Register an auxiliary LLM *provider* (a client factory, not a task).
+
+        Complements :meth:`register_auxiliary_task`: tasks declare LLM-backed
+        side jobs, providers supply the clients that serve them. The
+        registered name becomes valid anywhere a provider name is accepted —
+        ``auxiliary.<task>.provider`` and ``auxiliary.<task>.fallback_chain``
+        in ``config.yaml`` — via ``agent.auxiliary_client``.
+
+        ``builder(model, task=None)`` must return ``(client, resolved_model)``
+        where the client exposes ``.chat.completions.create()``, or
+        ``(None, None)`` when its credentials are unavailable on this host.
+        Async-native clients (subprocess/IPC facades) should set
+        ``aux_async_passthrough = True`` on themselves.
+
+        Registrations are owned by the registering plugin. Re-registering the
+        same name from the same plugin replaces the builder and rewrites its
+        aliases; a *different* plugin claiming that name — or aliasing onto
+        it — is rejected rather than allowed to reroute it silently.
+
+        The registry is a module global in ``agent.auxiliary_client`` rather
+        than a manager attribute, so the returned handle carries its release:
+        a plugin unload or a forced re-discovery unwinds the provider with the
+        rest of that plugin's registrations instead of leaving a disabled
+        plugin's route reachable for the life of the process.
+
+        Raises:
+            ValueError: if *name* is empty, shadows a built-in provider, or
+                collides with a name/alias owned by another plugin.
+        """
+        from agent.auxiliary_client import (
+            register_aux_provider as _register,
+            unregister_aux_provider as _unregister,
+        )
+
+        owner = self.manifest.key or self.manifest.name
+        key = (name or "").strip().lower()
+        registration = _register(name, builder, aliases=tuple(aliases),
+                                 owner=owner)
+        handle = self._track(
+            "aux_provider",
+            key,
+            lambda: _unregister(key, owner=owner, expect=registration),
+        )
+        logger.info(
+            "Plugin '%s' registered aux provider: %s",
+            self.manifest.name, name,
+        )
+        return handle
+
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback.
 

@@ -829,6 +829,176 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
+# ── Plugin-registered auxiliary providers ────────────────────────────────
+# Plugins can contribute whole auxiliary providers (e.g. a subprocess-backed
+# subscription pool) without touching this file. A registered name is valid
+# anywhere a provider name is accepted: ``auxiliary.<task>.provider`` and
+# ``auxiliary.<task>.fallback_chain`` entries both route through
+# :func:`resolve_provider_client`, which checks this registry first.
+#
+# Registrations carry their owner (the plugin name; ``None`` for direct API
+# callers) so one plugin cannot silently take over a route another plugin
+# already serves. Each one is released through the ``PluginRegistration``
+# handle its plugin received — see :func:`unregister_aux_provider` — so a
+# plugin unload or forced re-discovery drops it with the rest of that
+# plugin's state.
+
+
+class _AuxProviderRegistration(NamedTuple):
+    builder: Any
+    owner: Optional[str]
+
+
+_PLUGIN_AUX_PROVIDERS: Dict[str, _AuxProviderRegistration] = {}
+
+# Aliases contributed by registrations: alias → provider name. Mirrored into
+# _PROVIDER_ALIASES so _normalize_aux_provider() resolves them, but tracked
+# separately so teardown removes exactly what plugins added and the built-in
+# alias table survives untouched.
+_PLUGIN_AUX_ALIASES: Dict[str, str] = {}
+
+# Provider names with dedicated resolution branches (or magic meaning) that a
+# plugin must not shadow. Built-in aliases and the auth PROVIDER_REGISTRY are
+# folded in at check time — see _reserved_aux_names().
+_RESERVED_AUX_PROVIDERS = {
+    "auto", "custom", "main", "local", "codex", "openrouter", "nous",
+    "openai-codex", "xai-oauth", "azure-foundry", "anthropic", "copilot",
+    "gemini", "copilot-acp",
+}
+
+
+def _reserved_aux_names() -> set:
+    """Names a plugin may not claim: every built-in provider and alias.
+
+    Plugin-contributed aliases live in ``_PROVIDER_ALIASES`` too, so they are
+    excluded here — they are guarded by ownership, not by reservation.
+    """
+    builtin_aliases = {k: v for k, v in _PROVIDER_ALIASES.items()
+                       if k not in _PLUGIN_AUX_ALIASES}
+    reserved = set(_RESERVED_AUX_PROVIDERS)
+    reserved |= set(builtin_aliases) | set(builtin_aliases.values())
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        reserved |= set(PROVIDER_REGISTRY)
+    except Exception:
+        logger.debug("aux provider registry: hermes_cli.auth unavailable",
+                     exc_info=True)
+    return reserved
+
+
+def _check_alias_available(alias_key: str, key: str, owner: Optional[str],
+                           reserved: set) -> None:
+    """Raise ValueError if *alias_key* is not *owner*'s to point at *key*."""
+    if alias_key in reserved:
+        raise ValueError(
+            f"aux provider alias {alias_key!r} is reserved by a built-in provider")
+    # An alias that matches a registered *name* would rewrite that provider's
+    # route away from itself — never allowed, not even for its own owner.
+    shadowed = _PLUGIN_AUX_PROVIDERS.get(alias_key)
+    if shadowed is not None:
+        raise ValueError(
+            f"aux provider alias {alias_key!r} would rewrite the provider "
+            f"registered under that name by {shadowed.owner or 'a direct caller'}")
+    target = _PLUGIN_AUX_ALIASES.get(alias_key)
+    if target is not None and target != key:
+        holder = _PLUGIN_AUX_PROVIDERS.get(target)
+        holder_owner = holder.owner if holder is not None else None
+        if holder_owner != owner:
+            raise ValueError(
+                f"aux provider alias {alias_key!r} is already registered for "
+                f"{target!r} by {holder_owner or 'a direct caller'}")
+
+
+def register_aux_provider(name: str, builder, *, aliases: Tuple[str, ...] = (),
+                          owner: Optional[str] = None) -> _AuxProviderRegistration:
+    """Register a plugin-supplied auxiliary provider under *name*.
+
+    ``builder(model, task=None)`` must return ``(client, resolved_model)``
+    where the client exposes ``.chat.completions.create()``, or
+    ``(None, None)`` when its credentials are unavailable on this host (the
+    caller's fallback chain then continues instead of hard-failing).
+
+    Async-native clients (subprocess/IPC facades with no httpx transport to
+    swap) should set ``aux_async_passthrough = True`` on themselves; async
+    callers then receive them unchanged instead of an AsyncOpenAI wrapper
+    around a non-HTTP base URL.
+
+    *owner* identifies the registrant (``PluginContext`` passes the plugin
+    name). An owner may re-register its own provider — the builder is
+    replaced and the alias set rewritten — but claiming a name or an alias
+    that belongs to a different owner raises ``ValueError`` instead of
+    silently rerouting it. Nothing is mutated unless every check passes.
+
+    Returns the installed registration record, which
+    :func:`unregister_aux_provider` accepts as *expect* so a stale handle
+    cannot tear down a newer registration made under the same name.
+    """
+    key = (name or "").strip().lower()
+    reserved = _reserved_aux_names()
+    if not key or key in reserved:
+        raise ValueError(f"aux provider name {name!r} is empty or reserved")
+    if not callable(builder):
+        raise ValueError(f"aux provider {name!r} builder must be callable")
+    existing = _PLUGIN_AUX_PROVIDERS.get(key)
+    if existing is not None and existing.owner != owner:
+        raise ValueError(
+            f"aux provider {key!r} is already registered by "
+            f"{existing.owner or 'a direct caller'}")
+
+    alias_keys = []
+    for alias in aliases:
+        alias_key = (alias or "").strip().lower()
+        if not alias_key or alias_key == key:
+            continue
+        _check_alias_available(alias_key, key, owner, reserved)
+        alias_keys.append(alias_key)
+
+    # Re-registration narrows: aliases this provider carried before but no
+    # longer declares are dropped rather than left dangling.
+    for stale in [a for a, t in _PLUGIN_AUX_ALIASES.items()
+                  if t == key and a not in alias_keys]:
+        _PLUGIN_AUX_ALIASES.pop(stale, None)
+        _PROVIDER_ALIASES.pop(stale, None)
+
+    registration = _AuxProviderRegistration(builder, owner)
+    _PLUGIN_AUX_PROVIDERS[key] = registration
+    for alias_key in alias_keys:
+        _PROVIDER_ALIASES[alias_key] = key
+        _PLUGIN_AUX_ALIASES[alias_key] = key
+    return registration
+
+
+def unregister_aux_provider(name: str, *, owner: Optional[str] = None,
+                            expect: Optional[_AuxProviderRegistration] = None
+                            ) -> bool:
+    """Remove one registered provider and the aliases it contributed.
+
+    This is the release half of a registration: ``PluginContext``'s handle
+    calls it, so a plugin's provider is dropped by the same reverse-order
+    teardown that unwinds every other plugin-owned registration — a disabled
+    or uninstalled plugin stops resolving without waiting for a restart.
+
+    Idempotent, and never removes someone else's route: the call is a no-op
+    unless *owner* matches and — when *expect* is given — the registration
+    still in place is the very one that handle installed. A later
+    re-registration by the same owner therefore supersedes the older handle
+    instead of being torn down by it.
+
+    Returns whether this call removed a registration.
+    """
+    key = (name or "").strip().lower()
+    current = _PLUGIN_AUX_PROVIDERS.get(key)
+    if current is None or current.owner != owner:
+        return False
+    if expect is not None and current is not expect:
+        return False
+    _PLUGIN_AUX_PROVIDERS.pop(key, None)
+    for alias in [a for a, target in _PLUGIN_AUX_ALIASES.items() if target == key]:
+        _PLUGIN_AUX_ALIASES.pop(alias, None)
+        _PROVIDER_ALIASES.pop(alias, None)
+    return True
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -6647,6 +6817,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
     if isinstance(sync_client, _AuxProbeClientStub):
         return sync_client, model
+
+    # Async-native facades (subprocess/IPC-backed plugin clients): nothing to
+    # swap — wrapping their marker base_url in AsyncOpenAI would HTTP a bogus
+    # URL. Duck-typed so plugin classes never need an isinstance here.
+    if getattr(sync_client, "aux_async_passthrough", False):
+        return sync_client, model
+
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
@@ -6908,6 +7085,25 @@ def resolve_provider_client(
         return _maybe_wrap_anthropic(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
         )
+
+    # ── Plugin-registered providers ──────────────────────────────────
+    if provider in _PLUGIN_AUX_PROVIDERS:
+        try:
+            client, default = _PLUGIN_AUX_PROVIDERS[provider].builder(
+                model, task=task)
+        except Exception:
+            logger.warning(
+                "resolve_provider_client: plugin aux provider %r failed to "
+                "build", provider, exc_info=True)
+            return None, None
+        if client is None:
+            logger.debug(
+                "resolve_provider_client: plugin aux provider %r has no "
+                "credentials on this host", provider)
+            return None, None
+        final_model = default or model
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
