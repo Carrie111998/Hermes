@@ -970,6 +970,15 @@ export interface Translations {
       fallbackAdd: string
       fallbackEmpty: string
       notInCatalog: string
+      moaTitle: string
+      moaDesc: string
+      moaPresetPlaceholder: string
+      moaEnabled: string
+      moaSetDefault: string
+      moaDelete: string
+      moaNewPresetPlaceholder: string
+      moaAddPreset: string
+      moaDefault: string
       tasks: Record<string, AuxTaskCopy>
     }
     localModels: {
