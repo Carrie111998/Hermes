@@ -1255,6 +1255,73 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _check_profiles(*, should_fix: bool, issues: list, manual_issues: list) -> int:
+    """Report profile health and optionally remove verified orphan aliases."""
+    try:
+        from hermes_cli.profiles import (
+            _scan_profile_wrappers,
+            list_profiles,
+            profile_exists,
+        )
+
+        named_profiles = [p for p in list_profiles() if not p.is_default]
+        orphan_wrappers = [
+            (wrapper, target)
+            for wrapper, target in _scan_profile_wrappers()
+            if not profile_exists(target)
+        ]
+    except Exception:
+        # Profile diagnostics must not prevent Doctor's other checks from
+        # completing when a profile directory is temporarily unreadable.
+        return 0
+
+    if not named_profiles and not orphan_wrappers:
+        return 0
+
+    _section("Profiles")
+    if named_profiles:
+        check_ok(f"{len(named_profiles)} profile(s) found")
+        for profile in named_profiles:
+            parts = []
+            if profile.gateway_running:
+                parts.append("gateway running")
+            if profile.model:
+                parts.append(profile.model[:30])
+            if not (profile.path / "config.yaml").exists():
+                parts.append("⚠ missing config")
+            if not (profile.path / ".env").exists():
+                parts.append("no .env")
+            if profile.alias_path is None:
+                parts.append("no alias")
+            status = ", ".join(parts) if parts else "configured"
+            check_ok(f"  {profile.name}: {status}")
+
+    fixed = 0
+    for wrapper, target in orphan_wrappers:
+        description = (
+            f"Orphan alias: {wrapper.name} → profile '{target}' no longer exists"
+        )
+        if not should_fix:
+            check_warn(description)
+            issues.append(
+                f"Remove orphan alias {wrapper}: run 'hermes doctor --fix'."
+            )
+            continue
+
+        try:
+            wrapper.unlink()
+        except OSError as exc:
+            check_warn(f"Could not remove {description.lower()}", str(exc))
+            manual_issues.append(
+                f"Remove orphan alias {wrapper} manually: {exc}"
+            )
+        else:
+            check_ok(f"Removed {description.lower()}")
+            fixed += 1
+
+    return fixed
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -3369,48 +3436,11 @@ def run_doctor(args):
         except Exception as _e:
             check_warn(f"{_active_memory_provider} check failed", str(_e))
 
-    try:
-        from hermes_cli.profiles import list_profiles, _get_wrapper_dir, profile_exists
-        import re as _re
-
-        named_profiles = [p for p in list_profiles() if not p.is_default]
-        if named_profiles:
-            _section("Profiles")
-            check_ok(f"{len(named_profiles)} profile(s) found")
-            wrapper_dir = _get_wrapper_dir()
-            for p in named_profiles:
-                parts = []
-                if p.gateway_running:
-                    parts.append("gateway running")
-                if p.model:
-                    parts.append(p.model[:30])
-                if not (p.path / "config.yaml").exists():
-                    parts.append("⚠ missing config")
-                if not (p.path / ".env").exists():
-                    parts.append("no .env")
-                wrapper = wrapper_dir / p.name
-                if not wrapper.exists():
-                    parts.append("no alias")
-                status = ", ".join(parts) if parts else "configured"
-                check_ok(f"  {p.name}: {status}")
-
-            # Check for orphan wrappers
-            if wrapper_dir.is_dir():
-                for wrapper in wrapper_dir.iterdir():
-                    if not wrapper.is_file():
-                        continue
-                    try:
-                        content = wrapper.read_text(encoding="utf-8")
-                        if "hermes -p" in content:
-                            _m = _re.search(r"hermes -p (\S+)", content)
-                            if _m and not profile_exists(_m.group(1)):
-                                check_warn(f"Orphan alias: {wrapper.name} → profile '{_m.group(1)}' no longer exists")
-                    except Exception:
-                        pass
-    except ImportError:
-        pass
-    except Exception:
-        pass
+    fixed_count += _check_profiles(
+        should_fix=should_fix,
+        issues=issues,
+        manual_issues=manual_issues,
+    )
 
     # Opt-in live backend probes run AFTER all static checks, only with
     # `hermes doctor --live` (real network calls; bounded + read-only).

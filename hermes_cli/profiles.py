@@ -528,7 +528,11 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
     if is_windows:
         wrapper_path = wrapper_dir / f"{canon}.bat"
         try:
-            wrapper_path.write_text(f"@echo off\r\nhermes -p {profile} %*\r\n", encoding="utf-8")
+            wrapper_path.write_text(
+                f"@echo off\r\nhermes -p {profile} %*\r\n",
+                encoding="utf-8",
+                newline="",
+            )
             return wrapper_path
         except OSError as e:
             print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
@@ -628,53 +632,113 @@ def find_alias_for_profile(profile_name: str) -> Optional[str]:
 
 
 # Cap how much of a wrapper file we read when reverse-looking-up its profile.
-# Real wrappers are a few hundred bytes of shell; the needle (``hermes -p X``)
-# sits near the top. The wrapper dir (e.g. ``~/.local/bin``) commonly also holds
-# large unrelated binaries (ffmpeg, node, …) — reading those whole, N times, was
-# the dominant cost in ``list_profiles`` (~4.5s). Reading a small head slice and
-# skipping NUL-bearing (binary) content keeps the scan to a single cheap pass.
+# Real wrappers are a few hundred bytes of shell. The wrapper dir (e.g.
+# ``~/.local/bin``) commonly also holds large unrelated binaries (ffmpeg, node,
+# …) — reading those whole, N times, was the dominant cost in ``list_profiles``
+# (~4.5s). Read only this bounded slice and reject anything larger so exact
+# wrapper validation stays a single cheap pass.
 _WRAPPER_READ_LIMIT = 8192
+
+
+def _scan_profile_wrappers() -> List[Tuple[Path, str]]:
+    """Return verified Hermes profile wrappers as ``(path, profile)`` pairs.
+
+    ``~/.local/bin`` is a shared executable directory, so a loose substring
+    match is not a safe basis for deletion.  Accept only the exact wrapper
+    shape emitted by :func:`create_wrapper_script` for the current platform,
+    with a valid alias filename and profile id.  Reads stay bounded and strict
+    UTF-8 so unrelated binaries and oversized scripts are ignored cheaply.
+    """
+    wrapper_dir = _get_wrapper_dir()
+    if not wrapper_dir.is_dir():
+        return []
+
+    is_windows = sys.platform == "win32"
+    wrappers: List[Tuple[Path, str]] = []
+    try:
+        entries = sorted(wrapper_dir.iterdir())
+    except OSError:
+        return wrappers
+
+    for entry in entries:
+        try:
+            if not entry.is_file() or entry.is_symlink():
+                continue
+        except OSError:
+            continue
+
+        if is_windows:
+            if entry.suffix != ".bat":
+                continue
+            alias = entry.stem
+        else:
+            if entry.suffix:
+                continue
+            alias = entry.name
+        try:
+            validate_alias_name(alias)
+        except ValueError:
+            continue
+
+        try:
+            with open(entry, "r", encoding="utf-8", errors="strict") as f:
+                content = f.read(_WRAPPER_READ_LIMIT + 1)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if len(content) > _WRAPPER_READ_LIMIT:
+            continue
+
+        profile = ""
+        if is_windows:
+            match = re.fullmatch(
+                r"@echo off\n(?:\n)?hermes -p "
+                r"([a-z0-9][a-z0-9_-]{0,63}) %\*\n(?:\n)?",
+                content,
+            )
+            if match:
+                profile = match.group(1)
+        else:
+            lines = content.splitlines(keepends=True)
+            if (
+                len(lines) != 2
+                or lines[0] != "#!/bin/sh\n"
+                or not lines[1].endswith("\n")
+            ):
+                continue
+            try:
+                argv = shlex.split(lines[1][:-1], posix=True)
+            except ValueError:
+                continue
+            if (
+                len(argv) == 5
+                and argv[0] == "exec"
+                and Path(argv[1]).name == "hermes"
+                and argv[2] == "-p"
+                and argv[4] == "$@"
+            ):
+                profile = argv[3]
+
+        try:
+            validate_profile_name(profile)
+        except ValueError:
+            continue
+        wrappers.append((entry, profile))
+
+    return wrappers
 
 
 def build_alias_map() -> dict[str, str]:
     """Single-pass reverse map ``{canonical_profile -> alias_name}``.
 
     Scans the wrapper dir ONCE (vs. :func:`find_alias_for_profile` per profile)
-    and reads only a small head slice of each candidate wrapper, skipping
-    binaries. A custom alias (file name != profile) wins over the profile-named
-    wrapper, matching ``find_alias_for_profile``'s preference; deterministic via
-    sorted iteration.
+    and reads only a small bounded slice of each candidate wrapper, skipping
+    binaries and non-generated scripts. A custom alias (file name != profile)
+    wins over the profile-named wrapper, matching ``find_alias_for_profile``'s
+    preference; deterministic via sorted iteration.
     """
-    wrapper_dir = _get_wrapper_dir()
     result: dict[str, str] = {}
-    if not wrapper_dir.is_dir():
-        return result
     is_windows = sys.platform == "win32"
-    prefix = "hermes -p "
-
-    for entry in sorted(wrapper_dir.iterdir()):
-        if not entry.is_file():
-            continue
-        # Only our own wrappers are named with the alias and (on Windows) .bat.
-        if is_windows and entry.suffix != ".bat":
-            continue
-        if not is_windows and entry.suffix:
-            continue
-        try:
-            with open(entry, "r", encoding="utf-8", errors="strict") as f:
-                content = f.read(_WRAPPER_READ_LIMIT)
-        except (OSError, UnicodeDecodeError):
-            # UnicodeDecodeError = a binary on PATH (ffmpeg etc.) — not a wrapper.
-            continue
-        idx = content.find(prefix)
-        if idx == -1:
-            continue
-        rest = content[idx + len(prefix):]
-        # Profile id is the first whitespace-delimited token after the flag.
-        canon = rest.split(None, 1)[0].strip() if rest.strip() else ""
-        if not canon:
-            continue
-        canon = normalize_profile_name(canon)
+    for entry, canon in _scan_profile_wrappers():
         alias = entry.stem if is_windows else entry.name
         # Custom alias (name != profile) preferred; otherwise keep the
         # profile-named wrapper. Don't overwrite a custom alias already found.
