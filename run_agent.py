@@ -5008,6 +5008,16 @@ class AIAgent:
         hard teardown for actual session boundaries (/new, /reset, session
         expiry).
         """
+        # A cached whole-turn runtime belongs to this exact agent/session.
+        # Once the cache owner is evicted, late results must be rejected rather
+        # than delivered through a stale parent binding.
+        try:
+            from agent.runtime_dispatch import close_runtime_session
+
+            close_runtime_session(self)
+        except Exception:
+            pass
+
         # Close active child agents (per-turn; no cross-turn persistence).
         try:
             with self._active_children_lock:
@@ -5064,6 +5074,15 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        # Seal the exact-parent runtime route first. No detached completion may
+        # escape once hard teardown has begun.
+        try:
+            from agent.runtime_dispatch import close_runtime_session
+
+            close_runtime_session(self)
+        except Exception:
+            pass
+
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
         # call shutdown_memory_provider() first; its idempotence prevents
         # duplicate extraction while direct callers cannot skip provider close.
@@ -5321,7 +5340,7 @@ class AIAgent:
         assistant_msg: Dict[str, Any],
         tool_call_id: str,
     ) -> bool:
-        """True when the assistant message issued a ``todo`` call with this id."""
+        """True when the assistant issued a canonical or legacy todo call."""
         tool_calls = assistant_msg.get("tool_calls")
         if not isinstance(tool_calls, list):
             return False
@@ -5329,7 +5348,9 @@ class AIAgent:
         for tool_call in tool_calls:
             if cls._get_tool_call_id_static(tool_call) != tool_call_id:
                 continue
-            if cls._get_tool_call_name_static(tool_call) == "todo":
+            # ``todo_list`` is the canonical registry name. ``todo`` remains
+            # a supported alias for transcripts created before the rename.
+            if cls._get_tool_call_name_static(tool_call) in {"todo_list", "todo"}:
                 return True
         return False
 
