@@ -1929,9 +1929,27 @@ def init_agent(
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
+                from hermes_cli.config_defaults import (
+                    DEFAULT_MEMORY_CHAR_LIMIT,
+                    DEFAULT_USER_CHAR_LIMIT,
+                )
+                _mem_cap = int(mem_config.get("memory_char_limit", DEFAULT_MEMORY_CHAR_LIMIT))
+                _usr_cap = int(mem_config.get("user_char_limit", DEFAULT_USER_CHAR_LIMIT))
+                # Provenance: log the home + caps the store is actually built
+                # against, so a profile/main config-resolution split is
+                # diagnosable from one line instead of silent (#memory-cap-split).
+                try:
+                    from hermes_constants import get_hermes_home
+                    _mem_src = "config" if "memory_char_limit" in mem_config else "default"
+                    logger.info(
+                        "memory store: home=%s mem_cap=%d user_cap=%d source=%s",
+                        get_hermes_home(), _mem_cap, _usr_cap, _mem_src,
+                    )
+                except Exception:
+                    pass
                 agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_char_limit=_mem_cap,
+                    user_char_limit=_usr_cap,
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
                 )

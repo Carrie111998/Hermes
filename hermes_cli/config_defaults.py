@@ -4,6 +4,12 @@ Pure-data leaf module: DEFAULT_CONFIG and OPTIONAL_ENV_VARS, extracted
 verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
+# Single source of truth for built-in memory caps. Imported by
+# tools/memory_tool.py and agent/agent_init.py so a missing config section
+# resolves to ONE default, not three drifting copies (#memory-cap-split).
+DEFAULT_MEMORY_CHAR_LIMIT = 2200   # ~800 tokens at 2.75 chars/token
+DEFAULT_USER_CHAR_LIMIT = 1375     # ~500 tokens at 2.75 chars/token
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -2119,8 +2125,8 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "memory_char_limit": DEFAULT_MEMORY_CHAR_LIMIT,   # ~800 tokens at 2.75 chars/token
+        "user_char_limit": DEFAULT_USER_CHAR_LIMIT,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review. External providers with automatic
         # turn/session extraction can set this to 0 and keep the small local
         # store reserved for explicit high-frequency operational facts.
