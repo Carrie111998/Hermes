@@ -8323,6 +8323,15 @@ def _on_tool_progress(
             payload["tool_count"] = int(_kwargs["tool_count"])
         if _kwargs.get("toolsets"):
             payload["toolsets"] = [str(t) for t in _kwargs["toolsets"]]
+        run_binding = _kwargs.get("run_binding")
+        if isinstance(run_binding, dict):
+            compact_binding = {
+                key: str(run_binding[key])
+                for key in ("repo", "branch", "sha")
+                if run_binding.get(key)
+            }
+            if compact_binding:
+                payload["run_binding"] = compact_binding
         # Per-branch rollups emitted on subagent.complete (features 1+2+4).
         for int_key in (
             "input_tokens",
@@ -13258,7 +13267,6 @@ def _run_prompt_submit(
         agent = session["agent"]
         approval_token = None
         session_tokens = []
-        run_binding_token = None
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
@@ -13364,41 +13372,6 @@ def _run_prompt_submit(
                 history_version = int(session.get("history_version", 0))
             cwd = _session_cwd(session)
             _register_session_cwd(session)
-            # Capture checkout identity from the live session at turn start.
-            # The model and RPC payload are intentionally not inputs to this
-            # binding; delegate_task will re-probe it immediately before the
-            # first child is constructed.
-            try:
-                from gateway.session_context import set_run_binding
-
-                _profile = str(
-                    Path(str(session.get("profile_home"))).name
-                    if session.get("profile_home")
-                    else _current_profile_name()
-                )
-                _binding = git_probe.capture_run_binding(
-                    cwd,
-                    session_key=str(session.get("session_key") or ""),
-                    ui_session_id=sid,
-                    profile=_profile,
-                )
-                run_binding_token = set_run_binding(_binding)
-            except ValueError as binding_error:
-                # A conversation without a stable Git worktree cannot safely
-                # attribute a delegated run. Surface the refusal on the same
-                # conversation and spawn no child.
-                _emit(
-                    "message.complete",
-                    sid,
-                    {
-                        "text": str(binding_error),
-                        "status": "error",
-                        "error": str(binding_error),
-                        "failure_reason": "run_binding_refused",
-                        "recoverable": True,
-                    },
-                )
-                return
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text

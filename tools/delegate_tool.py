@@ -1467,6 +1467,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    run_binding: Any = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -1531,7 +1532,7 @@ def _build_child_progress_callback(
         try:
             from gateway.session_context import current_run_binding
 
-            binding = current_run_binding()
+            binding = run_binding or current_run_binding()
             if binding is not None:
                 kw["run_binding"] = {
                     "repo": binding.repo_root,
@@ -1777,6 +1778,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    run_binding: Any = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1910,6 +1912,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        run_binding=run_binding,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -2853,7 +2856,12 @@ def _run_single_child(
 
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
-    _worktree_info: Optional[Dict[str, str]] = None
+    _bound_worktree_info = getattr(child, "_bound_worktree_info", None)
+    _worktree_info: Optional[Dict[str, str]] = (
+        _bound_worktree_info
+        if isinstance(_bound_worktree_info, dict)
+        else None
+    )
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
@@ -2937,8 +2945,9 @@ def _run_single_child(
         # Opt-in worktree isolation (delegation.worktree_isolation, inspired
         # by Muse Code's --subagent-worktree-isolation): give this child its
         # own git worktree branched from the parent repo's HEAD, and start its
-        # terminal there. Git-only and local-backend-only; any failure
-        # degrades silently to the shared-workspace behavior above.
+        # terminal there. Git-only and local-backend-only. Bound runs fail
+        # closed when isolation cannot be established; legacy unbound callers
+        # retain the historical best-effort behavior.
         if _get_worktree_isolation():
             try:
                 from tools import subagent_worktree
@@ -2962,11 +2971,30 @@ def _run_single_child(
                             run_binding.head if run_binding is not None else None
                         ),
                     )
+                    if run_binding is not None and _worktree_info is None:
+                        raise RuntimeError(
+                            "bound Git worktree creation failed; refusing shared-workspace fallback"
+                        )
                 else:
+                    if run_binding is not None:
+                        raise RuntimeError(
+                            "bound delegation requires a local isolated Git worktree"
+                        )
                     logger.debug(
                         "worktree isolation skipped: non-local terminal backend"
                     )
             except Exception as e:
+                if run_binding is not None:
+                    logger.warning("bound worktree isolation refused: %s", e)
+                    return {
+                        "status": "failed",
+                        "exit_reason": "error",
+                        "error": str(e),
+                        "summary": (
+                            "Delegation refused: the bound Git worktree could not "
+                            "be created; the parent workspace was not used."
+                        ),
+                    }
                 logger.debug("worktree isolation setup failed: %s", e)
             if _worktree_info is not None:
                 try:
@@ -4136,43 +4164,105 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
-    # A gateway/TUI turn carries a server-derived immutable RunBinding.  Before
-    # constructing even one child, reprobe the exact session-owned checkout
-    # and identity.  This closes the stale-session/worktree window without
-    # making CLI and legacy callers (which have no binding) fail unexpectedly.
-    from gateway.session_context import current_run_binding, get_session_env
+    # A gateway/TUI turn carries a server-derived immutable RunBinding. Before
+    # constructing even one child, read the live session record and transport
+    # generation, then reprobe the exact session-owned checkout. Legacy CLI
+    # callers have no live record and retain their existing behavior.
+    from gateway.session_context import current_run_binding
 
     _bound_run_binding = current_run_binding()
-    if _bound_run_binding is not None:
-        _binding_cwd = _bound_run_binding.cwd
-        _parent_task_id = getattr(parent_agent, "_current_task_id", None)
-        try:
-            from tools.terminal_tool import get_session_cwd
+    try:
+        from tui_gateway import server as _gateway_server
+        from tui_gateway.transport import current_transport as _current_transport
 
-            _binding_cwd = get_session_cwd(_parent_task_id) or _binding_cwd
-        except Exception:
-            pass
+        _live_session_record = _gateway_server._current_runtime_session_record.get()
+        _live_transport = _current_transport()
+    except Exception:
+        _live_session_record = None
+        _live_transport = None
+
+    if _bound_run_binding is not None or _live_session_record is not None:
+        if _live_session_record is None:
+            return tool_error(
+                "Delegation refused: the originating live session is no longer active."
+            )
+        _parent_task_id = getattr(parent_agent, "_current_task_id", None)
+        _binding_drift: list[str] = []
+        if (
+            _bound_run_binding is not None
+            and _bound_run_binding.owner_generation
+            and _bound_run_binding.owner_generation != str(id(_live_session_record))
+        ):
+            _binding_drift.append("owner_session")
+        if (
+            _bound_run_binding is not None
+            and _bound_run_binding.transport_generation
+            and _bound_run_binding.transport_generation != str(id(_live_transport))
+        ):
+            _binding_drift.append("transport_generation")
+        if _live_session_record.get("transport") is not _live_transport:
+            _binding_drift.append("transport")
+        _live_key = str(_live_session_record.get("session_key") or "")
+        _live_profile_home = _live_session_record.get("profile_home")
+        _live_profile = (
+            Path(str(_live_profile_home)).name
+            if _live_profile_home
+            else str(_gateway_server._current_profile_name())
+        )
+        if _bound_run_binding is not None:
+            if _bound_run_binding.session_key != _live_key:
+                _binding_drift.append("session_key")
+            if _bound_run_binding.profile != _live_profile:
+                _binding_drift.append("profile")
+        if _binding_drift:
+            return tool_error(
+                "Delegation refused: the live session owner changed after this "
+                f"turn was bound ({', '.join(dict.fromkeys(_binding_drift))})."
+            )
+
+        _binding_cwd = str(_live_session_record.get("cwd") or "")
+        if not _binding_cwd:
+            try:
+                from tools.terminal_tool import get_session_cwd
+
+                _binding_cwd = get_session_cwd(_parent_task_id) or ""
+            except Exception:
+                _binding_cwd = ""
         try:
-            from tui_gateway.git_probe import capture_run_binding
+            from tui_gateway.git_probe import capture_run_binding, run_git
 
             _reprobed = capture_run_binding(
                 _binding_cwd,
-                session_key=get_session_env("HERMES_SESSION_KEY", ""),
-                ui_session_id=get_session_env("HERMES_UI_SESSION_ID", ""),
-                profile=get_session_env("HERMES_SESSION_PROFILE", ""),
+                session_key=_live_key,
+                ui_session_id=(
+                    _bound_run_binding.ui_session_id
+                    if _bound_run_binding is not None
+                    else ""
+                ),
+                profile=_live_profile,
+                owner_generation=str(id(_live_session_record)),
+                transport_generation=str(id(_live_transport)),
             )
         except ValueError as exc:
             return tool_error(
-                "Delegation refused: the bound Git worktree is no longer available. "
+                "Delegation refused: the selected live session must be attached "
+                "to a Git worktree. "
                 f"{exc}"
             )
-        _binding_drift = _bound_run_binding.differences(_reprobed)
-        if _binding_drift:
+        if _bound_run_binding is not None:
+            _binding_drift = list(_bound_run_binding.differences(_reprobed))
+            if _binding_drift:
+                return tool_error(
+                    "Delegation refused: the live session/worktree changed after "
+                    f"this turn was bound ({', '.join(_binding_drift)}). "
+                    f"Bound {_bound_run_binding.display()}; current {_reprobed.display()}. "
+                    "Start a new conversation turn after selecting the intended worktree."
+                )
+        _bound_run_binding = _reprobed
+        if run_git(_binding_cwd, "status", "--porcelain", "--untracked-files=all"):
             return tool_error(
-                "Delegation refused: the live session/worktree changed after this "
-                f"turn was bound ({', '.join(_binding_drift)}). "
-                f"Bound {_bound_run_binding.display()}; current {_reprobed.display()}. "
-                "Start a new conversation turn after selecting the intended worktree."
+                "Delegation refused: the selected worktree has uncommitted changes. "
+                "Commit or clean it before delegating so the bound HEAD is complete."
             )
 
     overall_start = time.monotonic()
@@ -4230,6 +4320,40 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
+    # Reserve every bound child worktree before constructing any child agent.
+    # This makes an isolation failure a true zero-child refusal instead of
+    # constructing a child and silently sending it into the parent workspace.
+    _precreated_worktrees: list[Optional[Dict[str, str]]] = []
+    if _bound_run_binding is not None and _get_worktree_isolation():
+        from tools import subagent_worktree
+
+        if not subagent_worktree.local_backend_active():
+            return tool_error(
+                "Delegation refused: bound runs require a local isolated Git "
+                "worktree, but the active terminal backend cannot create one."
+            )
+        import uuid as _uuid
+
+        _preflight_cwd = _bound_run_binding.cwd
+        for _preflight_index in range(len(task_list)):
+            _info = subagent_worktree.create_subagent_worktree(
+                _preflight_cwd,
+                subagent_id=(
+                    f"bound-{_preflight_index}-{_uuid.uuid4().hex[:8]}"
+                ),
+                base_commit=_bound_run_binding.head,
+            )
+            if _info is None:
+                for _created in _precreated_worktrees:
+                    if _created is not None:
+                        subagent_worktree.finalize_subagent_worktree(_created)
+                return tool_error(
+                    "Delegation refused: the bound Git worktree could not be "
+                    "created; no child was spawned and the parent workspace "
+                    "was not used as a fallback."
+                )
+            _precreated_worktrees.append(_info)
+
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
@@ -4269,11 +4393,19 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                run_binding=_bound_run_binding,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
             # missing from PATH) refuse the spawn loudly (#80450).
+            from tools import subagent_worktree as _sw
+
+            for _created in _precreated_worktrees:
+                if _created is not None:
+                    _sw.finalize_subagent_worktree(_created)
             return tool_error(str(exc))
+        if i < len(_precreated_worktrees):
+            child._bound_worktree_info = _precreated_worktrees[i]
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:

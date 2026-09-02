@@ -67,6 +67,8 @@ class RunBinding:
     session_key: str
     ui_session_id: str
     profile: str
+    owner_generation: str = ""
+    transport_generation: str = ""
 
     @property
     def short_head(self) -> str:
@@ -81,6 +83,7 @@ class RunBinding:
         fields = (
             "cwd", "repo_root", "worktree_root", "git_common_dir", "branch",
             "ref", "head", "session_key", "ui_session_id", "profile",
+            "owner_generation", "transport_generation",
         )
         return tuple(name for name in fields if getattr(self, name) != getattr(other, name))
 

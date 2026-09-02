@@ -271,6 +271,104 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
+    def test_live_owner_drift_refuses_before_child_construction(self):
+        from gateway.session_context import RunBinding, reset_run_binding, set_run_binding
+        from tui_gateway import server
+
+        live_record = {"session_key": "session-live", "transport": None}
+        binding = RunBinding(
+            cwd="/workspace",
+            repo_root="/workspace",
+            worktree_root="/workspace",
+            git_common_dir="/workspace/.git",
+            branch="main",
+            ref="refs/heads/main",
+            head="0" * 40,
+            session_key="session-live",
+            ui_session_id="ui-live",
+            profile="default",
+            owner_generation=str(id({})),
+            transport_generation=str(id(None)),
+        )
+        binding_token = set_run_binding(binding)
+        live_token = server._current_runtime_session_record.set(live_record)
+        try:
+            parent = _make_mock_parent()
+            with patch("tools.delegate_tool._build_child_preserving_parent_tools") as build:
+                result = json.loads(
+                    delegate_task(goal="Refuse stale live owner", parent_agent=parent)
+                )
+            self.assertIn("error", result)
+            self.assertIn("live session owner changed", result["error"])
+            build.assert_not_called()
+        finally:
+            server._current_runtime_session_record.reset(live_token)
+            reset_run_binding(binding_token)
+
+    def test_non_git_live_turn_allows_chat_but_refuses_delegation(self):
+        from tui_gateway import server
+
+        live_record = {
+            "session_key": "session-live",
+            "cwd": self._testMethodName,
+            "profile_home": None,
+            "transport": None,
+        }
+        live_token = server._current_runtime_session_record.set(live_record)
+        try:
+            parent = _make_mock_parent()
+            with patch("tools.delegate_tool._build_child_preserving_parent_tools") as build:
+                result = json.loads(
+                    delegate_task(goal="Refuse non Git delegation", parent_agent=parent)
+                )
+            self.assertIn("error", result)
+            self.assertIn("must be attached to a Git worktree", result["error"])
+            build.assert_not_called()
+        finally:
+            server._current_runtime_session_record.reset(live_token)
+
+    def test_bound_worktree_failure_refuses_before_child_construction(self):
+        from gateway.session_context import RunBinding, reset_run_binding, set_run_binding
+        from tui_gateway import server
+
+        live_record = {"session_key": "session-live", "transport": None}
+        binding = RunBinding(
+            cwd="/workspace",
+            repo_root="/workspace",
+            worktree_root="/workspace",
+            git_common_dir="/workspace/.git",
+            branch="main",
+            ref="refs/heads/main",
+            head="0" * 40,
+            session_key="session-live",
+            ui_session_id="ui-live",
+            profile="default",
+            owner_generation=str(id(live_record)),
+            transport_generation=str(id(None)),
+        )
+        binding_token = set_run_binding(binding)
+        live_token = server._current_runtime_session_record.set(live_record)
+        try:
+            parent = _make_mock_parent()
+            with (
+                patch("tui_gateway.git_probe.capture_run_binding", return_value=binding),
+                patch("tui_gateway.git_probe.run_git", return_value=""),
+                patch("tui_gateway.server._current_profile_name", return_value="default"),
+                patch("tools.delegate_tool._get_worktree_isolation", return_value=True),
+                patch("tools.subagent_worktree.local_backend_active", return_value=True),
+                patch("tools.subagent_worktree.create_subagent_worktree", return_value=None),
+                patch("tools.delegate_tool._build_child_preserving_parent_tools") as build,
+            ):
+                result = json.loads(
+                    delegate_task(goal="Refuse missing bound worktree", parent_agent=parent)
+                )
+            self.assertIn("error", result)
+            self.assertIn("no child was spawned", result["error"])
+            build.assert_not_called()
+        finally:
+            server._current_runtime_session_record.reset(live_token)
+            reset_run_binding(binding_token)
+
 
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)

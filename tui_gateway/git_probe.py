@@ -69,6 +69,8 @@ def capture_run_binding(
     session_key: str = "",
     ui_session_id: str = "",
     profile: str = "",
+    owner_generation: str = "",
+    transport_generation: str = "",
 ):
     """Capture immutable checkout and live-session identity for one turn.
 
@@ -111,6 +113,8 @@ def capture_run_binding(
         session_key=str(session_key or ""),
         ui_session_id=str(ui_session_id or ""),
         profile=str(profile or ""),
+        owner_generation=str(owner_generation or ""),
+        transport_generation=str(transport_generation or ""),
     )
 
 
