@@ -20,7 +20,6 @@ import {
 import { resetBackgroundPollingGuard } from '@/store/composer-status'
 import {
   $gateway,
-  activeGatewayConnectionId,
   closeLegacySecondaryGateways,
   closeSecondaryGateways,
   configureGatewayRegistry,
@@ -29,8 +28,10 @@ import {
   gatewayActivationEpoch,
   isActivePrimary,
   liveSecondaryConnectionIds,
+  primaryGatewaySource,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
+  type ReplayGapSource,
   reportPrimaryGatewayState,
   setPrimaryGateway,
   setPrimaryGatewayConnection,
@@ -139,6 +140,7 @@ export function primaryRuntimeConnectionId(connection: Pick<HermesConnection, 'c
 interface GatewayBootOptions {
   beforeConnectionSwitch: () => void
   handleGatewayEvent: (event: RpcEvent) => void
+  resyncReplaySession?: (sessionId: string, source: ReplayGapSource) => Promise<boolean> | boolean
   onConnectionReady: (
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
   ) => void
@@ -150,6 +152,7 @@ interface GatewayBootOptions {
 export function useGatewayBoot({
   beforeConnectionSwitch,
   handleGatewayEvent,
+  resyncReplaySession = () => false,
   onConnectionReady,
   onGatewayReady,
   refreshHermesConfig,
@@ -158,6 +161,7 @@ export function useGatewayBoot({
   const callbacksRef = useRef({
     beforeConnectionSwitch,
     handleGatewayEvent,
+    resyncReplaySession,
     onConnectionReady,
     onGatewayReady,
     refreshHermesConfig,
@@ -167,6 +171,7 @@ export function useGatewayBoot({
   callbacksRef.current = {
     beforeConnectionSwitch,
     handleGatewayEvent,
+    resyncReplaySession,
     onConnectionReady,
     onGatewayReady,
     refreshHermesConfig,
@@ -781,6 +786,7 @@ export function useGatewayBoot({
         recordSessionEventScope(event)
         callbacksRef.current.handleGatewayEvent(event)
       },
+      onReplayGap: (sessionId, source) => callbacksRef.current.resyncReplaySession(sessionId, source),
       onActiveConnectionInvalidated: (fallbackProfile, invalidationEpoch) => {
         $activeGatewayProfile.set(fallbackProfile)
         // Bounded like every other getConnection() call in this file (#93454):
@@ -834,20 +840,23 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
-
     const offEvent = gateway.onEvent(event => {
-      const connectionId = activeGatewayConnectionId()
+      const source = primaryGatewaySource()
 
       const scopedEvent = {
         ...event,
-        profile: sourceProfile,
-        ...(connectionId ? { connectionId } : {})
+        profile: source.profile,
+        ...(source.connectionId ? { connectionId: source.connectionId } : {})
       }
 
       recordSessionEventScope(scopedEvent)
       callbacksRef.current.handleGatewayEvent(scopedEvent)
     })
+
+    const offReplayGap =
+      gateway.onReplayGap?.(sessionId =>
+        callbacksRef.current.resyncReplaySession(sessionId, primaryGatewaySource())
+      ) ?? (() => {})
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
@@ -1165,6 +1174,7 @@ export function useGatewayBoot({
       offGatewayReconnect()
       offState()
       offEvent()
+      offReplayGap()
       offExit()
       offWindowState?.()
       offBootProgress()
