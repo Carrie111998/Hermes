@@ -410,3 +410,105 @@ def test_is_managed_tool_gateway_ready_skips_refresh_for_expired_cached_token(tm
         assert is_managed_tool_gateway_ready("modal") is True
 
     assert refresh_calls == []
+
+
+def _fixture_token(label: str) -> str:
+    """Build a clearly-fake marker token for a test fixture."""
+    return f"fixture-nous-token-{label}"
+
+
+def _write_auth_store(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def test_peek_nous_access_token_falls_back_to_global_root_store(tmp_path, monkeypatch):
+    # Profile with an empty providers map; the Nous login lives at the
+    # global root. peek must resolve it the same way read/status do (#97490).
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    profile_home = tmp_path / "profiles" / "alice"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(profile_home / "auth.json", {"version": 1, "providers": {}})
+    _write_auth_store(tmp_path / "auth.json", {
+        "version": 1,
+        "providers": {"nous": {"access_token": _fixture_token("global-root")}},
+    })
+
+    assert managed_tool_gateway.peek_nous_access_token() == _fixture_token("global-root")
+
+
+def test_peek_nous_access_token_falls_back_to_credential_pool(tmp_path, monkeypatch):
+    # Device-code logins can leave the token only in credential_pool.nous
+    # with an empty providers map — the status snapshot already falls back
+    # to the pool; peek must too.
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    profile_home = tmp_path / "profiles" / "alice"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(profile_home / "auth.json", {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "nous": [{"source": "device_code", "access_token": _fixture_token("pool")}]
+        },
+    })
+
+    assert managed_tool_gateway.peek_nous_access_token() == _fixture_token("pool")
+
+
+def test_peek_nous_access_token_prefers_active_provider_state_over_fallbacks(tmp_path, monkeypatch):
+    # Shadowing order must not flip: an active-store token wins over both
+    # the global-root state and a pooled entry.
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    profile_home = tmp_path / "profiles" / "alice"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(profile_home / "auth.json", {
+        "version": 1,
+        "providers": {"nous": {"access_token": _fixture_token("profile")}},
+        "credential_pool": {
+            "nous": [{"source": "device_code", "access_token": _fixture_token("pool")}]
+        },
+    })
+    _write_auth_store(tmp_path / "auth.json", {
+        "version": 1,
+        "providers": {"nous": {"access_token": _fixture_token("global-root")}},
+    })
+
+    assert managed_tool_gateway.peek_nous_access_token() == _fixture_token("profile")
+
+
+def test_peek_nous_access_token_falls_back_to_global_pool_entries(tmp_path, monkeypatch):
+    # read_credential_pool's per-provider shadowing also covers Nous entries
+    # that only exist at the global root.
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    profile_home = tmp_path / "profiles" / "alice"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(profile_home / "auth.json", {"version": 1, "providers": {}})
+    _write_auth_store(tmp_path / "auth.json", {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "nous": [{"source": "device_code", "access_token": _fixture_token("global-pool")}]
+        },
+    })
+
+    assert managed_tool_gateway.peek_nous_access_token() == _fixture_token("global-pool")
+
+
+def test_is_managed_tool_gateway_ready_reports_ready_from_fallback_token(tmp_path, monkeypatch):
+    # End-to-end shape of #97490: every managed tool showed unavailable in a
+    # profile while the credentials worked when invoked.
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    profile_home = tmp_path / "profiles" / "alice"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    _write_auth_store(profile_home / "auth.json", {"version": 1, "providers": {}})
+    _write_auth_store(tmp_path / "auth.json", {
+        "version": 1,
+        "providers": {"nous": {"access_token": _fixture_token("global-root")}},
+    })
+
+    with patch.dict(
+        os.environ,
+        {"TOOL_GATEWAY_DOMAIN": "nousresearch.com"},
+        clear=False,
+    ), patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=True):
+        assert managed_tool_gateway.is_managed_tool_gateway_ready("firecrawl") is True
