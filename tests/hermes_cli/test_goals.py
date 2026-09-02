@@ -96,6 +96,37 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_judge_prompt_includes_prior_evidence_only_when_provided(self):
+        from hermes_cli import goals
+
+        captured = {}
+
+        class _FakeMsg:
+            content = '{"done": true, "reason": "achieved"}'
+        class _FakeChoice:
+            message = _FakeMsg()
+        class _FakeResp:
+            choices = [_FakeChoice()]
+        def _fake_call_llm(**kwargs):
+            captured.update(kwargs)
+            return _FakeResp()
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            goals.judge_goal("goal", "agent response", prior_evidence="prior process evidence")
+
+        sent_messages = captured.get("messages") or []
+        user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
+        assert "Relevant evidence from prior turns" in user_msg
+        assert "prior process evidence" in user_msg
+
+        captured.clear()
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            goals.judge_goal("goal", "agent response")
+
+        sent_messages = captured.get("messages") or []
+        user_msg = next((m["content"] for m in sent_messages if m["role"] == "user"), "")
+        assert "Relevant evidence from prior turns" not in user_msg
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
@@ -245,6 +276,45 @@ class TestGoalStateSubgoalsBackcompat:
         state = GoalState.from_json(legacy)
         assert state.goal == "do a thing"
         assert state.subgoals == []
+
+
+class TestGoalStatePriorEvidenceBackcompat:
+    def test_old_state_meta_row_loads_without_prior_evidence(self):
+        from hermes_cli.goals import GoalState
+
+        legacy = json.dumps({
+            "goal": "do a thing",
+            "status": "active",
+            "turns_used": 2,
+            "max_turns": 20,
+            "created_at": 1.0,
+            "last_turn_at": 2.0,
+        })
+        state = GoalState.from_json(legacy)
+        assert state.goal == "do a thing"
+        assert state.prior_turn_evidence == []
+
+    def test_prior_evidence_roundtrip_is_bounded(self):
+        from hermes_cli.goals import (
+            _GOAL_PRIOR_EVIDENCE_ENTRY_CHARS,
+            _GOAL_PRIOR_EVIDENCE_MAX_ENTRIES,
+            GoalState,
+        )
+
+        state = GoalState(
+            goal="do a thing",
+            prior_turn_evidence=[
+                f"old-{i}-" + ("x" * (_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS + 50))
+                for i in range(_GOAL_PRIOR_EVIDENCE_MAX_ENTRIES + 2)
+            ],
+        )
+        restored = GoalState.from_json(state.to_json())
+        assert len(restored.prior_turn_evidence) == _GOAL_PRIOR_EVIDENCE_MAX_ENTRIES
+        assert restored.prior_turn_evidence[0].startswith("old-2-")
+        assert all(
+            len(entry) <= _GOAL_PRIOR_EVIDENCE_ENTRY_CHARS
+            for entry in restored.prior_turn_evidence
+        )
 
 
 class TestMigrateGoalToSession:
@@ -519,6 +589,114 @@ class TestJudgeDrivenWait:
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
         assert mgr.state.waiting_on_pid is None
+
+    def test_prior_evidence_accumulation_is_bounded(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import (
+            _GOAL_PRIOR_EVIDENCE_MAX_ENTRIES,
+            GoalManager,
+        )
+
+        mgr = GoalManager(session_id="jw-evidence-bounded", default_max_turns=20)
+        mgr.set("finish all steps")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("continue", "more work", False, None, False),
+        ):
+            for i in range(_GOAL_PRIOR_EVIDENCE_MAX_ENTRIES + 3):
+                mgr.evaluate_after_turn(f"turn-{i}-evidence")
+
+        evidence = mgr.state.prior_turn_evidence
+        assert len(evidence) == _GOAL_PRIOR_EVIDENCE_MAX_ENTRIES
+        joined = "\n".join(evidence)
+        assert "turn-0-evidence" not in joined
+        assert "turn-1-evidence" not in joined
+        assert "turn-6-evidence" in joined
+
+    def test_prior_evidence_not_added_to_continuation_prompt(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-evidence-prompt", default_max_turns=5)
+        mgr.set("finish all steps")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("continue", "more work", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("private prior evidence")
+
+        prompt = decision["continuation_prompt"]
+        assert prompt is not None
+        assert "Relevant evidence from prior turns" not in prompt
+        assert "private prior evidence" not in prompt
+
+    def test_new_goal_resets_prior_evidence(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-evidence-reset", default_max_turns=5)
+        mgr.set("first goal")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("continue", "more work", False, None, False),
+        ):
+            mgr.evaluate_after_turn("first-goal-evidence")
+        assert mgr.state.prior_turn_evidence
+
+        mgr.clear()
+        mgr.set("second goal")
+        assert mgr.state.prior_turn_evidence == []
+
+    def test_wait_then_done_can_use_prior_turn_evidence_after_reload(self, hermes_home):
+        """A completion turn after WAIT may be terse; the judge still needs
+        bounded evidence from the turn that parked the goal."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        captured = []
+
+        def judge(goal, response, **kwargs):
+            captured.append({"response": response, **kwargs})
+            if len(captured) == 1:
+                return (
+                    "wait",
+                    "process is running",
+                    False,
+                    {"session_id": "proc-evidence"},
+                    False,
+                )
+            prior = kwargs.get("prior_evidence") or ""
+            assert "PROCESS-STARTED" in prior
+            assert "proc-evidence" in prior
+            assert "notify_on_complete" in prior
+            return "done", "completion evidence links back to parked work", False, None, False
+
+        with patch.object(goals, "judge_goal", side_effect=judge):
+            mgr = GoalManager(session_id="jw-evidence", default_max_turns=3)
+            mgr.set("finish the background job")
+            d1 = mgr.evaluate_after_turn(
+                "PROCESS-STARTED proc-evidence: notify_on_complete watcher is running.",
+                background_processes=[{
+                    "session_id": "proc-evidence",
+                    "pid": 4242,
+                    "status": "running",
+                    "command": "notify_on_complete.sh",
+                    "notify_on_complete": True,
+                }],
+            )
+            assert d1["verdict"] == "wait"
+
+            # Model the real wake path: a later process-completion turn reloads
+            # persisted GoalState before the judge sees the terse final answer.
+            resumed = GoalManager(session_id="jw-evidence", default_max_turns=3)
+            resumed.state.waiting_on_session = None
+            d2 = resumed.evaluate_after_turn("GOAL-THREAD-PASS")
+
+        assert d2["verdict"] == "done"
+        assert captured[1]["response"] == "GOAL-THREAD-PASS"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -797,4 +975,3 @@ class TestContractAndBackgroundCompose:
         # The judge can return a wait verdict on a contract goal.
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
-
