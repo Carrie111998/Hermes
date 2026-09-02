@@ -1,6 +1,7 @@
 {
   "assetCount": 26,
   "blend": "lunar-city/hero-assets/lunar-city-hero-assets.blend",
+  "buildingPreview": "lunar-city/hero-assets/lunar-city-hero-buildings.png",
   "buildings": [
     {
       "collection": "Hero Asset - library",

@@ -35,6 +35,7 @@ HERO_DIR = OUTPUT / "hero-assets"
 HERO_BLEND = HERO_DIR / "lunar-city-hero-assets.blend"
 HERO_GLB = HERO_DIR / "lunar-city-hero-assets.glb"
 HERO_RENDER = HERO_DIR / "lunar-city-hero-assets.png"
+HERO_BUILDING_RENDER = HERO_DIR / "lunar-city-hero-buildings.png"
 HERO_CHARACTER_RENDER = HERO_DIR / "lunar-city-hero-characters.png"
 HERO_MANIFEST = HERO_DIR / "hero-assets-manifest.json"
 
@@ -684,6 +685,7 @@ def main():
         "blend": "lunar-city/hero-assets/lunar-city-hero-assets.blend",
         "glb": "lunar-city/hero-assets/lunar-city-hero-assets.glb",
         "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
+        "buildingPreview": "lunar-city/hero-assets/lunar-city-hero-buildings.png",
         "characterPreview": "lunar-city/hero-assets/lunar-city-hero-characters.png",
         "assetCount": scene["asset_count"],
         "heroMeshComponentCount": scene["hero_mesh_components"],
@@ -745,6 +747,13 @@ def main():
     bpy.ops.render.render(write_still=True)
     camera = scene.camera
     if camera:
+        characters.hide_render = True
+        camera.location = (0, -23, 15)
+        camera.data.ortho_scale = 17
+        camera.rotation_euler = (Vector((0, 3.1, 1.0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
+        scene.render.filepath = str(HERO_BUILDING_RENDER)
+        bpy.ops.render.render(write_still=True)
+        characters.hide_render = False
         buildings.hide_render = True
         camera.location = (0, -28, 17)
         camera.data.ortho_scale = 20

@@ -66,7 +66,9 @@ describe('Lunar City asset manifest', () => {
       readFileSync(join(process.cwd(), 'public/lunar-city/hero-assets/hero-assets-manifest.json'), 'utf8')
     ) as {
       assetCount: number
+      buildingPreview: string
       buildings: Array<{ collection: string; id: string }>
+      characterPreview: string
       children: Array<{ collection: string; id: string }>
       heroMeshComponentCount: number
       leaders: Array<{ collection: string; id: string }>
@@ -79,6 +81,8 @@ describe('Lunar City asset manifest', () => {
     }
 
     expect(manifest.assetCount).toBe(26)
+    expect(manifest.buildingPreview).toBe('lunar-city/hero-assets/lunar-city-hero-buildings.png')
+    expect(manifest.characterPreview).toBe('lunar-city/hero-assets/lunar-city-hero-characters.png')
     expect(manifest.buildings).toHaveLength(8)
     expect(manifest.leaders).toHaveLength(8)
     expect(manifest.workers).toHaveLength(6)
