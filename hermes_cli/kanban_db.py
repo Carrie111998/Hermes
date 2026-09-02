@@ -8023,6 +8023,113 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Capture groups for the PR URL: (owner, repo, pull_number).
+_GITHUB_PR_URL_RE = re.compile(
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
+    re.IGNORECASE,
+)
+
+# t_9799c507: the active_pr respawn guard was PR-state-BLIND — it blocked
+# re-spawn whenever a GitHub PR URL appeared in a recent comment, even after
+# the PR was MERGED/CLOSED. The 24.5d stall of sycode-trading/t_30c13209 was
+# exactly this: PR #856 MERGED but the guard kept firing every dispatcher tick.
+# We now resolve the ACTUAL GitHub PR state (read-only `gh pr view`); only a PR
+# that is still OPEN (or whose state cannot be determined — fail closed) blocks.
+# MERGED/CLOSED PRs must NOT block re-spawn.
+#
+# PR-state results are cached for a short TTL so the per-tick dispatcher probes
+# do not hammer the GitHub API. Overrides:
+#   HERMES_KANBAN_PR_STATE_CACHE_TTL=<seconds>  (0 disables caching)
+#   HERMES_KANBAN_PR_STATE_CHECK=0              (disable the state check; keeps
+#                                                the legacy URL-only guard)
+_PR_STATE_CACHE_TTL = 300  # 5 minutes
+_pr_state_cache: dict[tuple[str, str], tuple[float, "str | None"]] = {}
+
+
+def _pr_author_restriction_enabled() -> bool:
+    """Whether the ``active_pr`` guard only counts PR references authored by a
+    profile that has actually run this task.
+
+    OFF by default: the documented guard semantics are "a GitHub PR URL in a
+    recent comment defers the re-spawn", regardless of who wrote it. Opt in with
+    ``HERMES_KANBAN_PR_AUTHOR_RESTRICTION=1`` when third-party PR references
+    (e.g. a reviewer-lane card quoting someone else's PR) are starving cards that
+    have no prior worker to dedupe against.
+    """
+    return os.environ.get(
+        "HERMES_KANBAN_PR_AUTHOR_RESTRICTION", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pr_state_check_enabled() -> bool:
+    return os.environ.get("HERMES_KANBAN_PR_STATE_CHECK", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _github_pr_state(repo: str, number: str) -> "str | None":
+    """Return the GitHub PR state for ``repo`` (``owner/name``) ``number``.
+
+    Uses the read-only ``gh pr view <n> --repo <repo> --json state`` command.
+    Returns ``'OPEN'`` / ``'MERGED'`` / ``'CLOSED'`` (gh's state vocabulary),
+    or ``None`` when the state cannot be determined (gh missing, auth/network
+    failure, non-zero exit). Callers fail CLOSED on ``None`` — treat the PR as
+    still active and keep the guard.
+
+    Results are cached for ``_PR_STATE_CACHE_TTL`` seconds (overridable via
+    ``HERMES_KANBAN_PR_STATE_CACHE_TTL``). Never raises.
+    """
+    try:
+        ttl = int(os.environ.get("HERMES_KANBAN_PR_STATE_CACHE_TTL", str(_PR_STATE_CACHE_TTL)) or 0)
+    except ValueError:
+        ttl = _PR_STATE_CACHE_TTL
+    now = time.time()
+    key = (repo.strip().lower(), number.strip())
+    hit = _pr_state_cache.get(key)
+    if hit is not None and ttl > 0 and (now - hit[0]) < ttl:
+        return hit[1]
+    state: "str | None" = None
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", number, "--repo", repo, "--json", "state"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            try:
+                data = json.loads(proc.stdout or "{}")
+            except ValueError:
+                data = {}
+            state = (data.get("state") or "").strip().upper() or None
+    except Exception:
+        # gh missing / timeout / network failure — caller fails closed.
+        state = None
+    if ttl > 0:
+        _pr_state_cache[key] = (now, state)
+    return state
+
+
+def _pr_urls_in_comments(conn: sqlite3.Connection, task_id: str, pr_cutoff: int) -> "list[tuple[str, str]]":
+    """Return ``(repo, number)`` pairs for GitHub PR URLs in recent comments.
+
+    Used by the active_pr respawn guard so it can resolve the ACTUAL PR state
+    instead of blocking on the mere presence of a URL (t_9799c507).
+    """
+    found: "list[tuple[str, str]]" = []
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, pr_cutoff),
+    ).fetchall():
+        if not c["body"]:
+            continue
+        for m in _GITHUB_PR_URL_RE.finditer(c["body"]):
+            found.append((f"{m.group(1)}/{m.group(2)}", m.group(3)))
+    return found
+
 
 @dataclass
 class DispatchResult:
@@ -9447,8 +9554,11 @@ def check_respawn_guard(
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) AND the PR is still OPEN (or its
+        state cannot be determined — fail closed).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        (t_9799c507: a MERGED or CLOSED PR no longer blocks re-spawn — the
+        PR state is resolved read-only via ``gh pr view``.)
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9537,12 +9647,59 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Composed guard (t_ac710e3f): defer ONLY when BOTH hold:
+    #      (a) the PR reference was authored by a profile that has ACTUALLY
+    #          RUN this task (``task_runs.profile``) — the dedupe intent is
+    #          "don't re-spawn a card whose own worker already opened a PR";
+    #      (b) the PR is still OPEN (or its state cannot be determined —
+    #          fail closed). A MERGED or CLOSED PR must NOT block re-spawn.
+    #
+    #    (a) t_0536fe58 author-restriction: a third-party PR reference in a
+    #        comment (e.g. a reviewer-lane card "Independent review: PR #844 …",
+    #        author != any profile in task_runs) must NOT defer a card that was
+    #        never spawned — there is no prior worker to dedupe against, so the
+    #        card must dispatch normally (t_24c405ba / t_439547d4 starvation).
+    #    (b) t_9799c507 PR-state: the guard was PR-state-BLIND and stalled
+    #        MERGED-PR cards (sycode-trading/t_30c13209, 24.5d). We now resolve
+    #        the ACTUAL GitHub PR state (read-only `gh pr view`); only a still
+    #        OPEN PR (or unknown — fail closed) blocks. The state check can be
+    #        disabled via HERMES_KANBAN_PR_STATE_CHECK=0 (keeps the legacy
+    #        URL-only behavior — but still under the own-worker restriction).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    own_worker_profiles: "set[str] | None" = None
+    if _pr_author_restriction_enabled():
+        own_worker_profiles = {
+            r["profile"]
+            for r in conn.execute(
+                "SELECT DISTINCT profile FROM task_runs "
+                "WHERE task_id = ? AND profile IS NOT NULL",
+                (task_id,),
+            ).fetchall()
+        }
+        if not own_worker_profiles:
+            # No prior worker to dedupe against — nothing to defer.
+            return None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if not c["body"]:
+            continue
+        if own_worker_profiles is not None and c["author"] not in own_worker_profiles:
+            continue
+        pr_urls = list(_GITHUB_PR_URL_RE.finditer(c["body"]))
+        if not pr_urls:
+            continue
+        if not _pr_state_check_enabled():
+            # Legacy behaviour: any recent PR URL blocks.
+            return "active_pr"
+        pr_states = [
+            _github_pr_state(m.group(1) + "/" + m.group(2), m.group(3))
+            for m in pr_urls
+        ]
+        if any(state not in ("MERGED", "CLOSED") for state in pr_states):
+            # OPEN, or unknown (gh failed) — fail closed, keep the guard.
             return "active_pr"
 
     return None
