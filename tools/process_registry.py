@@ -1621,14 +1621,31 @@ class ProcessRegistry:
             pass
 
         # Process exited
+        reaped = True
         try:
             pty.wait()
         except Exception as e:
-            logger.debug("PTY wait timed out or failed: %s", e)
+            reaped = False
+            logger.warning("PTY wait for session %s failed: %s", session.id, e)
+
+        status = getattr(pty, "exitstatus", None)
         session.exited = True
         if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
+            if reaped:
+                # wait() returned, so the child really is gone. A backend
+                # without exitstatus (pywinpty) still reports -1 rather than
+                # a null exit code.
+                session.exit_code = status if status is not None else -1
+                session.completion_reason = "exited"
+            else:
+                # _move_to_finished drops the last handle on this child, so
+                # nothing can determine its status afterwards. Report the
+                # outcome as unknown instead of a clean exit carrying a null
+                # code — same shape the env poller uses when it loses a
+                # backend.
+                session.exit_code = -1
+                session.completion_reason = "lost"
+                session.termination_source = "pty_wait_failed"
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -3331,7 +3348,11 @@ def format_process_notification(evt: dict) -> "str | None":
     if _reason == "killed":
         _status = f"terminated by {_source or 'Hermes'}"
     elif _reason == "lost":
-        _status = "marked lost because the process backend disappeared"
+        _status = (
+            "marked lost because the PTY could not be reaped"
+            if _source == "pty_wait_failed"
+            else "marked lost because the process backend disappeared"
+        )
     elif _reason == "failed_start":
         _status = "failed to start"
     elif _exit == 0:
