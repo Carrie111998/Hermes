@@ -13,9 +13,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import OrderedDict
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -506,6 +506,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             pass
         return None
 
+    def _use_private_api_send(self) -> bool:
+        """Send through the Private API helper when it is available.
+
+        An omitted ``method`` defaults to AppleScript on the server, which
+        cannot drive Messages.app unless the BlueBubbles macOS user is the
+        active GUI login.
+        """
+        return bool(self._private_api_enabled and self._helper_connected)
+
     async def _create_chat_for_handle(
         self, address: str, message: str
     ) -> SendResult:
@@ -513,8 +522,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         payload = {
             "addresses": [address],
             "message": message,
-            "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+            "tempGuid": f"temp-{time.time_ns()}",
         }
+        if self._use_private_api_send():
+            payload["method"] = "private-api"
         try:
             res = await self._api_post("/api/v1/chat/new", payload)
             data = res.get("data") or {}
@@ -569,13 +580,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
             payload: Dict[str, Any] = {
                 "chatGuid": guid,
-                "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+                "tempGuid": f"temp-{time.time_ns()}",
                 "message": chunk,
             }
-            if reply_to and self._private_api_enabled and self._helper_connected:
+            if self._use_private_api_send():
                 payload["method"] = "private-api"
-                payload["selectedMessageGuid"] = reply_to
-                payload["partIndex"] = 0
+                if reply_to:
+                    payload["selectedMessageGuid"] = reply_to
+                    payload["partIndex"] = 0
             try:
                 res = await self._api_post("/api/v1/message/text", payload)
                 data = res.get("data") or {}
@@ -623,6 +635,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             }
             if is_audio_message:
                 data["isAudioMessage"] = "true"
+            if self._use_private_api_send():
+                data["method"] = "private-api"
             res = await self.client.post(
                 self._api_url("/api/v1/message/attachment"),
                 files=files,

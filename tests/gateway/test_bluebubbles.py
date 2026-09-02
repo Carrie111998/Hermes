@@ -317,6 +317,154 @@ class TestBlueBubblesAttachmentSend:
         assert captured["data"]["chatGuid"] == "iMessage;+;chat-guid"
 
 
+class TestBlueBubblesTextSend:
+    @staticmethod
+    def _capture_send(monkeypatch, adapter, *, private_api=True, helper=True):
+        adapter._private_api_enabled = private_api
+        adapter._helper_connected = helper
+        posts = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;+15551234567"
+
+        async def fake_api_post(path, payload):
+            posts.append((path, payload))
+            return {"status": 200, "data": {"guid": "message-guid"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        return posts
+
+    @pytest.mark.asyncio
+    async def test_send_uses_private_api_when_helper_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter)
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is True
+        (path, payload), = posts
+        assert path == "/api/v1/message/text"
+        assert payload["method"] == "private-api"
+        assert "selectedMessageGuid" not in payload
+        assert "partIndex" not in payload
+
+    @pytest.mark.asyncio
+    async def test_send_omits_method_when_helper_not_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter, helper=False)
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is True
+        assert "method" not in posts[0][1]
+
+    @pytest.mark.asyncio
+    async def test_send_omits_method_when_private_api_disabled(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter, private_api=False, helper=True)
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is True
+        assert "method" not in posts[0][1]
+
+    @pytest.mark.asyncio
+    async def test_reply_keeps_selected_message_guid(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter)
+
+        result = await adapter.send("+15551234567", "hello", reply_to="orig-guid")
+
+        assert result.success is True
+        payload = posts[0][1]
+        assert payload["method"] == "private-api"
+        assert payload["selectedMessageGuid"] == "orig-guid"
+        assert payload["partIndex"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reply_without_helper_stays_plain_send(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter, helper=False)
+
+        await adapter.send("+15551234567", "hello", reply_to="orig-guid")
+
+        payload = posts[0][1]
+        assert "method" not in payload
+        assert "selectedMessageGuid" not in payload
+
+    @pytest.mark.asyncio
+    async def test_every_chunk_carries_method(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter)
+
+        await adapter.send("+15551234567", "first paragraph\n\nsecond paragraph")
+
+        assert len(posts) == 2
+        assert all(payload["method"] == "private-api" for _, payload in posts)
+
+    @pytest.mark.asyncio
+    async def test_new_chat_uses_private_api_when_helper_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        posts = self._capture_send(monkeypatch, adapter)
+
+        result = await adapter._create_chat_for_handle("+15559876543", "hello")
+
+        assert result.success is True
+        (path, payload), = posts
+        assert path == "/api/v1/chat/new"
+        assert payload["method"] == "private-api"
+
+
+class TestBlueBubblesAttachmentMethod:
+    @staticmethod
+    async def _post_attachment(monkeypatch, tmp_path, adapter):
+        file_path = tmp_path / "payload.bin"
+        file_path.write_bytes(b"attachment-payload")
+        captured = {}
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;+;chat-guid"
+
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": 200, "data": {"guid": "message-guid"}}
+
+        class MockClient:
+            async def post(self, url, *, files, data, timeout):
+                captured.update(data=data)
+                return MockResponse()
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        adapter.client = MockClient()
+        result = await adapter._send_attachment("target", str(file_path))
+        assert result.success is True
+        return captured["data"]
+
+    @pytest.mark.asyncio
+    async def test_attachment_uses_private_api_when_helper_connected(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+
+        data = await self._post_attachment(monkeypatch, tmp_path, adapter)
+
+        assert data["method"] == "private-api"
+
+    @pytest.mark.asyncio
+    async def test_attachment_omits_method_without_helper(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = False
+
+        data = await self._post_attachment(monkeypatch, tmp_path, adapter)
+
+        assert "method" not in data
+
+
 # ---------------------------------------------------------------------------
 # Webhook registration
 # ---------------------------------------------------------------------------
