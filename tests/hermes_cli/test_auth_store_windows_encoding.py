@@ -149,8 +149,14 @@ class TestExplicitEncodingPassed:
         auth_path = hermes_home / "auth.json"
         _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
 
+        original_read_text = Path.read_text
+        read_target = auth_path
+
+        def read_text_with_self(*args, **kwargs):
+            return original_read_text(read_target, *args, **kwargs)
+
         with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
+            Path, "read_text", side_effect=read_text_with_self
         ) as spy:
             auth._load_auth_store(auth_path)
 
@@ -171,7 +177,15 @@ class TestExplicitEncodingPassed:
         # Bypass the JWT-expiry check so a fake token doesn't short-circuit.
         monkeypatch.setattr(auth, "_codex_access_token_is_expiring", lambda *a, **k: False)
 
-        with mock.patch.object(Path, "read_text", wraps=Path.read_text) as spy:
+        original_read_text = Path.read_text
+        read_target = codex_home / "auth.json"
+
+        def read_text_with_self(*args, **kwargs):
+            return original_read_text(read_target, *args, **kwargs)
+
+        with mock.patch.object(
+            Path, "read_text", side_effect=read_text_with_self
+        ) as spy:
             auth._import_codex_cli_tokens()
 
         # _import_codex_cli_tokens reads exactly one file; assert that read

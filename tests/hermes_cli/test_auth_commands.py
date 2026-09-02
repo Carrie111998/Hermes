@@ -15,7 +15,9 @@ import yaml
 def _write_auth_store(tmp_path, payload: dict) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
 
 
 def _write_groq_provider_config(
@@ -107,7 +109,7 @@ def test_auth_add_api_key_persists_manual_entry(tmp_path, monkeypatch):
 
     auth_add_command(_Args())
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     entries = payload["credential_pool"]["openrouter"]
     entry = next(item for item in entries if item["source"] == "manual")
     assert entry["label"] == "personal"
@@ -409,7 +411,7 @@ def test_auth_add_nous_oauth_persists_pool_entry(tmp_path, monkeypatch):
 
     auth_add_command(_Args())
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
 
     # Pool has exactly one canonical `device_code` entry — not a duplicate
     # pair of `manual:device_code` + `device_code` (the latter would be
@@ -486,7 +488,7 @@ def test_auth_add_nous_oauth_honors_custom_label(tmp_path, monkeypatch):
 
     auth_add_command(_Args())
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
 
     # Custom label reaches the pool entry …
     pool_entry = payload["credential_pool"]["nous"][0]
@@ -563,7 +565,7 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
         "second-refresh-token",
     ]
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     # No singleton block — the add path is now pool-only.
     assert "openai-codex" not in payload.get("providers", {})
     # First add activated the provider; second add left it as-is.
@@ -638,7 +640,7 @@ def test_auth_add_xai_oauth_sets_active_provider(tmp_path, monkeypatch):
 
     auth_add_command(_Args())
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     # active_provider must be set — the core of the original regression
     assert payload["active_provider"] == "xai-oauth"
     # Pool-only multi-account path: no providers.xai-oauth singleton write
@@ -732,7 +734,7 @@ def test_auth_add_xai_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch):
         "second-xai-refresh",
     ]
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     # No singleton block — the add path is now pool-only.
     assert "xai-oauth" not in payload.get("providers", {})
     # First add activated the provider; second add left it as-is.
@@ -784,7 +786,7 @@ def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
 
     auth_remove_command(_Args())
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     entries = payload["credential_pool"]["anthropic"]
     assert len(entries) == 1
     assert entries[0]["label"] == "secondary"
@@ -860,7 +862,7 @@ def test_clear_provider_auth_removes_provider_pool_entries(tmp_path, monkeypatch
 
     assert clear_provider_auth("anthropic") is True
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     assert payload["active_provider"] is None
     assert "anthropic" not in payload.get("providers", {})
     assert "anthropic" not in payload.get("credential_pool", {})
@@ -881,7 +883,8 @@ def test_logout_resets_codex_config_when_auth_state_already_cleared(tmp_path, mo
         "model:\n"
         "  default: gpt-5.3-codex\n"
         "  provider: openai-codex\n"
-        "  base_url: https://chatgpt.com/backend-api/codex\n"
+        "  base_url: https://chatgpt.com/backend-api/codex\n",
+        encoding="utf-8",
     )
 
     from types import SimpleNamespace
@@ -891,7 +894,7 @@ def test_logout_resets_codex_config_when_auth_state_already_cleared(tmp_path, mo
 
     out = capsys.readouterr().out
     assert "Logged out of OpenAI Codex." in out
-    config_text = (hermes_home / "config.yaml").read_text()
+    config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
     assert "provider: auto" in config_text
     assert "base_url: https://openrouter.ai/api/v1" in config_text
 
@@ -901,7 +904,7 @@ def test_logout_resets_codex_config_when_auth_state_already_cleared(tmp_path, mo
 def test_unsuppress_credential_source_clears_marker(tmp_path, monkeypatch):
     """unsuppress_credential_source() removes a previously-set marker."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from hermes_cli.auth import suppress_credential_source, unsuppress_credential_source, is_source_suppressed
 
@@ -912,7 +915,7 @@ def test_unsuppress_credential_source_clears_marker(tmp_path, monkeypatch):
     assert cleared is True
     assert is_source_suppressed("openai-codex", "device_code") is False
 
-    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     # Empty suppressed_sources dict should be cleaned up entirely
     assert "suppressed_sources" not in payload
 
@@ -920,7 +923,7 @@ def test_unsuppress_credential_source_clears_marker(tmp_path, monkeypatch):
 def test_unsuppress_credential_source_preserves_other_markers(tmp_path, monkeypatch):
     """Clearing one marker must not affect unrelated markers."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     from hermes_cli.auth import (
         suppress_credential_source,
@@ -952,12 +955,18 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     import yaml
-    (hermes_home / "config.yaml").write_text(yaml.dump({"model": {"provider": "anthropic", "model": "claude"}}))
-    (hermes_home / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {},
-        "suppressed_sources": {"anthropic": ["hermes_pkce"]},
-    }))
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"model": {"provider": "anthropic", "model": "claude"}}),
+        encoding="utf-8",
+    )
+    (hermes_home / "auth.json").write_text(
+        json.dumps({
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"anthropic": ["hermes_pkce"]},
+        }),
+        encoding="utf-8",
+    )
 
     # Stub the readers so only hermes_pkce is "available"; claude_code returns None
     import agent.anthropic_adapter as aa

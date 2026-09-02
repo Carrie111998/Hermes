@@ -3,9 +3,12 @@
 from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
+import json
 import math
+import stat
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
@@ -521,6 +524,58 @@ def auth_add_command(args) -> None:
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
 
 
+def _safe_recovery_source(path: Path) -> bytes:
+    """Read an operator-selected replacement without following a reparse."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SystemExit(f"Cannot read recovery source: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+        raise SystemExit(f"Recovery source must be a regular non-reparse file: {path}")
+    try:
+        return auth_mod._auth_store._read_auth_bytes(path)
+    except OSError as exc:
+        raise SystemExit(f"Cannot read recovery source: {path}") from exc
+
+
+def auth_recover_command(args) -> None:
+    """Perform an explicit, digest-fenced auth-store restore."""
+    target = Path(getattr(args, "target", None) or auth_mod._auth_file_path())
+    try:
+        auth_mod._load_auth_store(target)
+    except auth_mod.AuthStoreCorruptionError as corruption:
+        if not corruption.corrupt_sha256:
+            raise SystemExit(
+                f"Auth store is corrupt but no preserved digest is available: {target}"
+            )
+        source_arg = getattr(args, "source", None)
+        source = Path(source_arg) if source_arg else corruption.corrupt_path
+        if source is None:
+            raise SystemExit(
+                f"Auth store is read-only and no evidence copy exists: {target}. "
+                "Provide a JSON replacement path."
+            )
+        raw = _safe_recovery_source(source)
+        try:
+            replacement = json.loads(raw.decode("utf-8-sig"))
+        except Exception as exc:
+            raise SystemExit(f"Recovery source is not valid UTF-8 JSON: {source}") from exc
+        try:
+            restored = auth_mod.recover_auth_store(
+                replacement,
+                target,
+                expected_corrupt_sha256=corruption.corrupt_sha256,
+                expected_corrupt_path=target,
+            )
+        except (auth_mod.AuthStoreRecoveryConflictError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"Recovered auth store: {restored}")
+        return
+    except OSError as exc:
+        raise SystemExit(f"Cannot inspect auth store safely: {target}") from exc
+    raise SystemExit(f"Auth store is not corrupt; refusing recovery: {target}")
+
+
 def auth_list_command(args) -> None:
     provider_filter = _normalize_provider(getattr(args, "provider", "") or "")
     if provider_filter:
@@ -886,28 +941,52 @@ def _interactive_strategy() -> None:
     print(f"Set {provider} strategy to: {strategy}")
 
 
+def _render_auth_store_error(exc: RuntimeError) -> None:
+    """Render corruption/conflict state without credential-bearing content."""
+    path = getattr(exc, "auth_file", getattr(exc, "path", "auth.json"))
+    if isinstance(exc, auth_mod.AuthStoreCorruptionError):
+        preserved = getattr(exc, "corrupt_path", None)
+        hint = f" Evidence: {preserved}." if preserved else " No evidence copy was preserved."
+        raise SystemExit(
+            f"Auth store is read-only because it is corrupt: {path}.{hint} "
+            "Run `hermes auth recover <replacement.json>` after review."
+        ) from exc
+    raise SystemExit(str(exc)) from exc
+
+
 def auth_command(args) -> None:
     action = getattr(args, "auth_action", "")
-    if action == "add":
-        auth_add_command(args)
-        return
-    if action == "list":
-        auth_list_command(args)
-        return
-    if action == "remove":
-        auth_remove_command(args)
-        return
-    if action == "reset":
-        auth_reset_command(args)
-        return
-    if action == "status":
-        auth_status_command(args)
-        return
-    if action == "logout":
-        auth_logout_command(args)
-        return
-    if action == "spotify":
-        auth_spotify_command(args)
-        return
-    # No subcommand — launch interactive mode
-    _interactive_auth()
+    try:
+        if action == "add":
+            auth_add_command(args)
+            return
+        if action == "list":
+            auth_list_command(args)
+            return
+        if action == "recover":
+            auth_recover_command(args)
+            return
+        if action == "remove":
+            auth_remove_command(args)
+            return
+        if action == "reset":
+            auth_reset_command(args)
+            return
+        if action == "status":
+            auth_status_command(args)
+            return
+        if action == "logout":
+            auth_logout_command(args)
+            return
+        if action == "spotify":
+            auth_spotify_command(args)
+            return
+        # No subcommand — launch interactive mode
+        _interactive_auth()
+    except (
+        auth_mod.AuthStoreCorruptionError,
+        auth_mod.AuthStoreRecoveryRequired,
+        auth_mod.AuthStoreWriteConflictError,
+        auth_mod.AuthStoreRecoveryConflictError,
+    ) as exc:
+        _render_auth_store_error(exc)

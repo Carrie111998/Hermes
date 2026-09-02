@@ -13,7 +13,9 @@ import pytest
 def _write_auth_store(tmp_path, payload: dict) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -257,7 +259,7 @@ def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, 
         entry.last_status not in (STATUS_EXHAUSTED, STATUS_DEAD)
         for entry in pool.entries()
     )
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     for persisted in auth_payload["credential_pool"]["anthropic"]:
         assert persisted.get("last_status") not in (STATUS_EXHAUSTED, STATUS_DEAD)
         assert persisted.get("last_error_code") is None
@@ -321,7 +323,7 @@ def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     assert next_entry.id == "cred-ok"
 
     # The revoked credential is now permanently marked DEAD.
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     persisted = auth_payload["credential_pool"]["openai-codex"][0]
     assert persisted["last_status"] == STATUS_DEAD
     assert persisted["last_error_code"] == 401
@@ -385,7 +387,7 @@ def test_dead_credential_never_re_enters_rotation_after_ttl(tmp_path, monkeypatc
     assert selected.id == "cred-ok"
 
     # The DEAD entry is still marked dead on disk — not cleared by TTL.
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     dead_entry = next(e for e in auth_payload["credential_pool"]["openai-codex"]
                        if e["id"] == "cred-dead")
     assert dead_entry["last_status"] == STATUS_DEAD
@@ -439,7 +441,7 @@ def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
     assert next_entry is not None
     assert next_entry.id == "cred-2"
 
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     persisted = auth_payload["credential_pool"]["openai-codex"][0]
     # 429 stays exhausted (transient) — NOT dead.
     assert persisted["last_status"] == STATUS_EXHAUSTED
@@ -494,7 +496,7 @@ def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monk
         error_context={"message": "Unauthorized"},
     )
 
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     persisted = auth_payload["credential_pool"]["openai-codex"][0]
     assert persisted["last_status"] == STATUS_EXHAUSTED
     assert persisted["last_error_code"] == 401
@@ -553,7 +555,7 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
     assert selected.id == "cred-ok"
 
     # On-disk pool should have the dead entry removed.
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     persisted = auth_payload["credential_pool"]["openai-codex"]
     assert len(persisted) == 1
     assert persisted[0]["id"] == "cred-ok"
@@ -595,7 +597,7 @@ def test_load_pool_does_not_persist_env_seeded_secret_value(tmp_path, monkeypatc
     assert entry.source == "env:OPENROUTER_API_KEY"
     assert entry.access_token == sentinel
 
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8")
     assert sentinel not in auth_text
     persisted = json.loads(auth_text)["credential_pool"]["openrouter"][0]
     assert persisted["source"] == "env:OPENROUTER_API_KEY"
@@ -643,7 +645,7 @@ def test_load_pool_collapses_duplicate_env_rows_to_active_key(tmp_path, monkeypa
     assert [(entry.id, entry.runtime_api_key) for entry in pool.entries()] == [
         ("current-row", key)
     ]
-    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     assert [entry["id"] for entry in persisted["credential_pool"]["openrouter"]] == [
         "current-row"
     ]
@@ -691,7 +693,7 @@ def test_load_pool_persists_bitwarden_origin_metadata_without_secret(tmp_path, m
     assert entry.access_token == sentinel
     assert entry.source == "env:OPENROUTER_API_KEY"
 
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8")
     assert sentinel not in auth_text
     persisted = json.loads(auth_text)["credential_pool"]["openrouter"][0]
     assert persisted["source"] == "env:OPENROUTER_API_KEY"
@@ -732,7 +734,7 @@ def test_load_pool_sanitizes_legacy_raw_borrowed_entry_when_value_unchanged(tmp_
 
     assert entry is not None
     assert entry.access_token == sentinel
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8")
     assert sentinel not in auth_text
     persisted = json.loads(auth_text)["credential_pool"]["openrouter"][0]
     assert persisted["id"] == "legacy-env"
@@ -861,7 +863,7 @@ def test_write_credential_pool_sanitizes_borrowed_payload_at_disk_boundary(tmp_p
         },
     ])
 
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8")
     assert sentinel not in auth_text
     assert manual_secret in auth_text
     entries = json.loads(auth_text)["credential_pool"]["openrouter"]
@@ -894,7 +896,7 @@ def test_write_credential_pool_treats_unowned_oauth_source_as_borrowed(tmp_path,
         }
     ])
 
-    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8")
     assert sentinel not in auth_text
     persisted = json.loads(auth_text)["credential_pool"]["openrouter"][0]
     assert persisted["source"] == "oauth"
@@ -923,7 +925,7 @@ def test_write_credential_pool_preserves_known_provider_owned_oauth_state(tmp_pa
         }
     ])
 
-    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())["credential_pool"]["nous"][0]
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))["credential_pool"]["nous"][0]
     assert persisted["access_token"] == sentinel
     assert persisted["refresh_token"] == f"refresh-{sentinel}"
     assert persisted["agent_key"] == f"agent-{sentinel}"
@@ -975,7 +977,9 @@ def test_load_pool_falls_back_to_os_environ_when_dotenv_empty(tmp_path, monkeypa
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-from-runtime-env")
 
     # .env exists but does not define OPENROUTER_API_KEY
-    (hermes_home / ".env").write_text("SOME_OTHER_VAR=unrelated\n")
+    (hermes_home / ".env").write_text(
+        "SOME_OTHER_VAR=unrelated\n", encoding="utf-8"
+    )
 
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
@@ -1033,7 +1037,7 @@ def test_load_pool_mirrors_nous_invoke_jwt_agent_key_runtime_api_key(tmp_path, m
     assert entry.agent_key == token
     assert entry.runtime_api_key == token
 
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     pool_entry = auth_payload["credential_pool"]["nous"][0]
     assert pool_entry["agent_key"] == token
     assert pool_entry["agent_key_expires_at"] == expires_at
@@ -1287,7 +1291,7 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
 def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
     """Verify seeding from custom_providers api_key in config.yaml."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     # Write config.yaml with a custom_providers entry
     config_path = tmp_path / "hermes" / "config.yaml"
@@ -1315,7 +1319,7 @@ def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
 def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     """Verify seeding from model.api_key when model.provider=='custom' and base_url matches."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     import yaml
     config_path = tmp_path / "hermes" / "config.yaml"
@@ -1830,7 +1834,7 @@ def test_persist_preserves_concurrent_disk_only_entry(tmp_path, monkeypatch):
 
     pool.mark_exhausted_and_rotate(status_code=429)
 
-    final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    final = json.loads((tmp_path / "hermes" / "auth.json").read_text(encoding="utf-8"))
     final_ids = [entry["id"] for entry in final["credential_pool"]["anthropic"]]
     assert set(final_ids) == {"cred-A", "cred-B", "cred-C"}
     persisted_a = next(

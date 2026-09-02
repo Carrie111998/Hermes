@@ -1545,7 +1545,7 @@ class CredentialPool:
             return
         try:
             with _auth_store_lock():
-                auth_store = _load_auth_store()
+                auth_store = _load_auth_store(allow_legacy_empty=True)
                 _wt_provider_id = {
                     "nous": "nous",
                     "openai-codex": "openai-codex",
@@ -3117,7 +3117,7 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
 def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-    auth_store = _load_auth_store()
+    auth_store = _load_auth_store(allow_legacy_empty=True)
 
     # Shared suppression gate — used at every upsert site so
     # `hermes auth remove <provider> <N>` is stable across all source types.

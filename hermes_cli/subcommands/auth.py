@@ -51,6 +51,15 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
     auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
     auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
+    auth_recover = auth_subparsers.add_parser(
+        "recover", help="Explicitly import a reviewed auth-store replacement"
+    )
+    auth_recover.add_argument(
+        "source", nargs="?", help="UTF-8 JSON replacement (defaults to preserved evidence)"
+    )
+    auth_recover.add_argument(
+        "--target", help="Auth store to recover (defaults to the active store)"
+    )
     auth_remove = auth_subparsers.add_parser(
         "remove", help="Remove a pooled credential by index, id, or label"
     )
