@@ -206,9 +206,17 @@ class TestSummaryRoleAlternatesAgainstVisibleNeighbours:
 
 class TestForcedUserGuardsStillWin:
     def test_zero_user_guard_still_forces_user(self, compressor):
-        """#58753: when no genuine user turn survives, the summary must
-        still be pinned to role=user (and that shape is alternation-safe
-        because everything after it is template-exempt)."""
+        """#58753 + #100818: when no genuine user turn survives, the
+        compressed transcript must still contain a user-role message the
+        backend accepts — AND (#100818) that message must be the recovered
+        LIVE task prompt, not the summary in a user-role transport slot.
+
+        The original #58753 contract pinned the summary itself to
+        role="user". The #100818 recovery supersedes that mechanism: the
+        summary becomes the assistant-role handoff and the swallowed task
+        prompt is re-appended as the real user turn — a strictly stronger
+        shape (a genuine instruction to act on, instead of a REFERENCE
+        ONLY summary the model is told not to answer)."""
         c = compressor
         c.compression_count = 1  # protect_first_n decays -> no head
         messages = [{"role": "user", "content": "work kanban task 42"}]
@@ -220,7 +228,27 @@ class TestForcedUserGuardsStillWin:
 
         rows = _summary_rows(out)
         assert len(rows) == 1
-        assert rows[0].get("role") == "user"
+        # #100818: the summary row is now the assistant-role handoff that
+        # follows the recovered live prompt…
+        assert rows[0].get("role") == "assistant"
+        # …and the recovered task prompt OPENS the visible sequence as the
+        # user turn (strict templates require user-first; the backend's
+        # "at least one user query" requirement is satisfied by a genuine
+        # instruction, not a summary in a transport slot).
+        first_visible = next(
+            (_template_visible_role(m) for m in out if _template_visible_role(m)),
+            None,
+        )
+        assert first_visible == "user", (
+            "recovered task prompt must open the visible sequence (#100818)"
+        )
+        user_rows = [
+            m for m in out
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ]
+        assert any(
+            m.get("content") == "work kanban task 42" for m in user_rows
+        ), "recovered task prompt must be the live user turn (#100818)"
         assert _mistral_alternation_ok(out)
 
     def test_no_literal_consecutive_user_roles(self, compressor):

@@ -5730,6 +5730,32 @@ This compaction should PRIORITISE preserving all information related to the focu
         return False
 
     @classmethod
+    def _latest_real_user_turn_text(cls, messages: List[Dict[str, Any]]) -> str:
+        """Extract the text of the newest user-authored turn in *messages*.
+
+        Companion to :func:`_transcript_has_real_user_turn`: same synthetic-row
+        exclusion (compaction summaries in ``role="user"`` transport slots,
+        recovery nudges, continuation markers), newest-first scan so the
+        ACTIVE task — not an older ask already fulfilled — is what comes back.
+        Returns ``""`` when no real user turn exists.
+
+        Used by the #100818 recovery: when compaction swallows the only user
+        message (a cron/bot run whose single job prompt fell inside the
+        compressed window), this is the exact prompt that must be re-appended
+        after the summary so the run delivers its work instead of obeying the
+        handoff's "do nothing" clause.
+        """
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            if cls._is_synthetic_compression_user_turn(message):
+                continue
+            text = _content_text_for_contains(message.get("content"))
+            if text.strip():
+                return text.strip()
+        return ""
+
+    @classmethod
     def _is_synthetic_compression_user_turn(cls, message: Any) -> bool:
         """Recognize internal user-role rows after SessionDB projection.
 
@@ -8342,14 +8368,57 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
         if not _merge_summary_into_tail:
-            compressed.append({
-                "role": summary_role,
-                "content": summary,
-                COMPRESSED_SUMMARY_METADATA_KEY: True,
-                COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
-                    self._summary_has_user_turn
-                ),
-            })
+            # ── #100818 recovery: re-append the live task prompt. ────────
+            # The zero-user guard above made the summary itself role="user"
+            # so the request is shape-valid — but the summary's preamble
+            # tells the model "Do NOT answer… If no user message appears
+            # AFTER this summary, do nothing". In an interactive session a
+            # follow-up message will arrive; in a cron/bot run the swallowed
+            # job prompt was the ONLY user message, so the model correctly
+            # obeys and answers nothing — frequently the literal [SILENT]
+            # sentinel — and the scheduler records a successful, empty
+            # delivery. Re-append the newest real user turn from the
+            # compressed window as a fresh user message AFTER the summary:
+            # the summary stays reference material, and the model has a
+            # live instruction to act on.
+            _recovered_task = ""
+            if _force_user_leading:
+                _recovered_task = self._latest_real_user_turn_text(
+                    turns_to_summarize
+                )
+            if _recovered_task:
+                # #100818: re-append the swallowed live task prompt so the
+                # run acts on it instead of obeying the summary's "do
+                # nothing" clause. Order: the recovered prompt OPENS as the
+                # user turn (strict templates require the visible sequence
+                # to start with user — test_summary_role_template_alternation's
+                # Mistral replay), and the summary follows as the
+                # assistant-role handoff providing context for it. Emitting
+                # [assistant(summary), user(task)] or [user(summary),
+                # user(task)] both break alternation; [user(task),
+                # assistant(summary)] is valid AND puts the live
+                # instruction first, which is what the model should act on.
+                compressed.append({
+                    "role": "user",
+                    "content": _recovered_task,
+                })
+                compressed.append({
+                    "role": "assistant",
+                    "content": summary,
+                    COMPRESSED_SUMMARY_METADATA_KEY: True,
+                    COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
+                        self._summary_has_user_turn
+                    ),
+                })
+            else:
+                compressed.append({
+                    "role": summary_role,
+                    "content": summary,
+                    COMPRESSED_SUMMARY_METADATA_KEY: True,
+                    COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
+                        self._summary_has_user_turn
+                    ),
+                })
 
         # Default merge target: literal tail index 0. For an ordinary
         # alternation collision the summary only has to stay *invisible* to
