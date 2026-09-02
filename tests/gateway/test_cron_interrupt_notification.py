@@ -13,6 +13,8 @@ adapters are still connected — the same window
 saw cron work because cron runs outside ``_running_agents`` (#60432).
 """
 
+import concurrent.futures
+import time
 from unittest.mock import patch
 
 import pytest
@@ -26,9 +28,15 @@ def _reset_cron_running_set():
     import cron.scheduler as sched
 
     sched._running_job_ids.clear()
+    sched._running_since.clear()
+    sched._running_futures.clear()
+    sched._queued_dispatches.clear()
     sched._interrupted_job_ids.clear()
     yield
     sched._running_job_ids.clear()
+    sched._running_since.clear()
+    sched._running_futures.clear()
+    sched._queued_dispatches.clear()
     sched._interrupted_job_ids.clear()
 
 
@@ -194,6 +202,47 @@ class TestNotifyInterruptedCronJobs:
 
 
 class TestShutdownDeliversNoticeBeforeDisconnect:
+    @pytest.mark.asyncio
+    async def test_queued_recurring_tick_is_deferred_without_interrupt_notice(
+        self, monkeypatch
+    ):
+        import cron.scheduler as sched
+        import tools.browser_tool as _bt
+        import tools.process_registry as _pr
+        import tools.terminal_tool as _tt
+
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 0.01
+        runner._cron_drain_timeout = 0.01
+        queued = concurrent.futures.Future()
+        job_id = "queued-recurring"
+        sched._running_job_ids.add(job_id)
+        sched._running_since[job_id] = time.time()
+        sched._running_futures[job_id] = queued
+        sched._queued_dispatches[job_id] = {
+            "future": queued,
+            "execution_id": None,
+            "job": {
+                "id": job_id,
+                "name": "quiet-monitor",
+                "schedule": {"kind": "interval", "minutes": 10},
+            },
+            "context": None,
+        }
+
+        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 0)
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+
+        with patch("gateway.status.remove_pid_file"), \
+             patch("gateway.status.write_runtime_status"), \
+             patch("cron.scheduler.mark_job_run"):
+            await runner.stop()
+
+        assert queued.cancelled()
+        assert job_id not in sched.get_running_job_ids()
+        assert adapter.sent == []
+
     @pytest.mark.asyncio
     async def test_notice_is_sent_while_the_adapter_is_still_connected(self, monkeypatch):
         """The whole point is ordering: a notice sent after teardown is lost,

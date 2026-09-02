@@ -783,6 +783,14 @@ _running_lock = threading.Lock()
 _running_since: dict = {}
 _running_futures: dict = {}
 
+# Dispatches submitted to an executor but not yet started.  The gateway
+# shutdown path cancels these before it marks genuinely running jobs
+# interrupted: a queued tick has no tool subprocess to kill and must not emit
+# an interrupted-run notification.  Keep the copied Context with the record so
+# one-shot claim cleanup and execution-ledger finalization run against the same
+# profile-local store that created the attempt.
+_queued_dispatches: dict[str, dict] = {}
+
 # Sentinel installed in ``_running_futures`` at claim time, before
 # ``pool.submit`` has returned a real future.  This closes the race the
 # stale sweep previously had: a sweep landing between the claim critical
@@ -902,6 +910,73 @@ def release_running_job(job_id: str) -> None:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+        _queued_dispatches.pop(job_id, None)
+
+
+def cancel_queued_jobs_for_shutdown(reason: str) -> list[str]:
+    """Cancel executor-queued ticks and restore them to schedulable state.
+
+    ``Future.cancel()`` is the race authority: it succeeds only while the
+    worker has not started.  Started workers stay registered and continue down
+    the existing interruption + owner-notification path.  Cancelled recurring
+    jobs retain their due time; cancelled one-shots additionally have the
+    pre-dispatch ``run_claim`` cleared so the replacement gateway can fire them
+    immediately instead of waiting for the claim TTL.
+    """
+    cancelled: list[tuple[str, dict]] = []
+    with _running_lock:
+        for job_id, dispatch in list(_queued_dispatches.items()):
+            future = dispatch.get("future")
+            if future is _FUTURE_PENDING or future is None:
+                continue
+            if not future.cancel():
+                continue
+            cancelled.append((job_id, dispatch))
+            _queued_dispatches.pop(job_id, None)
+            _running_job_ids.discard(job_id)
+            _running_since.pop(job_id, None)
+            _running_futures.pop(job_id, None)
+
+    for job_id, dispatch in cancelled:
+        def _finalize_cancelled() -> None:
+            execution_id = dispatch.get("execution_id")
+            if execution_id:
+                try:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error=f"Deferred before dispatch: {reason}",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not finalize deferred execution for job '%s': %s",
+                        job_id,
+                        exc,
+                    )
+            job = dispatch.get("job") or {}
+            schedule = job.get("schedule")
+            if isinstance(schedule, dict) and schedule.get("kind") == "once":
+                try:
+                    clear_run_claim(job_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not clear run_claim for queued one-shot '%s' "
+                        "during shutdown: %s (claim will expire at TTL)",
+                        job.get("name", job_id),
+                        exc,
+                    )
+
+        context = dispatch.get("context")
+        if context is not None:
+            context.run(_finalize_cancelled)
+        else:
+            _finalize_cancelled()
+        logger.info(
+            "Deferred queued cron job '%s' before gateway shutdown",
+            (dispatch.get("job") or {}).get("name", job_id),
+        )
+
+    return [job_id for job_id, _dispatch in cancelled]
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -8466,13 +8541,32 @@ def tick(
                 return None
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
+                # Once the executor starts this callback it is no longer safe
+                # for shutdown reconciliation to cancel it as queued.
+                with _running_lock:
+                    _queued_dispatches.pop(j["id"], None)
                 try:
                     return ctx.run(_process_job, j)
                 finally:
                     release_running_job(j["id"])
 
             try:
-                fut = pool.submit(_run_and_release)
+                # Publish the real Future under the same lock that exposes the
+                # queued record.  Otherwise shutdown can observe
+                # _FUTURE_PENDING after submit has enqueued the callback but
+                # before this thread records the cancellable Future, skip it,
+                # and misclassify the tick as interrupted.
+                with _running_lock:
+                    _queued_dispatches[job_id] = {
+                        "future": _FUTURE_PENDING,
+                        "execution_id": execution["id"],
+                        "job": dispatched_job,
+                        "context": _ctx,
+                    }
+                    fut = pool.submit(_run_and_release)
+                    if job_id in _running_job_ids:
+                        _running_futures[job_id] = fut
+                        _queued_dispatches[job_id]["future"] = fut
             except Exception as submit_err:
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
@@ -8496,11 +8590,6 @@ def tick(
                 )
                 return None
 
-            # Record the owning future so the stale sweep can distinguish
-            # "still executing" from "claim leaked before/after the future".
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    _running_futures[job_id] = fut
             return fut
 
 

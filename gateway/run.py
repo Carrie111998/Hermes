@@ -16340,6 +16340,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 one subsystem's failure doesn't block the rest.
                 """
                 try:
+                    # Jobs waiting in the cron executor have not started and
+                    # own no tool subprocess. Cancel them first so the broad
+                    # interruption sweep below cannot turn a routine restart
+                    # into a false user-visible failure. One-shots are restored
+                    # to due state by clearing their pre-dispatch run claim.
+                    from cron.scheduler import cancel_queued_jobs_for_shutdown
+
+                    _deferred = cancel_queued_jobs_for_shutdown(
+                        f"gateway shutdown ({phase})"
+                    )
+                    if _deferred:
+                        logger.info(
+                            "Shutdown (%s): deferred %d queued cron job(s): %s",
+                            phase,
+                            len(_deferred),
+                            ", ".join(_deferred),
+                        )
+                except Exception as _e:
+                    logger.debug(
+                        "cancel_queued_jobs_for_shutdown (%s) error: %s", phase, _e
+                    )
+                try:
                     from tools.process_registry import process_registry
                     _killed = process_registry.kill_all()
                     if _killed:
