@@ -411,7 +411,22 @@ def generate_title(
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
-        content = response.choices[0].message.content or ""
+        _message = response.choices[0].message
+        content = getattr(_message, "content", None) or ""
+        if not content.strip():
+            # Reasoning models (R1-style APIs, OpenRouter :thinking variants)
+            # sometimes leave ``content`` empty and put everything — including
+            # the requested title JSON — in ``reasoning_content``. Without this
+            # fallback every auto-title attempt on such a backend silently
+            # fails and the session stays untitled.
+            reasoning_text = getattr(_message, "reasoning_content", None) or ""
+            if isinstance(_message, dict):
+                content = _message.get("content") or ""
+                if not content.strip():
+                    reasoning_text = _message.get("reasoning_content") or ""
+            if reasoning_text.strip():
+                logger.debug("title: content empty; falling back to reasoning_content")
+                content = reasoning_text
         title = _clean_title(_extract_title_text(content))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
