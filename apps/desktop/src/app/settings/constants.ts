@@ -1,6 +1,7 @@
 import {
   Box,
   Brain,
+  Globe,
   type IconComponent,
   Lock,
   MessageCircle,
@@ -373,131 +374,132 @@ export const FREE_INPUT_KEYS = new Set([
 ])
 
 export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
-  model: 'Modelo Padrão',
-  modelContextLength: 'Janela de Contexto',
-  fallbackProviders: 'Modelos de Fallback',
-  toolsets: 'Ferramentas Habilitadas',
-  timezone: 'Fuso Horário',
+  model: 'Default Model',
+  modelContextLength: 'Context Window',
+  fallbackProviders: 'Fallback Models',
+  toolsets: 'Enabled Toolsets',
+  timezone: 'Timezone',
   display: {
-    personality: 'Personalidade',
-    showReasoning: 'Blocos de Raciocínio'
+    personality: 'Personality',
+    showReasoning: 'Reasoning Blocks'
   },
   desktop: {
-    repoScanEnabled: 'Descoberta Automática de Repositório',
-    repoScanRoots: 'Raízes de Descoberta',
-    repoScanExcludePaths: 'Caminhos Excluídos'
+    repoScanEnabled: 'Automatic Repository Discovery',
+    repoScanRoots: 'Repository Discovery Roots',
+    repoScanExcludePaths: 'Excluded Repository Paths'
   },
   agent: {
-    maxTurns: 'Passos Máximos do Agente',
-    imageInputMode: 'Anexos de Imagem',
-    apiMaxRetries: 'Tentativas de API',
-    serviceTier: 'Nível de Serviço',
-    toolUseEnforcement: 'Imposição de Uso de Ferramentas'
+    maxTurns: 'Max Agent Steps',
+    imageInputMode: 'Image Attachments',
+    apiMaxRetries: 'API Retries',
+    serviceTier: 'Service Tier',
+    toolUseEnforcement: 'Tool-Use Enforcement'
   },
   terminal: {
-    cwd: 'Diretório de Trabalho',
-    backend: 'Backend de Execução',
-    timeout: 'Tempo Limite de Comando',
-    persistentShell: 'Shell Persistente',
-    envPassthrough: 'Repasse de Ambiente',
-    dockerImage: 'Imagem Docker',
-    singularityImage: 'Imagem Singularity',
-    modalImage: 'Imagem Modal',
-    daytonaImage: 'Imagem Daytona'
+    cwd: 'Working Directory',
+    backend: 'Execution Backend',
+    timeout: 'Command Timeout',
+    persistentShell: 'Persistent Shell',
+    envPassthrough: 'Environment Passthrough',
+    dockerImage: 'Docker Image',
+    singularityImage: 'Singularity Image',
+    modalImage: 'Modal Image',
+    daytonaImage: 'Daytona Image'
   },
-  fileReadMaxChars: 'Limite de Leitura de Arquivo',
+  fileReadMaxChars: 'File Read Limit',
   toolOutput: {
-    maxBytes: 'Limite de Saída do Terminal',
-    maxLines: 'Limite de Página de Arquivo',
-    maxLineLength: 'Limite de Tamanho da Linha'
+    maxBytes: 'Terminal Output Limit',
+    maxLines: 'File Page Limit',
+    maxLineLength: 'Line Length Limit'
   },
   codeExecution: {
-    mode: 'Modo de Execução de Código'
+    mode: 'Code Execution Mode'
   },
   approvals: {
-    mode: 'Modo de Aprovação',
-    timeout: 'Tempo Limite de Aprovação',
-    mcpReloadConfirm: 'Confirmar Recarregamento de MCP'
+    mode: 'Approval Mode',
+    timeout: 'Approval Timeout',
+    mcpReloadConfirm: 'Confirm MCP Reloads'
   },
-  commandAllowlist: 'Comandos Permitidos',
+  commandAllowlist: 'Command Allowlist',
   security: {
-    redactSecrets: 'Ocultar Segredos',
-    allowPrivateUrls: 'Permitir URLs Privadas'
+    redactSecrets: 'Redact Secrets',
+    allowPrivateUrls: 'Allow Private URLs'
   },
   browser: {
-    allowPrivateUrls: 'URLs Privadas no Navegador',
-    autoLocalForPrivateUrls: 'Navegador Local para URLs Privadas'
+    allowPrivateUrls: 'Browser Private URLs',
+    autoLocalForPrivateUrls: 'Local Browser For Private URLs',
+    useRealProfile: 'Use My Real Browser Profile'
   },
   checkpoints: {
-    enabled: 'Checkpoints de Arquivos',
-    maxSnapshots: 'Limite de Checkpoints'
+    enabled: 'File Checkpoints',
+    maxSnapshots: 'Checkpoint Limit'
   },
   voice: {
-    recordKey: 'Atalho de Voz',
-    maxRecordingSeconds: 'Tempo Máximo de Gravação',
-    autoTts: 'Ler Respostas em Voz Alta'
+    recordKey: 'Voice Shortcut',
+    maxRecordingSeconds: 'Max Recording Length',
+    autoTts: 'Read Responses Aloud'
   },
   stt: {
-    enabled: 'Voz para Texto (STT)',
-    echoTranscripts: 'Ecoar Transcrições',
-    provider: 'Provedor de STT',
+    enabled: 'Speech To Text',
+    echoTranscripts: 'Echo Transcripts',
+    provider: 'Speech-To-Text Provider',
     local: {
-      model: 'Modelo de Transcrição Local',
-      language: 'Idioma de Transcrição'
+      model: 'Local Transcription Model',
+      language: 'Transcription Language'
     },
     openai: {
-      model: 'Modelo STT OpenAI'
+      model: 'OpenAI STT Model'
     },
     groq: {
-      model: 'Modelo STT Groq'
+      model: 'Groq STT Model'
     },
     mistral: {
-      model: 'Modelo STT Mistral'
+      model: 'Mistral STT Model'
     },
     elevenlabs: {
-      modelId: 'Modelo STT ElevenLabs',
-      languageCode: 'Idioma ElevenLabs',
-      tagAudioEvents: 'Marcar Eventos de Áudio',
-      diarize: 'Diarização de Locutor'
+      modelId: 'ElevenLabs STT Model',
+      languageCode: 'ElevenLabs Language',
+      tagAudioEvents: 'Tag Audio Events',
+      diarize: 'Speaker Diarization'
     }
   },
   tts: {
-    provider: 'Provedor de Texto para Voz (TTS)',
+    provider: 'Text-To-Speech Provider',
     edge: {
-      voice: 'Voz Edge'
+      voice: 'Edge Voice'
     },
     openai: {
-      model: 'Modelo TTS OpenAI',
-      voice: 'Voz OpenAI'
+      model: 'OpenAI TTS Model',
+      voice: 'OpenAI Voice'
     },
     elevenlabs: {
-      voiceId: 'Voz ElevenLabs',
-      modelId: 'Modelo ElevenLabs'
+      voiceId: 'ElevenLabs Voice',
+      modelId: 'ElevenLabs Model'
     },
     xai: {
-      voiceId: 'Voz xAI (Grok)',
-      language: 'Idioma xAI',
-      speed: 'Velocidade de Reprodução xAI',
-      autoSpeechTags: 'Tags Automáticas de Fala xAI',
-      optimizeStreamingLatency: 'Otimização de Latência xAI',
-      sampleRate: 'Taxa de Amostragem xAI',
-      bitRate: 'Taxa de Bits xAI'
+      voiceId: 'xAI (Grok) Voice',
+      language: 'xAI Language',
+      speed: 'xAI Playback Speed',
+      autoSpeechTags: 'xAI Auto Speech Tags',
+      optimizeStreamingLatency: 'xAI Streaming Latency Optimization',
+      sampleRate: 'xAI Sample Rate',
+      bitRate: 'xAI Bit Rate'
     },
     minimax: {
-      model: 'Modelo TTS MiniMax',
-      voiceId: 'Voz MiniMax'
+      model: 'MiniMax TTS Model',
+      voiceId: 'MiniMax Voice'
     },
     mistral: {
-      model: 'Modelo TTS Mistral',
-      voiceId: 'Voz Mistral'
+      model: 'Mistral TTS Model',
+      voiceId: 'Mistral Voice'
     },
     gemini: {
-      model: 'Modelo TTS Gemini',
-      voice: 'Voz Gemini'
+      model: 'Gemini TTS Model',
+      voice: 'Gemini Voice'
     },
     neutts: {
-      model: 'Modelo NeuTTS',
-      device: 'Dispositivo NeuTTS'
+      model: 'NeuTTS Model',
+      device: 'NeuTTS Device'
     },
     kittentts: {
       model: 'KittenTTS Model',
@@ -512,20 +514,20 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     }
   },
   memory: {
-    memoryEnabled: 'Memória Persistente',
-    userProfileEnabled: 'Perfil do Usuário',
-    memoryCharLimit: 'Orçamento de Memória',
-    userCharLimit: 'Orçamento do Perfil',
-    provider: 'Provedor de Memória'
+    memoryEnabled: 'Persistent Memory',
+    userProfileEnabled: 'User Profile',
+    memoryCharLimit: 'Memory Budget',
+    userCharLimit: 'Profile Budget',
+    provider: 'Memory Provider'
   },
   context: {
-    engine: 'Motor de Contexto'
+    engine: 'Context Engine'
   },
   compression: {
-    enabled: 'Compressão Automática',
-    threshold: 'Limite para Compressão',
-    targetRatio: 'Alvo da Compressão',
-    protectLastN: 'Mensagens Recentes Protegidas'
+    enabled: 'Auto-Compression',
+    threshold: 'Compression Threshold',
+    targetRatio: 'Compression Target',
+    protectLastN: 'Protected Recent Messages'
   },
   delegation: {
     model: 'Subagent Model',
@@ -545,51 +547,55 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   modelContextLength: "Leave at 0 to use the selected model's detected context window.",
   fallbackProviders: 'Backup provider:model entries to try if the default model fails.',
   display: {
-    personality: 'Estilo padrão do assistente para novas sessões.',
-    showReasoning: 'Mostra seções de raciocínio quando o backend as fornecer.'
+    personality: 'Default assistant style for new sessions.',
+    showReasoning: 'Show reasoning sections when the backend provides them.'
   },
   desktop: {
-    repoScanEnabled: 'Verifica pastas locais por repositórios Git para mostrar em Projetos.',
-    repoScanRoots: 'Pastas para verificar. Deixe em branco para verificar a pasta do usuário.',
-    repoScanExcludePaths: 'Pastas ignoradas durante a descoberta de repositórios.'
+    repoScanEnabled: 'Scan local folders for Git repositories to show in Projects.',
+    repoScanRoots: 'Folders to scan. Leave empty to scan your home directory.',
+    repoScanExcludePaths: 'Folders and their descendants to skip during repository discovery.'
   },
-  timezone: 'Identificador de fuso horário IANA. Vazio usa o do sistema.',
+  timezone: 'IANA timezone identifier. Blank uses the system timezone.',
+  browser: {
+    useRealProfile:
+      "Local browsing uses your real logins. Hermes copies your default browser's profile (cookies, logins, preferences) into a managed snapshot and drives it with its packaged Chromium — your live profile is never opened directly, and the copy is refreshed from it on each run. Also lets the agent open a local real-profile session on request even when a cloud browser backend is configured. Only Chromium browsers (Chrome, Edge, Brave, Brave Origin, Chromium) are supported; a non-Chromium default fails with a clear message. Off by default."
+  },
   agent: {
     imageInputMode: 'Controls how image attachments are sent to the model.',
     maxTurns: 'Upper bound for tool-calling turns before Hermes stops a run.'
   },
   terminal: {
-    cwd: 'Pasta padrão do projeto para ferramentas e terminal.',
-    persistentShell: 'Mantém o estado do shell entre os comandos, quando suportado.',
-    envPassthrough: 'Variáveis de ambiente repassadas para a execução de ferramentas.',
+    cwd: 'Default project folder for tool and terminal work.',
+    persistentShell: 'Keep shell state between commands when the backend supports it.',
+    envPassthrough: 'Environment variables to pass into tool execution.',
     dockerImage: 'Container image used when the execution backend is Docker.',
     singularityImage: 'Image used when the execution backend is Singularity.',
     modalImage: 'Image used when the execution backend is Modal.',
     daytonaImage: 'Image used when the execution backend is Daytona.'
   },
   codeExecution: {
-    mode: 'Quão restrita a execução de código é ao projeto atual.'
+    mode: 'How strictly code execution is scoped to the current project.'
   },
-  fileReadMaxChars: 'Máximo de caracteres que o Hermes pode ler em uma solicitação de arquivo.',
+  fileReadMaxChars: 'Maximum characters Hermes can read from one file request.',
   approvals: {
-    mode: 'Como o Hermes lida com comandos que precisam de aprovação explícita.',
-    timeout: 'Quanto tempo o aviso aguarda antes de expirar.'
+    mode: 'How Hermes handles commands that need explicit approval.',
+    timeout: 'How long approval prompts wait before timing out.'
   },
   security: {
-    redactSecrets: 'Oculta segredos detectados do conteúdo visível para o modelo, quando possível.'
+    redactSecrets: 'Hide detected secrets from model-visible content when possible.'
   },
   checkpoints: {
-    enabled: 'Cria snapshots para reversão antes de edições em arquivos.'
+    enabled: 'Create rollback snapshots before file edits.'
   },
   memory: {
-    memoryEnabled: 'Salva memórias duráveis que ajudam em sessões futuras.',
-    userProfileEnabled: 'Mantém um perfil compacto com as preferências do usuário.'
+    memoryEnabled: 'Save durable memories that can help future sessions.',
+    userProfileEnabled: 'Maintain a compact profile of user preferences.'
   },
   context: {
-    engine: 'Estratégia para conversas longas perto do limite de contexto.'
+    engine: 'Strategy for managing long conversations near the context limit.'
   },
   compression: {
-    enabled: 'Resume contexto antigo quando a conversa cresce.'
+    enabled: 'Summarize older context when conversations get large.'
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.'
@@ -667,10 +673,14 @@ export const SECTIONS: DesktopConfigSection[] = [
       'command_allowlist',
       'security.redact_secrets',
       'security.allow_private_urls',
-      'browser.allow_private_urls',
-      'browser.auto_local_for_private_urls',
       'checkpoints.enabled'
     ]
+  },
+  {
+    id: 'browser',
+    label: 'Browser',
+    icon: Globe,
+    keys: ['browser.use_real_profile', 'browser.allow_private_urls', 'browser.auto_local_for_private_urls']
   },
   {
     id: 'memory',
