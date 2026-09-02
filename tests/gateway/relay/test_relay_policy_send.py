@@ -28,7 +28,7 @@ def _clean_env(monkeypatch):
         "DISCORD_ALLOW_BOTS",
     ):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {}, raising=False)
+    monkeypatch.setattr(relay, "load_gateway_config_dict", lambda: {})
 
 
 # --------------------------------------------------------------------------
@@ -38,9 +38,9 @@ def _clean_env(monkeypatch):
 def test_projection_maps_require_mention_and_free_response(monkeypatch):
     monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
     monkeypatch.setattr(
-        "gateway.run._load_gateway_config",
+        relay,
+        "load_gateway_config_dict",
         lambda: {"discord": {"require_mention": True, "free_response_channels": ["c-support", "c-help"]}},
-        raising=False,
     )
     pol = relay.relay_relevance_policy()
     assert pol == {
@@ -58,9 +58,9 @@ def test_projection_declares_explicit_require_mention_false(monkeypatch):
     # operator configured to free-respond.
     monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
     monkeypatch.setattr(
-        "gateway.run._load_gateway_config",
+        relay,
+        "load_gateway_config_dict",
         lambda: {"discord": {"require_mention": False}},
-        raising=False,
     )
     pol = relay.relay_relevance_policy()
     assert pol == {
@@ -85,9 +85,9 @@ def _arm(monkeypatch, *, url="wss://connector.example/relay"):
 def test_send_posts_projected_policy_with_token(monkeypatch):
     _arm(monkeypatch)
     monkeypatch.setattr(
-        "gateway.run._load_gateway_config",
+        relay,
+        "load_gateway_config_dict",
         lambda: {"discord": {"require_mention": True, "free_response_channels": ["c-support"]}},
-        raising=False,
     )
     captured = {}
 
@@ -110,9 +110,9 @@ def test_send_skips_when_no_secret(monkeypatch):
     monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
     # no GATEWAY_RELAY_ID / SECRET
     monkeypatch.setattr(
-        "gateway.run._load_gateway_config",
+        relay,
+        "load_gateway_config_dict",
         lambda: {"discord": {"require_mention": True}},
-        raising=False,
     )
     called = {"n": 0}
     monkeypatch.setattr(relay, "_post_policy", lambda **k: called.__setitem__("n", called["n"] + 1) or 200)
@@ -123,9 +123,9 @@ def test_send_skips_when_no_secret(monkeypatch):
 def test_send_fail_soft_on_transport_error(monkeypatch):
     _arm(monkeypatch)
     monkeypatch.setattr(
-        "gateway.run._load_gateway_config",
+        relay,
+        "load_gateway_config_dict",
         lambda: {"discord": {"require_mention": True}},
-        raising=False,
     )
 
     def _boom(**kwargs):
