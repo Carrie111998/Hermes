@@ -180,6 +180,24 @@ class TestResolveOrigin:
 
 
 class TestResolveDeliveryTarget:
+    def test_origin_delivery_preserves_user_id(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "77058666",
+                "user_id": "77058666",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "telegram",
+            "chat_id": "77058666",
+            "thread_id": None,
+            "user_id": "77058666",
+            "_resolved_from": "origin",
+        }
+
     def test_origin_delivery_preserves_thread_id(self):
         job = {
             "deliver": "origin",
@@ -1019,6 +1037,80 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        assert fake_db.close.call_count == 2
+
+    def test_run_job_exposes_origin_user_id_and_does_not_leak_to_next_job(
+        self, tmp_path, monkeypatch
+    ):
+        jobs = [
+            {
+                "id": "origin-job",
+                "name": "origin",
+                "prompt": "hello",
+                "deliver": "origin",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1001",
+                    "user_id": "555",
+                },
+            },
+            {
+                "id": "explicit-target-job",
+                "name": "explicit-target",
+                "prompt": "hello again",
+                "deliver": "telegram:-2002",
+            },
+        ]
+        fake_db = MagicMock()
+        seen = []
+
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_USER_ID", raising=False)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+
+                seen.append(
+                    {
+                        "platform": get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None,
+                        "chat_id": get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None,
+                        "user_id": get_session_env("HERMES_CRON_AUTO_DELIVER_USER_ID") or None,
+                    }
+                )
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            for job in jobs:
+                success, output, final_response, error = run_job(job)
+                assert success is True
+                assert error is None
+                assert final_response == "ok"
+                assert "ok" in output
+
+        assert seen == [
+            {"platform": "telegram", "chat_id": "-1001", "user_id": "555"},
+            {"platform": "telegram", "chat_id": "-2002", "user_id": None},
+        ]
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_USER_ID") is None
         assert fake_db.close.call_count == 2
 
 
