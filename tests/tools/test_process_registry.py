@@ -313,6 +313,85 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
     assert moved == ["proc_reader_live"]
 
 
+def test_reader_loop_force_terminates_and_reaps_after_wait_timeout(
+    registry, monkeypatch, caplog
+):
+    class _FakeStdout:
+        def read(self, _n):
+            return ""
+
+    class _FakeProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self):
+            self.stdout = _FakeStdout()
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired("child", timeout)
+            self.returncode = -9
+            return self.returncode
+
+    session = _make_session(sid="proc_wait_timeout")
+    session.process = _FakeProcess()
+    registry._running[session.id] = session
+    terminated = []
+    monkeypatch.setattr(
+        registry,
+        "_terminate_host_pid",
+        lambda pid, expected_start: terminated.append((pid, expected_start)),
+    )
+
+    registry._reader_loop(session)
+
+    assert session.process.wait_calls == 2
+    assert terminated == [(4321, None)]
+    assert session.exited is True
+    assert session.exit_code == -9
+    assert session.completion_reason == "exited"
+    assert session.id not in registry._running
+    assert session.id in registry._finished
+    assert "force-terminating" in caplog.text
+
+
+def test_reader_loop_keeps_session_running_when_forced_reap_fails(
+    registry, monkeypatch, caplog
+):
+    class _FakeStdout:
+        def read(self, _n):
+            return ""
+
+    class _FakeProcess:
+        pid = 4321
+        returncode = None
+        stdout = _FakeStdout()
+
+        def wait(self, timeout=None):
+            raise RuntimeError("wait handle unavailable")
+
+    session = _make_session(sid="proc_wait_failed")
+    session.process = _FakeProcess()
+    registry._running[session.id] = session
+    terminated = []
+    monkeypatch.setattr(
+        registry,
+        "_terminate_host_pid",
+        lambda pid, expected_start: terminated.append((pid, expected_start)),
+    )
+
+    registry._reader_loop(session)
+
+    assert terminated == [(4321, None)]
+    assert session.exited is False
+    assert session.exit_code is None
+    assert session.id in registry._running
+    assert session.id not in registry._finished
+    assert "could not be reaped after forced termination" in caplog.text
+
+
 # =========================================================================
 # Incremental UTF-8 decoding across chunk boundaries
 # (ported from openclaw/openclaw#112325)
@@ -412,6 +491,41 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer
+
+
+def test_pty_reader_loop_force_terminates_and_reaps_after_wait_failure(registry):
+    class _FakePty:
+        exitstatus = None
+
+        def __init__(self):
+            self.wait_calls = 0
+            self.terminate_calls = []
+
+        def isalive(self):
+            return False
+
+        def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("PTY wait failed")
+            self.exitstatus = -9
+            return self.exitstatus
+
+        def terminate(self, force=False):
+            self.terminate_calls.append(force)
+
+    session = _make_session(sid="proc_pty_wait_failed")
+    session._pty = _FakePty()
+    registry._running[session.id] = session
+
+    registry._pty_reader_loop(session)
+
+    assert session._pty.wait_calls == 2
+    assert session._pty.terminate_calls == [True]
+    assert session.exited is True
+    assert session.exit_code == -9
+    assert session.id not in registry._running
+    assert session.id in registry._finished
 
 
 # =========================================================================

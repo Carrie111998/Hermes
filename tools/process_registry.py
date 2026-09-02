@@ -1511,16 +1511,79 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            self._reap_and_finish_local_process(
+                session,
+                wait=lambda: session.process.wait(timeout=5),
+                force_terminate=lambda: self._terminate_host_pid(
+                    session.process.pid, session.host_start_time
+                ),
+                exit_code=lambda: session.process.returncode,
+                kind="pipe",
+            )
+
+    def _reap_and_finish_local_process(
+        self,
+        session: ProcessSession,
+        *,
+        wait,
+        force_terminate,
+        exit_code,
+        kind: str,
+    ) -> bool:
+        """Reap a local child before publishing its terminal state.
+
+        Reader completion does not prove that the child was reaped. If the
+        first wait fails, force-terminate the owned process tree and wait once
+        more. A child that still cannot be reaped remains in ``_running`` with
+        its runtime handle intact instead of being reported as a clean exit.
+        """
+        try:
+            wait()
+        except Exception as first_error:
+            if isinstance(first_error, subprocess.TimeoutExpired):
+                logger.warning(
+                    "%s process %s did not exit during wait; force-terminating: %s",
+                    kind,
+                    session.id,
+                    first_error,
+                )
+            else:
+                logger.error(
+                    "%s process %s wait failed; force-terminating: %s",
+                    kind,
+                    session.id,
+                    first_error,
+                )
             try:
-                session.process.wait(timeout=5)
-            except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+                force_terminate()
+                if session.systemd_unit:
+                    _stop_systemd_unit(session.systemd_unit)
+                wait()
+            except Exception as reap_error:
+                logger.error(
+                    "%s process %s could not be reaped after forced termination: %s",
+                    kind,
+                    session.id,
+                    reap_error,
+                )
+                return False
+
+        with session._lock:
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
+                try:
+                    session.exit_code = exit_code()
+                except Exception as status_error:
+                    logger.error(
+                        "%s process %s was reaped but its exit status is unavailable: %s",
+                        kind,
+                        session.id,
+                        status_error,
+                    )
+                    session.exit_code = -1
                 session.completion_reason = "exited"
-            self._move_to_finished(session)
+        self._move_to_finished(session)
+        return True
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -1620,16 +1683,13 @@ class ProcessRegistry:
         except Exception:
             pass
 
-        # Process exited
-        try:
-            pty.wait()
-        except Exception as e:
-            logger.debug("PTY wait timed out or failed: %s", e)
-        session.exited = True
-        if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
-        self._move_to_finished(session)
+        self._reap_and_finish_local_process(
+            session,
+            wait=pty.wait,
+            force_terminate=lambda: pty.terminate(force=True),
+            exit_code=lambda: pty.exitstatus if hasattr(pty, "exitstatus") else -1,
+            kind="PTY",
+        )
 
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
