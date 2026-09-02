@@ -2113,6 +2113,7 @@ def _build_child_agent(
                 max_iterations=max_iterations,
 
                 reasoning_config=child_reasoning,
+                service_tier=getattr(parent_agent, "service_tier", None),
                 prefill_messages=getattr(parent_agent, "prefill_messages", None),
                 fallback_model=parent_fallback,
                 enabled_toolsets=child_toolsets,
