@@ -28002,19 +28002,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         scope_id = str(evt.get("scope_id") or "").strip() or None
         if scope_id is None and chat_type not in ("dm", "thread"):
-            # Reconstructed (non-persisted) source for a scoped chat with no
-            # scope discriminator: on a relay-fronted deployment the
-            # connector's fail-closed tenant guard may decline the reply
-            # unless user_id resolves it (resolveByUser). Don't fail here —
-            # DMs and author-bound scoped chats still route, and native
-            # adapters don't need scope_id — but say so, so a post-restart
-            # egress decline isn't silent.
-            logger.warning(
-                "Synthetic event source for %s chat=%s (%s) reconstructed "
-                "without scope_id; scoped relay egress may be declined by "
-                "the connector's tenant guard (user_id fallback only).",
-                platform_name, chat_id, chat_type,
+            # Only Relay egress needs a tenant scope. Native adapters route on
+            # their own authenticated platform connection, so warning for them
+            # is both noisy and misleading. Reuse the canonical resolver to
+            # preserve its native-first / Relay-fronting contract.
+            transport = resolve_delivery_transport(
+                platform,
+                self.config,
+                self.adapters,
             )
+            if transport is not None and transport.is_relay:
+                logger.warning(
+                    "Synthetic event source for %s chat=%s (%s) reconstructed "
+                    "without scope_id; scoped relay egress may be declined by "
+                    "the connector's tenant guard (user_id fallback only).",
+                    platform_name, chat_id, chat_type,
+                )
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
