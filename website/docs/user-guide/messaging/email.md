@@ -122,6 +122,35 @@ Replies are sent via SMTP with proper email threading:
 - **Message-ID** generated with the agent's domain
 - Responses are sent as plain text (UTF-8)
 
+### Inbound-only mode
+
+Use this supported `config.yaml` setting when Email is an authenticated input
+feed and Hermes must never automatically reply to its sender:
+
+```yaml
+platforms:
+  email:
+    extra:
+      read_only: true
+```
+
+Inbound-only mode continues to create normal Email-source sessions. The full
+agent work, final answer, and tool activity remain in the session for Hermes
+Desktop. The adapter suppresses every task reply before SMTP, including interim
+messages, progress, final answers, approval prompts, media follow-ups, and
+delivery retries. Each suppression creates an audit log entry with recipient,
+subject, session, and delivery kind. It does not log the body or credentials.
+
+`display.platforms.email` can explicitly opt into a display setting, but global
+display verbosity does not override Email's minimal defaults. This avoids a
+global progress setting causing a permanent-email flood.
+
+Cron and report deliveries are different. They use the standalone Email sender,
+which remains an explicit proactive-send route and is not suppressed by
+`read_only`. Configure a cron Email target only when you intentionally want
+proactive mail. This preserves existing cron workflows and keeps inbound-only
+focused on replies from Email-originated sessions.
+
 ### File Attachments
 
 The agent can send file attachments in replies. Include `MEDIA:/path/to/file` in the response and the file is attached to the outgoing email.

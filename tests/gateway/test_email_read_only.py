@@ -10,6 +10,7 @@ read-only mode, that the default (unset) still sends, and that all three
 adapter send entry points are covered.
 """
 import asyncio
+import logging
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -24,6 +25,20 @@ def _make_adapter(*, extra=None, env=None):
 
 
 class TestEmailReadOnly(unittest.TestCase):
+    def test_read_only_blocks_the_shared_smtp_delivery_boundary(self):
+        """Even a future helper that reaches the shared SMTP sink cannot send."""
+        adapter = _make_adapter(extra={"read_only": True})
+        adapter._thread_context["user@example.com"] = {
+            "subject": "Private report",
+            "message_id": "<original@example.com>",
+        }
+
+        with patch("smtplib.SMTP") as smtp:
+            result = adapter._send_email("user@example.com", "do not disclose")
+
+        self.assertEqual(result, "read-only-suppressed")
+        smtp.assert_not_called()
+
     def test_read_only_via_extra_suppresses_send(self):
         adapter = _make_adapter(extra={"read_only": True})
         adapter._send_email = MagicMock(name="_send_email")
@@ -76,6 +91,64 @@ class TestEmailReadOnly(unittest.TestCase):
             )
         )
         adapter._send_email_with_attachments.assert_not_called()
+
+    def test_read_only_suppresses_a_noisy_100_step_run_and_every_notice_kind(self):
+        """The adapter is the hard egress boundary, not a display convention."""
+        adapter = _make_adapter(extra={"read_only": True})
+        adapter._send_email = MagicMock(name="smtp_delivery")
+
+        for step in range(100):
+            result = asyncio.run(
+                adapter.send(
+                    "user@example.com",
+                    f"interim commentary {step}",
+                    metadata={"session_id": "email-session-100"},
+                )
+            )
+            self.assertTrue(result.success)
+
+        for notice_kind in (
+            "iteration-budget",
+            "model-fallback",
+            "approval-status",
+            "attachment-follow-up",
+            "stop-closeout",
+            "delivery-ledger-retry",
+            "final-response",
+        ):
+            result = asyncio.run(
+                adapter.send(
+                    "user@example.com",
+                    f"{notice_kind} body",
+                    metadata={"session_id": "email-session-100", "delivery_kind": notice_kind},
+                )
+            )
+            self.assertTrue(result.success)
+
+        adapter._send_email.assert_not_called()
+
+    def test_suppression_audit_has_routing_metadata_but_no_body_or_secret(self):
+        adapter = _make_adapter(extra={"read_only": True})
+        adapter._thread_context["user@example.com"] = {
+            "subject": "Weekly report",
+            "message_id": "<original@example.com>",
+        }
+
+        with self.assertLogs("plugins.platforms.email.adapter", level=logging.INFO) as logs:
+            asyncio.run(
+                adapter.send(
+                    "user@example.com",
+                    "body which must never reach logs",
+                    metadata={"session_id": "email-session-42", "token": "secret-value"},
+                )
+            )
+
+        rendered = "\n".join(logs.output)
+        self.assertIn("recipient=user@example.com", rendered)
+        self.assertIn("subject=Weekly report", rendered)
+        self.assertIn("session=email-session-42", rendered)
+        self.assertNotIn("body which must never reach logs", rendered)
+        self.assertNotIn("secret-value", rendered)
 
 
 if __name__ == "__main__":
