@@ -161,3 +161,192 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+
+
+# --------------------------------------------------------------------------
+# Containment: triage tasks parked on a non-spawnable assignee (#62985)
+#
+# A task whose assignee names a control-plane lane rather than a Hermes
+# profile is pulled by a terminal via ``claim_task``; the harness must
+# never launch it. Before the guard, auto-decompose rewrote that assignee
+# to ``kanban.default_assignee`` and promoted the task out of triage, so
+# the dispatcher spawned work its owner had deliberately withheld.
+# --------------------------------------------------------------------------
+
+NONSPAWNABLE = "orion-cc"  # a terminal lane, not a Hermes profile
+
+
+def _aux_client_must_not_be_called():
+    return patch(
+        "agent.auxiliary_client.call_llm",
+        side_effect=AssertionError("decomposer reached the LLM for a parked task"),
+    )
+
+
+def test_decompose_refuses_a_task_parked_on_a_nonspawnable_assignee(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="held by a terminal lane",
+            assignee=NONSPAWNABLE, triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _aux_client_must_not_be_called(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "not a spawnable profile" in outcome.reason
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.assignee == NONSPAWNABLE
+
+
+def test_decompose_still_runs_for_a_task_assigned_to_a_real_profile(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="ordinary triage work",
+            assignee="engineer", triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "Do the thing.",
+        "assignee": "engineer",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status != "triage"
+    assert task.assignee == "engineer"
+
+
+def test_decompose_proceeds_for_an_unassigned_triage_task(kanban_home):
+    """The guard is about *deliberate* parking. An unassigned triage task
+    is exactly what the decomposer exists to route, so it must pass."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="nobody owns this yet", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False, "rationale": "r",
+        "title": "T", "body": "B", "assignee": "fallback",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+
+
+def test_list_triage_ids_skips_tasks_parked_on_nonspawnable_assignees(kanban_home):
+    with kb.connect() as conn:
+        routable = kb.create_task(conn, title="route me", triage=True)
+        parked = kb.create_task(
+            conn, title="parked", assignee=NONSPAWNABLE, triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        ids = decomp.list_triage_ids()
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert routable in ids
+    assert parked not in ids
+
+
+def test_guard_fails_open_when_the_profile_registry_is_unreadable(kanban_home):
+    """A broken profile registry must not freeze ordinary decomposition.
+    Mirrors the dispatcher, which also treats an unreadable registry as
+    'assume spawnable' rather than refusing every task."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="registry is down", assignee="engineer", triage=True,
+        )
+
+    with patch(
+        "hermes_cli.profiles.profile_exists",
+        side_effect=RuntimeError("registry unreadable"),
+    ):
+        assert decomp._assignee_is_spawnable("engineer") is True
+        assert decomp.list_triage_ids() == [tid]
+
+
+def test_dispatch_never_reassigns_or_spawns_a_parked_triage_task(kanban_home):
+    """Regression for #62985, end to end: with ``kanban.default_assignee``
+    configured, a triage task parked on a non-spawnable assignee survives
+    both an auto-decompose tick and a dispatcher tick untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="containment", assignee=NONSPAWNABLE, triage=True,
+        )
+
+    spawned = []
+
+    def _recording_spawn(*args, **kwargs):
+        spawned.append((args, kwargs))
+        return 4242
+
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _aux_client_must_not_be_called(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ):
+            # The auto-decompose tick picks its work through this call.
+            assert decomp.list_triage_ids() == []
+            # And the guard holds even if a task id reaches it directly.
+            assert decomp.decompose_task(tid, author="tick").ok is False
+
+        with kb.connect() as conn:
+            result = kb.dispatch_once(
+                conn, spawn_fn=_recording_spawn, dry_run=False,
+                default_assignee="fallback",
+            )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert spawned == []
+    assert tid not in [t[0] for t in result.spawned]
+    assert tid not in result.auto_assigned_default
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.assignee == NONSPAWNABLE

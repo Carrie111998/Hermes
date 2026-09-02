@@ -268,6 +268,26 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _assignee_is_spawnable(assignee: Optional[str]) -> bool:
+    """Whether ``assignee`` names a real Hermes profile we may spawn.
+
+    Mirrors the dispatcher's non-spawnable skip
+    (``kanban_db._dispatch_ready_tasks``): an assignee that is not a
+    profile names a control-plane lane pulled by a terminal via
+    ``claim_task``, never something the harness may launch on its own.
+
+    Fails OPEN — if the profile registry cannot be read we treat the
+    assignee as spawnable, so a broken registry never silently freezes
+    decomposition of ordinary triage work.
+    """
+    if not assignee or not assignee.strip():
+        return True
+    try:
+        return bool(profiles_mod.profile_exists(assignee.strip()))
+    except Exception:
+        return True
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -288,6 +308,17 @@ def decompose_task(
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    # Containment: a triage task deliberately parked on a non-spawnable
+    # assignee (a terminal lane, not a Hermes profile) must stay parked.
+    # Decomposition would rewrite that assignee to ``default_assignee``
+    # and promote the task into ``todo``, where the dispatcher then
+    # spawns work its owner never released (#62985).
+    if not _assignee_is_spawnable(task.assignee):
+        return DecomposeOutcome(
+            task_id, False,
+            f"assignee {task.assignee!r} is not a spawnable profile — "
+            "task is parked on a non-spawnable lane",
         )
 
     cfg = _load_config()
@@ -465,4 +496,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    # Tasks parked on a non-spawnable assignee are filtered out here as
+    # well as guarded inside ``decompose_task``: the auto-decompose tick
+    # calls this to pick work, and every id it returns costs one LLM
+    # round-trip that would be thrown away by the guard anyway.
+    return [row.id for row in rows if _assignee_is_spawnable(row.assignee)]
