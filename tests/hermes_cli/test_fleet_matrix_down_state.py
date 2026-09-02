@@ -27,6 +27,9 @@ def _setup(monkeypatch, tmp_path, record: dict):
         "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "no-profiles"
     )
     monkeypatch.setattr("gateway.control_socket.identify_gateway", lambda h, **k: None)
+    monkeypatch.setattr(
+        "gateway.status._read_process_cmdline", lambda pid: "hermes gateway run"
+    )
     (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")
     return home
 

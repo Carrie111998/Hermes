@@ -269,6 +269,13 @@ class TestFleetClassification:
         """Run collect_fleet_versions against one fake default profile."""
         home = tmp_path / "fleet_home"
         home.mkdir()
+        record = {
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "gateway_state": "running",
+            "start_time": None,
+            **record,
+        }
         (home / "gateway_state.json").write_text(
             json.dumps(record), encoding="utf-8"
         )
@@ -285,6 +292,9 @@ class TestFleetClassification:
             lambda: tmp_path / "nonexistent_profiles_root",
         )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline", lambda pid: "hermes gateway run"
+        )
         return ur.collect_fleet_versions()
 
     def test_current_gateway(self, monkeypatch, tmp_path):
@@ -327,6 +337,69 @@ class TestFleetClassification:
             lambda: tmp_path / "nope",
         )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        assert ur.collect_fleet_versions() == []
+
+    def test_recycled_pid_owned_by_non_gateway_is_excluded(self, monkeypatch, tmp_path):
+        home = tmp_path / "fleet_home_recycled"
+        home.mkdir()
+        (home / "gateway_state.json").write_text(
+            json.dumps(
+                {
+                    "pid": 4242,
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "gateway", "run"],
+                    "gateway_state": "running",
+                    "start_time": None,
+                    "code_sha": "a" * 40,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_default_hermes_home", lambda: home
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "nope"
+        )
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda pid: "/Applications/Safari.app/Contents/MacOS/Safari",
+        )
+
+        assert ur.collect_fleet_versions() == []
+
+    def test_named_profile_pid_reused_by_other_gateway_is_excluded(
+        self, monkeypatch, tmp_path
+    ):
+        default_home = tmp_path / "fleet_root"
+        work_home = default_home / "profiles" / "work"
+        work_home.mkdir(parents=True)
+        (work_home / "gateway_state.json").write_text(
+            json.dumps(
+                {
+                    "pid": 4242,
+                    "kind": "hermes-gateway",
+                    "argv": ["hermes", "--profile", "work", "gateway", "run"],
+                    "gateway_state": "running",
+                    "start_time": None,
+                    "code_sha": "a" * 40,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_default_hermes_home", lambda: default_home
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles._get_profiles_root", lambda: default_home / "profiles"
+        )
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda pid: "hermes --profile other gateway run",
+        )
+
         assert ur.collect_fleet_versions() == []
 
     def test_matrix_returns_true_only_on_stale(self, capsys):

@@ -364,7 +364,7 @@ def collect_fleet_versions(
         expected_sha = None
 
     try:
-        from gateway.status import read_runtime_status, runtime_status_pid_is_live
+        from gateway.status import get_runtime_status_running_pid, read_runtime_status
         from hermes_cli.profiles import (
             _get_default_hermes_home,
             _get_profiles_root,
@@ -426,7 +426,8 @@ def collect_fleet_versions(
                 pid = int(pid)
             except (TypeError, ValueError):
                 continue
-            if not runtime_status_pid_is_live(record):
+            live_pid = get_runtime_status_running_pid(record, expected_home=home)
+            if live_pid is None:
                 # Dead PID (or a live PID recycled by an unrelated process
                 # during the update's own churn — #93258): a DOWN row only
                 # when this exact pid was alive at update start AND the
@@ -458,6 +459,7 @@ def collect_fleet_versions(
                         }
                     )
                 continue
+            pid = live_pid
             code_sha = record.get("code_sha")
             if not code_sha or not expected_sha:
                 state = "unknown"

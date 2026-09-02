@@ -9,7 +9,13 @@ import hermes_cli.update_inventory as ui
 
 
 def _write_state(home: Path, pid: int, sha: str | None = None, version: str | None = None):
-    record = {"pid": pid}
+    record = {
+        "pid": pid,
+        "kind": "hermes-gateway",
+        "argv": ["hermes", "gateway", "run"],
+        "gateway_state": "running",
+        "start_time": None,
+    }
     if sha:
         record["code_sha"] = sha
     if version:
@@ -31,6 +37,12 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: default_home / "profiles")
     monkeypatch.setattr("hermes_cli.profiles._PROFILE_ID_RE", re.compile(r"^[a-z0-9][a-z0-9_-]*$"), raising=False)
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid in (100, 200))
+    monkeypatch.setattr(
+        "gateway.status._read_process_cmdline",
+        lambda pid: (
+            "hermes gateway run" if pid == 100 else "hermes --profile work gateway run"
+        ),
+    )
     monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda all_profiles=False: {100})
     monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: True)
     monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda exclude_pids=None: [])
@@ -79,6 +91,28 @@ class TestCollectInventory:
     def test_dead_pids_excluded(self, fleet, monkeypatch):
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         plan = ui.collect_runtime_inventory()
+        assert plan.runtimes == []
+
+    def test_recycled_pid_owned_by_non_gateway_is_excluded(self, fleet, monkeypatch):
+        """A stale state PID reused by Safari must not become a fleet runtime."""
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda pid: "/Applications/Safari.app/Contents/MacOS/Safari",
+        )
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.runtimes == []
+
+    def test_named_profile_requires_matching_gateway_identity(self, fleet, monkeypatch):
+        """A live gateway for one profile cannot satisfy another profile's state."""
+        monkeypatch.setattr(
+            "gateway.status._read_process_cmdline",
+            lambda pid: "hermes --profile other gateway run",
+        )
+
+        plan = ui.collect_runtime_inventory()
+
         assert plan.runtimes == []
 
     def test_pid_file_fallback_covers_unstamped_profiles(self, fleet, monkeypatch):
