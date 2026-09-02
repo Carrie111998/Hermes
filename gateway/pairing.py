@@ -198,7 +198,11 @@ def _read_allowlist_env(env_var: str) -> str:
             return (get_secret(env_var) or "").strip()
         except UnscopedSecretError:
             pass
-    except Exception:
+    except Exception as exc:
+        # If secret_scope itself is unavailable, surface the failure instead
+        # of silently degrading to os.getenv(), which can return another
+        # profile's value under multiplexing.
+        logger.debug("secret_scope unavailable for %s: %s", env_var, exc)
         pass
     return (os.getenv(env_var) or "").strip()
 
