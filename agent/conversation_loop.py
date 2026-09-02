@@ -5948,9 +5948,11 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                _is_stale_giveup = getattr(api_error, "_stale_giveup", False)
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
+                    or _is_stale_giveup
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
