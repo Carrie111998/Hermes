@@ -955,6 +955,44 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # Strict Anthropic/OpenAI-compat proxies (Palantir Foundry LLM proxy,
+    # Mistral, ...) reject the ``reasoning_details`` field Hermes echoes back
+    # for multi-turn reasoning continuity: HTTP 400 with
+    # ``{unrecognizedProperty=reasoning_details}`` / "unrecognized field".
+    # Unlike the signature/frozen-block cases below this carries no
+    # "thinking" token, so it fell through to a non-retryable format_error
+    # and the turn hard-aborted (observed on opus subagents doing many
+    # tool-call steps: the prior step's reasoning_details rides into the
+    # next request and the strict proxy rejects the whole call). Same
+    # recovery applies — strip all reasoning_details and retry — so route
+    # it to the thinking_signature handler in conversation_loop.py.
+    # Lowercased once so capitalized proxy variants ("Unrecognized request
+    # argument supplied", "Unknown field:") match too.
+    _rd_msg = error_msg.lower()
+    if (
+        status_code == 400
+        and "reasoning_details" in _rd_msg
+        and (
+            "unrecognized" in _rd_msg
+            or "unknown" in _rd_msg
+            or "invalid" in _rd_msg
+        )
+    ):
+        # The keyword net is deliberately broad: a 400 that merely mentions
+        # reasoning_details plus one of these words routes here even when the
+        # real problem was elsewhere. Recovery is harmless either way (retry
+        # omits the field), but log it so one-round-trip misroutes stay
+        # visible in traces instead of being silently absorbed.
+        logger.warning(
+            "400 mentions reasoning_details + unrecognized/unknown/invalid "
+            "(strict-proxy shape) — routing to thinking_signature strip-and-retry"
+        )
+        return _result(
+            FailoverReason.thinking_signature,
+            retryable=True,
+            should_compress=False,
+        )
+
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
     # same recovery (strip all reasoning_details and retry without thinking
     # blocks — see the thinking_signature handler in conversation_loop.py):
