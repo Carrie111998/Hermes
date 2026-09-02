@@ -496,6 +496,29 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "optimize-storage' with the gateway stopped)",
         ))
 
+    # An interrupted optimize-storage run leaves the CJK backfill markers
+    # frozen — nothing but that command's loop ever advances them, so CJK
+    # search quietly stays on trigram/LIKE forever. Surface the stuck
+    # progress (and the stale-index case, which forces a full rebuild).
+    cjk = stats.get("fts_cjk_backfill")
+    if isinstance(cjk, dict):
+        lines.append((
+            "warn",
+            "CJK FTS index backfill is interrupted "
+            f"({cjk.get('indexed', 0):,}/{cjk.get('total', 0):,} rows, "
+            f"{cjk.get('percent', 0)}% indexed)",
+            "(CJK search falls back to trigram/LIKE; run 'hermes sessions "
+            "optimize-storage' to finish the backfill)",
+        ))
+    if stats.get("fts_cjk_stale"):
+        lines.append((
+            "warn",
+            "CJK FTS index is stale (its triggers were dropped by a "
+            "tokenizer-less process)",
+            "(the next 'hermes sessions optimize-storage' run rebuilds it "
+            "from scratch)",
+        ))
+
     # Advisory: oversized database. Suggest auto_prune, and — when the v23
     # FTS rebuild is pending OR the DB still carries the legacy inline
     # trigram layout (fts_storage_version marker absent) — the offline

@@ -4872,6 +4872,13 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
       finished (high_water present and progress < high_water)
     - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
     - ``fts_rebuild_deferral`` — durable blocked-repair diagnostic, when present
+    - ``fts_cjk_backfill`` — {"total", "indexed", "percent"} for the CJK
+      bigram index when its backfill markers are present (an interrupted
+      `optimize-storage` run freezes them; CJK search falls back to
+      trigram/LIKE until the backfill is re-run), None otherwise
+    - ``fts_cjk_stale`` — True when the ``fts_cjk_stale`` breadcrumb is set
+      (a tokenizer-less process dropped the cjk triggers; the next
+      optimize-storage run rebuilds the index from scratch)
     """
     stats: Dict[str, Any] = {
         "page_count": None,
@@ -4888,6 +4895,8 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,
         "fts_rebuild_deferral": None,
+        "fts_cjk_backfill": None,
+        "fts_cjk_stale": None,
     }
 
     # WAL sidecar size needs no connection at all.
@@ -4989,6 +4998,25 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
                     stats["fts_rebuild_deferral"] = parsed
         except Exception:
             pass
+
+        # CJK-bigram backfill markers — same pending/high_water/progress
+        # shape as the base index, kept as a nested dict because the two
+        # backfills are independent phases of optimize-storage.
+        cjk_hw = _meta_int("fts_cjk_rebuild_high_water")
+        if cjk_hw is not None and cjk_hw > 0:
+            cjk_progress = _meta_int("fts_cjk_rebuild_progress") or 0
+            stats["fts_cjk_backfill"] = {
+                "total": cjk_hw,
+                "indexed": min(cjk_progress, cjk_hw),
+                "percent": min(100, int(100 * cjk_progress / cjk_hw)),
+            }
+        stats["fts_cjk_stale"] = (
+            conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_CJK_STALE_KEY,),
+            ).fetchone()
+            is not None
+        )
     finally:
         try:
             conn.close()
@@ -5609,6 +5637,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not report.get("repaired"):
                     raise
                 _connect_and_init_with_lock_patience()
+
+            # An interrupted CJK backfill freezes silently: the marker pair
+            # sits in state_meta forever because only the explicit
+            # optimize-storage loop ever advances it. Say so once per open,
+            # so weeks of trigram/LIKE fallback don't go unnoticed (#98743).
+            if self._fts_cjk_loaded:
+                _st = self.fts_cjk_rebuild_status()
+                if _st is not None:
+                    logger.warning(
+                        "CJK FTS index backfill is pending (%d/%d rows, %d%%) — "
+                        "CJK search falls back to trigram/LIKE until "
+                        "'hermes sessions optimize-storage' completes it.",
+                        _st["indexed"], _st["total"], _st["percent"],
+                    )
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
