@@ -3714,12 +3714,15 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
-    Reassign after the current run completes if needed.
+    Reassign after the current run completes if needed. Reassigning a parked
+    review is phase-aware: implementation skills are recorded on the assigned
+    event and removed before a different reviewer profile can dispatch.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3728,7 +3731,79 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
+        assignment_payload: dict[str, Any] = {"assignee": profile}
+        phase_skills_changed = False
+        review_phase = row["status"] == "review" or (
+            row["status"] in {"blocked", "todo", "scheduled"}
+            and _resume_status_from_events(conn, task_id) == "review"
+        )
+        if row["assignee"] != profile and review_phase:
+            review_event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                handoff = (
+                    json.loads(review_event["payload"])
+                    if review_event and review_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                handoff = {}
+            implementer = handoff.get("implementer") if isinstance(handoff, dict) else None
+            if not isinstance(implementer, str) or not implementer.strip():
+                raise RuntimeError(
+                    f"cannot reassign review task {task_id}: review handoff has "
+                    "no valid implementer provenance"
+                )
+            implementer = _canonical_assignee(implementer)
+            has_provenance, implementation_skills, skill_error = (
+                _resolved_implementation_skill_provenance(
+                    conn,
+                    task_id,
+                    handoff,
+                    review_event_id=int(review_event["id"]),
+                )
+            )
+            if skill_error is not None:
+                raise RuntimeError(f"cannot reassign review task {task_id}: {skill_error}")
+            if not has_provenance:
+                implementation_skills = _decode_task_skills(row["skills"])
+                if row["skills"] is not None and implementation_skills is None:
+                    raise RuntimeError(
+                        f"cannot reassign review task {task_id}: task has malformed "
+                        "implementation skill provenance"
+                    )
+                if (
+                    implementation_skills
+                    and _canonical_assignee(row["assignee"]) != implementer
+                ):
+                    raise RuntimeError(
+                        f"cannot reassign review task {task_id}: review handoff has "
+                        "no durable implementation skill provenance"
+                    )
+            routed_skills = implementation_skills if profile == implementer else None
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, skills = ?, "
+                "consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+                (
+                    profile,
+                    json.dumps(routed_skills) if routed_skills is not None else None,
+                    task_id,
+                ),
+            )
+            assignment_payload.update(
+                {
+                    "phase": "review",
+                    "implementer": implementer,
+                    "reviewer": profile,
+                    "implementation_skills": implementation_skills,
+                }
+            )
+            phase_skills_changed = True
+        elif row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
             # new profile should not inherit the previous profile's streak.
@@ -3739,10 +3814,14 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        _append_event(conn, task_id, "assigned", assignment_payload)
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
-    notify_task_updated(conn, task_id, ("assignee",))
+    notify_task_updated(
+        conn,
+        task_id,
+        ("assignee", "skills") if phase_skills_changed else ("assignee",),
+    )
     return True
 
 
@@ -4501,7 +4580,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'scheduled', 'unblocked', 'changes_requested', 'review_reopened', "
+        "'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -4762,6 +4842,10 @@ def claim_review_task(
     Parent dependencies are re-checked because a previously completed parent
     may have been reopened while this task waited in review.
 
+    Already-persisted pre-fix cross-profile handoffs are reconciled in the same
+    transaction before the claim: durable implementation skill provenance is
+    recorded and prior-phase flags are removed before spawn can observe them.
+
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
@@ -4785,6 +4869,8 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        if not _reconcile_legacy_review_skills_before_claim(conn, task_id):
             return None
         cur = conn.execute(
             """
@@ -6498,6 +6584,271 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _decode_task_skills(value: Any) -> Optional[list[str]]:
+    """Decode the task's persisted forced-skill list without profile lookup."""
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [str(skill) for skill in parsed if skill]
+
+
+def _implementation_skill_provenance(
+    payload: Any,
+) -> tuple[bool, Optional[list[str]], Optional[str]]:
+    """Read implementation skills from a review event.
+
+    The boolean distinguishes legacy events (no provenance key, so callers
+    preserve the task's current skills) from a recorded ``None`` skillset
+    (which callers must restore as SQL NULL). New payloads fail closed when
+    their provenance field is malformed instead of routing guessed skills.
+    """
+    if not isinstance(payload, dict) or "implementation_skills" not in payload:
+        return False, None, None
+    raw = payload["implementation_skills"]
+    if raw is None:
+        return True, None, None
+    if not isinstance(raw, list):
+        return True, None, "review handoff has malformed skill provenance"
+    skills: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            return True, None, "review handoff has malformed skill provenance"
+        skills.append(value.strip())
+    return True, skills, None
+
+
+def _resolved_implementation_skill_provenance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: Any,
+    *,
+    review_event_id: Optional[int] = None,
+) -> tuple[bool, Optional[list[str]], Optional[str]]:
+    """Resolve review-phase implementation skills with legacy fallbacks.
+
+    New handoffs carry the exact list directly. A later review-phase
+    ``assign_task`` records the same provenance on its ordinary ``assigned``
+    event, so two-step CLI/dashboard routing remains auditable without rewriting
+    the original handoff event. Pre-fix handoffs fall back to the immutable
+    ``created.skills`` field. Rows old enough to lack that field preserve their
+    current skills for backward compatibility.
+    """
+    found, skills, error = _implementation_skill_provenance(payload)
+    if found or error is not None:
+        return found, skills, error
+
+    if review_event_id is not None:
+        assigned_rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'assigned' AND id > ? "
+            "ORDER BY id DESC",
+            (task_id, int(review_event_id)),
+        ).fetchall()
+        for row in assigned_rows:
+            try:
+                assigned_payload = json.loads(row["payload"]) if row["payload"] else {}
+            except (json.JSONDecodeError, TypeError):
+                assigned_payload = {}
+            if not isinstance(assigned_payload, dict) or assigned_payload.get("phase") != "review":
+                continue
+            found, skills, error = _implementation_skill_provenance(assigned_payload)
+            if found or error is not None:
+                return found, skills, error
+
+    created_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' ORDER BY id ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if created_event is None:
+        return False, None, None
+    try:
+        created_payload = (
+            json.loads(created_event["payload"])
+            if created_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        return True, None, "created task has malformed skill provenance"
+    if not isinstance(created_payload, dict):
+        return True, None, "created task has malformed skill provenance"
+    if "skills" not in created_payload:
+        return False, None, None
+    return _implementation_skill_provenance(
+        {"implementation_skills": created_payload["skills"]}
+    )
+
+
+def _record_review_dispatch_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> None:
+    """Audit one sanitized legacy-review refusal without event spam."""
+    payload = {
+        "phase": "review",
+        "reason": reason,
+        "source": "legacy_review_dispatch_reconciliation",
+    }
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == "review_dispatch_refused":
+        try:
+            previous = json.loads(latest["payload"]) if latest["payload"] else None
+        except (json.JSONDecodeError, TypeError):
+            previous = None
+        if previous == payload:
+            return
+    _append_event(conn, task_id, "review_dispatch_refused", payload)
+
+
+def _reconcile_legacy_review_skills_before_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    apply: bool = True,
+    record_refusal: bool = True,
+) -> bool:
+    """Sanitize a pre-fix cross-profile review inside its claim transaction.
+
+    Old ``review_requested`` rows recorded the implementer/reviewer but left
+    the implementer's task-forced skills on ``tasks.skills``. Once upgraded,
+    the first review claim resolves the durable implementation provenance,
+    removes those cross-profile flags, and records the same phase-aware
+    ``assigned`` payload used by explicit reviewer reassignment. Same-profile
+    reviews retain their documented shared-skill behavior.
+
+    Returns ``False`` when non-empty or malformed skills cannot be attributed
+    safely to a phase. The caller then leaves the card parked in ``review``
+    rather than spawning a profile with unsafe flags, and a bounded sanitized
+    diagnostic event makes the refusal visible without repeating every tick.
+    ``apply=False`` performs the same provenance validation without changing a
+    safely reconcilable row; the dispatcher uses that read-only result when
+    deciding whether review work may reserve host capacity. Refusals can still
+    be recorded during that preflight so an unsafe row is visible even when a
+    healthy ready task consumes the released slot.
+    """
+    def refuse(reason: str) -> bool:
+        if record_refusal:
+            _record_review_dispatch_refusal(conn, task_id, reason)
+        return False
+
+    task_row = conn.execute(
+        "SELECT assignee, skills FROM tasks "
+        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+        (task_id,),
+    ).fetchone()
+    if task_row is None or task_row["skills"] is None:
+        return task_row is not None
+
+    review_event = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if review_event is None:
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "missing_review_handoff"
+        )
+    try:
+        handoff = (
+            json.loads(review_event["payload"])
+            if review_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "malformed_review_handoff"
+        )
+    if not isinstance(handoff, dict):
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "malformed_review_handoff"
+        )
+
+    implementer = handoff.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "missing_review_implementer"
+        )
+    implementer = _canonical_assignee(implementer)
+    reviewer = _canonical_assignee(task_row["assignee"])
+    if reviewer == implementer:
+        return True
+
+    current_skills = _decode_task_skills(task_row["skills"])
+    if current_skills is None:
+        return refuse("malformed_task_skills")
+
+    has_provenance, implementation_skills, skill_error = (
+        _resolved_implementation_skill_provenance(
+            conn,
+            task_id,
+            handoff,
+            review_event_id=int(review_event["id"]),
+        )
+    )
+    if skill_error is not None:
+        return refuse("malformed_implementation_skill_provenance")
+    if not has_provenance:
+        if current_skills:
+            return refuse("missing_implementation_skill_provenance")
+        implementation_skills = current_skills
+
+    if not apply:
+        return True
+
+    updated = conn.execute(
+        "UPDATE tasks SET skills = NULL "
+        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+        (task_id,),
+    )
+    if updated.rowcount != 1:
+        return refuse("review_task_changed_before_reconciliation")
+    _append_event(
+        conn,
+        task_id,
+        "assigned",
+        {
+            "assignee": reviewer,
+            "phase": "review",
+            "implementer": implementer,
+            "reviewer": reviewer,
+            "implementation_skills": implementation_skills,
+            "source": "legacy_review_dispatch_reconciliation",
+        },
+    )
+    return True
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6514,9 +6865,12 @@ def request_review(
     Unlike :func:`block_task`, this transition never touches block recurrence
     accounting.  The current implementer and resolved reviewer are recorded on
     the event so an autonomous reviewer can route requested changes back to the
-    right profile.  Supplying ``reviewer`` reassigns the task before it is
-    exposed to the review dispatcher.  On re-review, omitting it reuses the
-    reviewer provenance persisted by the latest ``changes_requested`` event.
+    right profile. Supplying a different ``reviewer`` reassigns the task and
+    isolates that review phase from the implementer's forced skills; the exact
+    implementation skillset is stored on the event for repair restoration.
+    Keeping the same profile is the explicit contract for sharing forced skills
+    across implementation and review. On re-review, omitting ``reviewer``
+    reuses the provenance persisted by the latest ``changes_requested`` event.
 
     When the task is ``running`` under a live claim, a caller that supplies no
     ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
@@ -6538,7 +6892,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, skills "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6597,17 +6951,22 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        implementation_skills = _decode_task_skills(trow["skills"])
+        # Task-forced skills are phase-owned. Keeping the same profile is the
+        # explicit shared-skill contract; routing to another profile isolates
+        # review from implementation-only, profile-local skill names. The
+        # original list rides the handoff event for exact repair restoration.
+        cross_profile_review = reviewer is not None and reviewer != implementer
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        params: tuple[Any, ...]
+        skills_sql = ", skills = NULL" if cross_profile_review else ""
+        params: list[Any] = []
+        if reviewer is not None:
+            params.append(reviewer)
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params.append(task_id)
             run_guard = ""
         else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+            params.extend((task_id, int(expected_run_id)))
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
@@ -6616,11 +6975,11 @@ def request_review(
                    claim_lock    = NULL,
                    claim_expires = NULL,
                    worker_pid    = NULL
-            """ + assignee_sql + """
+            """ + assignee_sql + skills_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
             """ + run_guard,
-            params,
+            tuple(params),
         )
         if cur.rowcount != 1:
             return _ret(
@@ -6646,15 +7005,23 @@ def request_review(
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
+        event_payload: dict[str, Any] = {
+            "summary": event_summary or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        if cross_profile_review:
+            event_payload.update(
+                {
+                    "implementation_skills": implementation_skills,
+                    "review_skills": None,
+                }
+            )
         _append_event(
             conn,
             task_id,
             "review_requested",
-            {
-                "summary": event_summary or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
+            event_payload,
             run_id=run_id,
         )
     return _ret(True)
@@ -6671,9 +7038,12 @@ def request_changes(
 
     The transition is valid only for a run claimed from ``review``.  It closes
     that reviewer run, restores the implementer recorded by the latest
-    ``review_requested`` event, reapplies parent gating, and emits an auditable
-    ``changes_requested`` event.  The second tuple item is the implementer on
-    success or a diagnostic reason on failure.
+    ``review_requested`` event, restores that handoff's implementation skillset,
+    reapplies parent gating, and emits an auditable ``changes_requested`` event.
+    Legacy review events recover skill provenance from later phase-aware
+    assignments or the immutable creation event; truly old rows without either
+    preserve the task's current skills. The second tuple item is the implementer
+    on success or a diagnostic reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
@@ -6712,7 +7082,7 @@ def request_changes(
             return False, "active run was not claimed from review"
 
         requested_event = conn.execute(
-            "SELECT payload FROM task_events "
+            "SELECT id, payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
@@ -6732,6 +7102,16 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        has_skill_provenance, implementation_skills, skill_error = (
+            _resolved_implementation_skill_provenance(
+                conn,
+                task_id,
+                requested_payload,
+                review_event_id=int(requested_event["id"]),
+            )
+        )
+        if skill_error is not None:
+            return False, skill_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -6743,6 +7123,15 @@ def request_changes(
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
         # breaker counter (mirrors unblock_task, #35072).
+        skills_sql = ", skills = ?" if has_skill_provenance else ""
+        params: list[Any] = [new_status, implementer]
+        if has_skill_provenance:
+            params.append(
+                json.dumps(implementation_skills)
+                if implementation_skills is not None
+                else None
+            )
+        params.extend((task_id, int(current_run_id)))
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6751,9 +7140,10 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
+            """ + skills_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            tuple(params),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -6764,16 +7154,19 @@ def request_changes(
             status=new_status,
             summary=reason,
         )
+        event_payload: dict[str, Any] = {
+            "reason": reason,
+            "implementer": implementer,
+            "reviewer": reviewer,
+            "status": new_status,
+        }
+        if has_skill_provenance:
+            event_payload["implementation_skills"] = implementation_skills
         _append_event(
             conn,
             task_id,
             "changes_requested",
-            {
-                "reason": reason,
-                "implementer": implementer,
-                "reviewer": reviewer,
-                "status": new_status,
-            },
+            event_payload,
             run_id=run_id,
         )
     return True, implementer
@@ -6916,7 +7309,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in {"blocked", "scheduled"}
             else "ready"
         )
         _reclaim_dangling_run(
@@ -6975,13 +7368,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("review",), now=now,
-            note="invariant recovery on review reopen",
-        )
         new_status = _landing_status_after_parents(conn, task_id)
         review_event = conn.execute(
-            "SELECT payload FROM task_events "
+            "SELECT id, payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
@@ -6994,15 +7383,45 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
         except (json.JSONDecodeError, TypeError):
             handoff = {}
+        if not isinstance(handoff, dict):
+            handoff = {}
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
-        assignee_sql = ", assignee = ?" if implementer else ""
-        params: tuple[Any, ...] = (
-            (new_status, implementer, task_id)
-            if implementer
-            else (new_status, task_id)
+        else:
+            implementer = _canonical_assignee(implementer)
+        has_skill_provenance, implementation_skills, skill_error = (
+            _resolved_implementation_skill_provenance(
+                conn,
+                task_id,
+                handoff,
+                review_event_id=(int(review_event["id"]) if review_event else None),
+            )
         )
+        if skill_error is not None:
+            return False
+        if has_skill_provenance and implementer is None:
+            # A phase-owned skillset without implementer provenance cannot be
+            # routed safely: leaving the reviewer assigned would recreate the
+            # cross-profile unavailable-skill crash. Truly old handoffs with
+            # no skill provenance retain the historical compatibility path.
+            return False
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("review",), now=now,
+            note="invariant recovery on review reopen",
+        )
+        assignee_sql = ", assignee = ?" if implementer else ""
+        skills_sql = ", skills = ?" if has_skill_provenance else ""
+        params: list[Any] = [new_status]
+        if implementer:
+            params.append(implementer)
+        if has_skill_provenance:
+            params.append(
+                json.dumps(implementation_skills)
+                if implementation_skills is not None
+                else None
+            )
+        params.append(task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7010,14 +7429,17 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
+            + skills_sql
             + " WHERE id = ? AND status = 'review'",
-            params,
+            tuple(params),
         )
         if cur.rowcount != 1:
             return False
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
+        if has_skill_provenance:
+            payload["implementation_skills"] = implementation_skills
         _append_event(
             conn,
             task_id,
@@ -7937,6 +8359,19 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        source_status = (
+            _retry_status_for_run(conn, task_id)
+            if current["status"] == "running"
+            else _resume_status_from_events(conn, task_id)
+            if current["status"] in {"blocked", "todo"}
+            else "ready"
+        )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -7964,7 +8399,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        event_payload = {"reason": reason}
+        if source_status != "ready":
+            event_payload["source_status"] = source_status
+        _append_event(conn, task_id, "scheduled", event_payload, run_id=run_id)
         return True
 
 
@@ -10066,9 +10504,9 @@ def _dispatch_once_locked(
     # from the ready loop so the review lane always gets a spawn
     # opportunity. The reservation is per-tick and self-releasing: with no
     # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
+    # full budget. "Spawnable" mirrors the review loop's profile gate and
+    # phase-skill claim gate so neither human-pulled control-plane lanes nor
+    # unsafe legacy handoffs permanently tax ready throughput.
     def _any_spawnable_review() -> bool:
         if not review_rows:
             return False
@@ -10077,10 +10515,29 @@ def _dispatch_once_locked(
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+            _rpe = None
+        for row in review_rows:
+            if not row["assignee"]:
+                continue
+            if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            if dry_run:
+                claimable = _reconcile_legacy_review_skills_before_claim(
+                    conn,
+                    row["id"],
+                    apply=False,
+                    record_refusal=False,
+                )
+            else:
+                with write_txn(conn):
+                    claimable = _reconcile_legacy_review_skills_before_claim(
+                        conn,
+                        row["id"],
+                        apply=False,
+                    )
+            if claimable:
+                return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
