@@ -1218,8 +1218,34 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+class TranscriptReadError(Exception):
+    """A transcript read failed — the history is unknown, NOT empty.
+
+    Raised by :meth:`SessionStore.load_transcript` when the underlying
+    state.db read blows up (malformed database, locked handle, schema
+    damage).  Returning ``[]`` there made a corrupt store indistinguishable
+    from a fresh session, so gateway restart resumed a long-running chat as
+    a brand-new conversation (#100788).  Callers must either surface the
+    failure or degrade explicitly; they must never silently substitute an
+    empty history.
+
+    The original error is preserved as ``__cause__``.
+    """
+
+    def __init__(self, session_id: str, message: Optional[str] = None) -> None:
+        super().__init__(
+            message or f"transcript read failed for session {session_id}"
+        )
+        self.session_id = session_id
+
+
 class AsyncSessionStore:
-    """Async boundary for the synchronous, thread-safe SessionStore."""
+    """Async boundary for the synchronous, thread-safe SessionStore.
+
+    ``__getattr__`` offloads to a thread and awaits the result, so store
+    exceptions — :class:`TranscriptReadError` included — propagate to the
+    async caller unchanged.  Do not add swallowing wrappers here.
+    """
 
     def __init__(self, store: "SessionStore") -> None:
         self._store = store
@@ -4404,11 +4430,15 @@ class SessionStore:
             # downstream guards treat [] as "nothing persisted" and may make
             # routing decisions on it (#82616). WARNING, not DEBUG.
             logger.warning(
-                "Transcript read failed for session %s (returning empty; "
-                "downstream must not treat this as data loss): %s",
+                "Transcript read failed for session %s (raising "
+                "TranscriptReadError; downstream must not treat this as an "
+                "empty history): %s",
                 session_id, e,
             )
-            return []
+            # #100788: returning [] here made a malformed state.db look like a
+            # fresh chat on restart. Fail loudly instead — the "no db" path
+            # above keeps returning [], because that really is empty.
+            raise TranscriptReadError(session_id) from e
 
     def rewind_session(
         self,

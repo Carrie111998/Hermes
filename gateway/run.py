@@ -2982,6 +2982,7 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    TranscriptReadError,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
@@ -5823,6 +5824,17 @@ class TurnRunner:
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        # #100788: if this turn's transcript read failed, the history above is
+        # empty because it is unreadable, not because the chat is new.  The
+        # notice rides the ephemeral prompt only — never as a synthetic
+        # history row, which would pollute the transcript on the next flush.
+        degraded_history_notice = self._runner._take_degraded_history_notice(
+            ctx.session_key or ""
+        )
+        if degraded_history_notice:
+            combined_ephemeral = (
+                combined_ephemeral + "\n\n" + degraded_history_notice
+            ).strip()
 
         max_iterations = _current_max_iterations()
 
@@ -7294,6 +7306,24 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
+def build_degraded_history_notice(session_id: str) -> str:
+    """Ephemeral note for a turn whose transcript could not be read (#100788).
+
+    A failed ``load_transcript`` leaves the turn with an empty history that is
+    NOT an empty conversation.  Say that in the prompt so the model neither
+    treats the chat as fresh nor fabricates the part it cannot see, and name
+    the store an operator has to look at.
+    """
+    return (
+        f"[Degraded history] The stored transcript for session {session_id} "
+        "could not be read for this turn, so no prior messages are attached. "
+        "This is not a new conversation — earlier messages exist but are "
+        "currently unreadable. Do not guess or invent what was said; if you "
+        "need something from earlier, ask the user to restate it. An operator "
+        "should check this session's store (state.db)."
+    )
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -7590,6 +7620,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # current stall episode (cleared when pending clears / activity resumes
         # / conversation boundary). See gateway.session_stall.
         self._session_stall_notified: Dict[str, bool] = {}
+        # One-shot degraded-history notices, keyed by session key (#100788).
+        # Set when a turn's transcript read raises TranscriptReadError and
+        # consumed by the same turn's ephemeral prompt, so the model is told
+        # the history is unreadable instead of silently assuming it is empty.
+        self._degraded_history_notices: Dict[str, str] = {}
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -20232,6 +20267,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._async_session_store = facade
         return facade
 
+    async def _load_history_for_turn(
+        self,
+        session_key: str,
+        session_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Load this turn's transcript, degrading loudly on a read failure.
+
+        A read failure is not an empty history (#100788): swallowing it into
+        ``[]`` restarted long-running chats as brand-new conversations after a
+        malformed ``state.db``.  The turn still runs without history — the
+        rows really are unavailable — but a one-shot notice is queued for the
+        turn's ephemeral prompt so the model knows the gap is a failure, not a
+        fresh session.
+        """
+        try:
+            return await self.async_session_store.load_transcript(session_id)
+        except TranscriptReadError:
+            self._note_degraded_history(session_key, session_id)
+            return []
+
+    def _note_degraded_history(self, session_key: str, session_id: str) -> None:
+        """Queue the degraded-history notice for ``session_key``'s next turn."""
+        logger.warning(
+            "Transcript read failed for session %s (key %s); running the turn "
+            "with an empty history plus a degraded-history notice (#100788)",
+            session_id, session_key,
+        )
+        notices = getattr(self, "_degraded_history_notices", None)
+        if notices is None:
+            notices = {}
+            self._degraded_history_notices = notices
+        notices[session_key] = build_degraded_history_notice(session_id)
+
+    def _take_degraded_history_notice(self, session_key: str) -> str:
+        """Pop the pending degraded-history notice for a turn ("" if none).
+
+        One-shot: the notice belongs to the turn whose read failed, so a later
+        turn that reads the transcript fine never carries a stale warning.
+        """
+        notices = getattr(self, "_degraded_history_notices", None)
+        if not notices:
+            return ""
+        return notices.pop(session_key, "") or ""
+
     async def _mark_durable_active_turn(
         self,
         event: "MessageEvent",
@@ -20846,8 +20925,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from transcript.  Keyed by the local
+        # ``session_key`` (the routing key that is also handed to _run_agent
+        # below), so a degraded-history notice is queued under exactly the key
+        # run_sync takes it back with.
+        history = await self._load_history_for_turn(session_key, session_entry.session_id)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -22883,6 +22965,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _already_persisted = False
                     try:
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
+                    except TranscriptReadError:
+                        # Not the restore path, so no second degraded-history
+                        # notice (#100788). Without readable rows we cannot
+                        # tell whether this turn was already persisted; the
+                        # dedupe below then falls back to appending, which is
+                        # the safe side of the trade.
+                        _recent_transcript = []
                     except Exception:
                         _recent_transcript = []
                     for _msg in reversed(_recent_transcript[-10:]):
