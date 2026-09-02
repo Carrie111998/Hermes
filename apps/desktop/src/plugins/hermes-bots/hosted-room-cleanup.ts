@@ -203,9 +203,11 @@ async function holdCleanupOwnerLock(ownerId: string) {
 
   let entered: () => void = () => undefined
   let release: () => void = () => undefined
+
   const acquired = new Promise<void>(resolve => {
     entered = resolve
   })
+
   const held = new Promise<void>(resolve => {
     release = resolve
   })
@@ -287,6 +289,7 @@ async function mutateCleanup(update: (current: HostedRoomCleanup) => HostedRoomC
 
     if (JSON.stringify(current) === JSON.stringify(next)) {
       $hostedRoomCleanup.set(current)
+
       return current
     }
 
@@ -365,10 +368,13 @@ async function peerRouteStatus(operation: HostedRoomCleanupOperation, homeRoute:
       room_id: operation.roomId
     })
   )
+
   const driver = record(state?.driver_status)
+
   if (!driver || !Array.isArray(driver.peer_routes)) {
     return 'unknown' as const
   }
+
   const route = driver.peer_routes
     .map(record)
     .find(candidate => String(candidate?.member_id || '') === String(operation.memberId || ''))
@@ -561,6 +567,7 @@ export async function startHostedRoomCleanup(storage: PluginContext['storage']) 
 
     if (!cleanupDisposed && generation === cleanupGeneration) {
       const current = normalizeHostedRoomCleanup(persisted)
+
       const next = normalizeHostedRoomCleanup({
         version: 1,
         operations: current.operations.map(operation =>

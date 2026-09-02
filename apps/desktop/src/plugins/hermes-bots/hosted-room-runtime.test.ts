@@ -287,7 +287,6 @@ describe('hosted Group Chat runtime', () => {
         ]
       })
     })
-
     await loaded.runtime.startHostedRoomRuntime(scriptedStorage(loaded.storage).storage)
 
     const hydrated = loaded.chat.$groupChats.get().Release
@@ -403,6 +402,26 @@ describe('hosted Group Chat runtime', () => {
         ]
       })
     })
+    loaded.chat.$groupHostedNeedsYou.set({ Release: true })
+    loaded.chat.$groupClarify.set({
+      'Release::builder': {
+        at: 1,
+        choices: ['once', 'deny'],
+        group: 'Release',
+        hostedApproval: {
+          executionGeneration: 1,
+          memberId: 'builder',
+          roomId: 'room-1',
+          taskId: 'task-1'
+        },
+        kind: 'approval',
+        member: 'builder',
+        memberKey: 'builder',
+        multiSelect: false,
+        question: 'Run command',
+        requestId: 'approval-1'
+      }
+    })
 
     await loaded.runtime.startHostedRoomRuntime(scriptedStorage(loaded.storage).storage)
 
@@ -415,6 +434,8 @@ describe('hosted Group Chat runtime', () => {
       'Start',
       'Finished while Desktop was closed'
     ])
+    expect(loaded.chat.$groupHostedNeedsYou.get().Release).toBeUndefined()
+    expect(Object.values(loaded.chat.$groupClarify.get())).toEqual([])
     loaded.runtime.stopHostedRoomRuntime()
   })
 
@@ -1533,7 +1554,7 @@ describe('hosted Group Chat runtime', () => {
     await logRequested
 
     if (action === 'send') {
-      expect(loaded.rounds.sendToGroupChat('Release', MEMBERS, 'Keep going')).toBeTruthy()
+      await expect(loaded.rounds.sendToGroupChatDurably('Release', MEMBERS, 'Keep going')).resolves.toBeTruthy()
     } else {
       await loaded.rounds.stopGroupThread('Release', null, MEMBERS)
     }
@@ -1545,7 +1566,7 @@ describe('hosted Group Chat runtime', () => {
     const expectedState = loaded.chat.$groupChats.get().Release.hostedStatus?.state
 
     if (action === 'send') {
-      expect(['sending', 'working']).toContain(expectedState)
+      expect(['queued', 'working']).toContain(expectedState)
     } else {
       expect(expectedState).toBe('stopped')
     }

@@ -35,6 +35,9 @@ export const $groupChats = atom<Record<string, GroupChatRoom>>({})
 export const $groupChatWorkspace = atom<null | string>(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 export const $groupNeedsYou = atom<Record<string, boolean>>({})
+/** Hosted approval attention stays separate from message mentions so resolving
+ * one source cannot erase the other source's unread state. */
+export const $groupHostedNeedsYou = atom<Record<string, boolean>>({})
 // Pending prompts (clarify questions AND command approvals) raised inside
 // hidden group-member sessions, keyed `${group}::${memberKey}` (#90694).
 // Members run in invisible plumbing sessions, so a member's blocking prompt
@@ -1674,10 +1677,11 @@ export function appendGroupChatEntry(
   from: GroupMessageAuthor,
   text: string,
   thread?: null | string,
-  images?: Attachment[]
+  images?: Attachment[],
+  entryId?: string
 ): GroupMessage {
   const entry: GroupMessage = {
-    id: groupChatEntryId(),
+    id: entryId || groupChatEntryId(),
     at: Date.now(),
     from,
     text: normalizeGroupChatText(text),

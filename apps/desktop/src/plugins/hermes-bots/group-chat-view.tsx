@@ -62,6 +62,7 @@ import {
   $groupChats,
   $groupChatWorkspace,
   $groupClarify,
+  $groupHostedNeedsYou,
   $groupNeedsYou,
   groupChatContinuityMode,
   groupChatHostedGateway,
@@ -96,14 +97,16 @@ import {
   updateGroupComposerDraft
 } from './group-panes'
 import type { GroupComposerDraft, GroupDraftSetter } from './group-panes'
-import { sendToGroupChat, stopGroupThread } from './group-rounds'
+import { sendToGroupChatDurably, stopGroupThread } from './group-rounds'
 import { clearGroupClarify } from './group-turns'
 import { reconnectHostedGroupChatPeer } from './hosted-room-reauthorization'
 import {
   beginHostedRoomMutation,
   disbandHostedGroupChat,
   markHostedRoomLocallyDeleted,
+  readHostedGroupChatAttachment,
   renameHostedGroupChat,
+  retryFailedHostedRoomCommand,
   retryHostedGroupChat,
   retryHostedRoomReplay
 } from './hosted-room-runtime'
@@ -209,6 +212,10 @@ export async function disbandGroupChat(group: string, members: RosterRow[]) {
 
   delete needs[group]
   $groupNeedsYou.set(needs)
+  const hostedNeeds = { ...$groupHostedNeedsYou.get() }
+
+  delete hostedNeeds[group]
+  $groupHostedNeedsYou.set(hostedNeeds)
   clearGroupClarify(group)
 
   // Persist the room map WITHOUT the disbanded room so it can't come back
@@ -372,6 +379,16 @@ export async function renameGroupChat(
     needs[next] = needs[oldName]
     delete needs[oldName]
     $groupNeedsYou.set(needs)
+  }
+
+  const hostedNeeds: Record<string, boolean> = {
+    ...$groupHostedNeedsYou.get()
+  }
+
+  if (oldName in hostedNeeds) {
+    hostedNeeds[next] = hostedNeeds[oldName]
+    delete hostedNeeds[oldName]
+    $groupHostedNeedsYou.set(hostedNeeds)
   }
 
   // Mirrored clarify cards key by group name; drop the old room's — the
@@ -568,6 +585,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     log: [],
     running: false
   }
+
   const hostedState = String(room.hostedStatus?.state || '')
   const hostedDeleted = Boolean(groupChatHostedGateway(room) && hostedState === 'deleted')
   const canStop = Boolean(room.running && hostedState !== 'stopping' && room.hostedStatus?.canStop !== false)
@@ -840,6 +858,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
   const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
   const hostedActivity = groupChatHostedGateway(room) ? room.hostedStatus?.label : null
   const retryTaskId = String(room.hostedStatus?.taskId || '')
+  const retryCommandId = String(room.hostedStatus?.retryCommandId || '')
   const reconnectMemberId = String(room.hostedStatus?.reconnectMemberId || '')
 
   const reconnectRoomMember = async () => {
@@ -848,6 +867,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     }
 
     setReconnecting(true)
+
     try {
       await reconnectHostedGroupChatPeer(group, reconnectMemberId)
     } catch {
@@ -910,7 +930,11 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
         {room.hostedStatus?.canRetry ? (
           <Button
             onClick={() =>
-              retryTaskId ? setConfirmRetry(true) : void retryHostedRoomReplay(group).catch(() => undefined)
+              retryCommandId
+                ? void retryFailedHostedRoomCommand(group, retryCommandId).catch(() => undefined)
+                : retryTaskId
+                  ? setConfirmRetry(true)
+                  : void retryHostedRoomReplay(group).catch(() => undefined)
             }
             size="xs"
             variant="secondary"
@@ -969,7 +993,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     </div>
   )
 
-  const submit = () => {
+  const submit = async () => {
     const text = draft.trim()
     const images = imagesFor(null)
 
@@ -991,7 +1015,24 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text, null, images)
+    let minted: null | string = null
+
+    try {
+      minted = await sendToGroupChatDurably(group, memberDescriptors(), text, null, images)
+    } catch (error) {
+      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
+
+      if (restored) {
+        setComposerDraft(restored)
+      }
+
+      host.notify({
+        kind: 'error',
+        message: error instanceof Error && error.message ? error.message : b.group.hostRejectedCommand
+      })
+
+      return
+    }
 
     if (minted) {
       setOpenThreads(prev => ({
@@ -1007,7 +1048,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
     }
   }
 
-  const submitReply = (thread: string) => {
+  const submitReply = async (thread: string) => {
     const text = (replyDrafts[thread] || '').trim()
     const images = imagesFor(thread)
 
@@ -1031,7 +1072,24 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
 
     // Reply box = CONTINUE this thread; the member turns it triggers are
     // scoped to it.
-    const sent = sendToGroupChat(group, memberDescriptors(), text, thread, images)
+    let sent: null | string = null
+
+    try {
+      sent = await sendToGroupChatDurably(group, memberDescriptors(), text, thread, images)
+    } catch (error) {
+      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
+
+      if (restored) {
+        setComposerDraft(restored)
+      }
+
+      host.notify({
+        kind: 'error',
+        message: error instanceof Error && error.message ? error.message : b.group.hostRejectedCommand
+      })
+
+      return
+    }
 
     if (sent) {
       setOpenThreads(prev => ({
@@ -1102,6 +1160,27 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
       <Codicon name="attach" />
     </Button>
   )
+
+  const downloadAttachment = async (entry: GroupMessage, attachment: Attachment) => {
+    try {
+      const resolved = attachment.data ? attachment : await readHostedGroupChatAttachment(group, entry, attachment)
+
+      if (!resolved.data) {
+        throw new Error('Attachment data is unavailable.')
+      }
+
+      const link = document.createElement('a')
+
+      link.href = resolved.data
+      link.download = resolved.name || 'attachment'
+      link.style.display = 'none'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch {
+      host.notify({ kind: 'error', message: b.group.attachmentDownloadFailed })
+    }
+  }
 
   // One log entry, rendered exactly as before conversation folding existed.
   const renderEntry = (entry: GroupMessage, index: number) => {
@@ -1203,15 +1282,22 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           {Array.isArray(entry.images) && entry.images.length ? (
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               {entry.images.map((img, imgIndex) =>
-                img.kind === 'pdf' || img.kind === 'file' ? (
-                  <div
-                    className="flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)"
-                    key={`${entryKey}:img:${imgIndex}`}
-                    title={img.name || 'attached file'}
-                  >
-                    <Codicon className="text-[0.8rem]" name={img.kind === 'pdf' ? 'file-pdf' : 'file'} />
-                    <span className="max-w-48 truncate">{img.name || 'attached file'}</span>
-                  </div>
+                img.kind === 'pdf' || img.kind === 'file' || !img.data ? (
+                  <Tip key={`${entryKey}:img:${imgIndex}`} label={b.group.downloadAttachment}>
+                    <Button
+                      className="h-auto max-w-60 gap-1 border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)"
+                      onClick={() => void downloadAttachment(entry, img)}
+                      size="sm"
+                      variant="ghost"
+                    >
+                      <Codicon
+                        className="shrink-0 text-[0.8rem]"
+                        name={img.kind === 'pdf' ? 'file-pdf' : img.kind === 'image' ? 'file-media' : 'file'}
+                      />
+                      <span className="truncate">{img.name || 'attached file'}</span>
+                      <Codicon className="shrink-0 text-[0.75rem]" name="cloud-download" />
+                    </Button>
+                  </Tip>
                 ) : (
                   <img
                     alt={img.name || 'attached image'}
@@ -1329,7 +1415,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           key={`replybox:${id}`}
           onSubmit={event => {
             event.preventDefault()
-            submitReply(id)
+            void submitReply(id)
           }}
         >
           {attachmentRow(id)}
@@ -1346,7 +1432,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
                 }))
               }
               onPaste={event => pasteImages(id, event)}
-              onSubmitDraft={() => submitReply(id)}
+              onSubmitDraft={() => void submitReply(id)}
               placeholder={b.group.replyInThreadPlaceholder}
               value={replyDrafts[id] || ''}
             />
@@ -1447,7 +1533,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
           className="grid gap-0"
           onSubmit={event => {
             event.preventDefault()
-            submit()
+            void submit()
           }}
         >
           {attachmentRow(null)}

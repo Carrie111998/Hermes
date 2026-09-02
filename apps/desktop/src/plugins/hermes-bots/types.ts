@@ -128,10 +128,16 @@ export type GroupMember = Pick<
 export type AttachmentKind = 'file' | 'image' | 'pdf'
 
 export interface Attachment {
-  /** Data URL. */
-  data: string
+  /** Local composer/preview data URL. Durable replay omits raw bytes. */
+  data?: string
+  /** Opaque gateway identity after durable staging. */
+  attachmentId?: string
   kind: AttachmentKind
+  mime?: string
   name: string
+  size?: number
+  /** Window-local idempotency key retained when a failed upload restores the draft. */
+  uploadId?: string
 }
 
 export interface GroupMessageAuthor {
@@ -187,6 +193,7 @@ export interface GroupChat {
     canStop?: boolean
     label: string
     reconnectMemberId?: string
+    retryCommandId?: string
     state: string
     taskId?: string
   }

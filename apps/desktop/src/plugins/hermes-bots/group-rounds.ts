@@ -3,8 +3,6 @@
  * @mention parse, the round-robin driver, the #93129 member holds, the stop
  * path, and the user send that starts it all.
  */
-import { host } from '@hermes/plugin-sdk'
-
 import { botFriendlyNames, botHandle, clearBotAttention, mentionNameForms, noteBotAttention } from './data'
 import { recordGroupActivity } from './group-activity'
 import {
@@ -29,7 +27,7 @@ import {
   beginHostedRoomMutation,
   groupChatContinuityReady,
   hostedRoomMutationIsCurrent,
-  sendHostedGroupChat,
+  queueHostedGroupChat,
   stopHostedGroupChat
 } from './hosted-room-runtime'
 import { botsText } from './i18n'
@@ -1048,6 +1046,84 @@ async function harvestStrandedUntilSettled(group: string, members: GroupMember[]
   })
 }
 
+/** Composer send with a durable hosted boundary. File staging and verified
+ * outbox insertion hold the room-order lock; only then is the optimistic
+ * message painted. Classic rooms retain the synchronous round engine. */
+export async function sendToGroupChatDurably(
+  group: string,
+  members: GroupMember[],
+  text: string,
+  thread?: null | string,
+  images?: Attachment[]
+) {
+  const room = $groupChats.get()[group]
+
+  if (!groupChatHostedGateway(room)) {
+    return sendToGroupChat(group, members, text, thread, images)
+  }
+
+  const trimmed = String(text || '').trim()
+  const attached = Array.isArray(images) ? images.filter((image): image is Attachment => Boolean(image?.data)) : []
+
+  if ((!trimmed && !attached.length) || !members.length || room.hostedStatus?.state === 'deleted') {
+    return null
+  }
+
+  if (!groupChatContinuityReady(room)) {
+    updateGroupChat(
+      group,
+      current => ({
+        ...current,
+        continuityIssue: current.continuityIssue || current.hostedStatus?.label || botsText().group.hostedSyncing
+      }),
+      { sync: false }
+    )
+
+    return null
+  }
+
+  const target = thread || mintGroupThreadId()
+  const commandId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const roomId = String(room.roomId || '')
+  const generation = beginHostedRoomMutation(roomId)
+
+  const message: GroupMessage = {
+    at: Date.now(),
+    from: { kind: 'user', name: 'You' },
+    id: commandId,
+    ...(attached.length ? { images: attached } : {}),
+    text: trimmed,
+    thread: target
+  }
+
+  await queueHostedGroupChat(group, message, target)
+
+  if (!hostedRoomMutationIsCurrent(roomId, generation) || !$groupChats.get()[group]) {
+    return target
+  }
+
+  $groupNeedsYou.set({
+    ...$groupNeedsYou.get(),
+    [group]: false
+  })
+  updateGroupChat(group, current => ({
+    ...current,
+    members: durableGroupChatMembers(members),
+    running: true,
+    hostedStatus: {
+      state: 'queued',
+      label: botsText().group.hostedQueued(hostedConnectionName(room))
+    },
+    continuityIssue: null
+  }))
+  const visibleAttachments = attached.map(({ uploadId: _uploadId, ...attachment }) => attachment)
+
+  appendGroupChatEntry(group, message.from, trimmed, target, visibleAttachments, commandId)
+  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
+
+  return target
+}
+
 /** User send into a group room. `thread` continues that thread (its reply
  *  box); omitted/null mints a NEW thread — the main composer's Slack shape.
  *  Appends, bumps the room epoch (supersedes any running loop at its next
@@ -1064,7 +1140,6 @@ export function sendToGroupChat(
   const attached = Array.isArray(images) ? images.filter((img: Attachment) => img && img.data) : []
   const roomBeforeSend = $groupChats.get()[group]
   const hosted = groupChatHostedGateway(roomBeforeSend)
-  const connectionName = hostedConnectionName(roomBeforeSend)
 
   if ((!trimmed && !attached.length) || !members.length) {
     return null
@@ -1087,12 +1162,7 @@ export function sendToGroupChat(
     return null
   }
 
-  if (hosted && attached.length) {
-    host.notify({
-      kind: 'info',
-      message: botsText().group.hostedAttachmentsUnavailable
-    })
-
+  if (hosted) {
     return null
   }
 
@@ -1123,76 +1193,6 @@ export function sendToGroupChat(
 
   if (!sent) {
     return null
-  }
-
-  if (hosted) {
-    const roomId = String(roomBeforeSend?.roomId || '')
-    const generation = beginHostedRoomMutation(roomId)
-
-    updateGroupChat(
-      group,
-      (room: GroupChatRoom) => ({
-        ...room,
-        running: true,
-        hostedStatus: {
-          state: 'sending',
-          label: botsText().group.hostedSending
-        }
-      }),
-      {
-        sync: false
-      }
-    )
-    recordGroupActivity(group, {
-      kind: 'queued',
-      member: 'You',
-      thread: target
-    })
-    void sendHostedGroupChat(group, sent, target)
-      .then(acknowledged => {
-        if (!hostedRoomMutationIsCurrent(roomId, generation)) {
-          return
-        }
-
-        updateGroupChat(
-          group,
-          room => ({
-            ...room,
-            running: true,
-            hostedStatus: {
-              state: acknowledged ? 'working' : 'queued',
-              label: acknowledged ? botsText().group.hostedWorking : botsText().group.hostedQueued(connectionName)
-            },
-            continuityIssue: acknowledged ? null : botsText().group.hostedQueuedHint(connectionName)
-          }),
-          {
-            sync: false
-          }
-        )
-      })
-      .catch(() => {
-        if (!hostedRoomMutationIsCurrent(roomId, generation)) {
-          return
-        }
-
-        updateGroupChat(
-          group,
-          room => ({
-            ...room,
-            running: false,
-            hostedStatus: {
-              state: 'failed',
-              label: botsText().group.hostedNeedsAttention
-            },
-            continuityIssue: botsText().group.hostedSendFailed(connectionName)
-          }),
-          {
-            sync: false
-          }
-        )
-      })
-
-    return target
   }
 
   const wasRunning = ($groupChats.get()[group] || {}).running === true

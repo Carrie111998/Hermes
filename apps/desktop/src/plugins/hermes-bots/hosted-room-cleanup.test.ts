@@ -62,12 +62,15 @@ function testLockManager() {
         }
 
         held.add(name)
+
         return Promise.resolve(callback({})).finally(() => held.delete(name))
       }
 
       const previous = tails.get(name) || Promise.resolve()
+
       const result = previous.then(async () => {
         held.add(name)
+
         try {
           return await callback({})
         } finally {
@@ -82,6 +85,7 @@ function testLockManager() {
           () => undefined
         )
       )
+
       return result
     }
   }
@@ -140,6 +144,7 @@ describe('hosted Group Chat cleanup journal', () => {
       const persisted = durable.get('hosted-room-cleanup-v1') as {
         operations: Array<{ ownerLeaseUntil: number; roomId: string }>
       }
+
       durable.set('hosted-room-cleanup-v1', {
         version: 1,
         operations: persisted.operations.map(operation =>
@@ -173,6 +178,7 @@ describe('hosted Group Chat cleanup journal', () => {
 
   it('rejects a cleanup write that production storage cannot read back', async () => {
     const cleanup = await loadCleanup()
+
     const storage = {
       get: vi.fn(async () => null),
       set: vi.fn(() => undefined)

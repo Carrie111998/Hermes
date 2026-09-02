@@ -59,7 +59,7 @@ describe('hosted Group Chat capability negotiation', () => {
         persistent_process: true,
         authority_gateway_id: 'install:home',
         features: ['peer_route_grant_fingerprint'],
-        methods: ['groups.peer.revoke_exact'],
+        methods: ['groups.peer.revoke_exact', 'groups.attachment.put', 'groups.attachment.read'],
         max_log_limit: 250
       },
       {
@@ -77,6 +77,7 @@ describe('hosted Group Chat capability negotiation', () => {
       kind: 'driver-capable',
       authorityId: 'install:home',
       exactPeerGrantRevoke: true,
+      limits: { attachments: true },
       persistentProcess: true,
       routeGrantFingerprint: true,
       maxLogLimit: 250
@@ -271,6 +272,40 @@ describe('hosted Group Chat capability negotiation', () => {
 })
 
 describe('hosted Group Chat replay', () => {
+  it('keeps only bounded opaque attachment metadata in replay', () => {
+    const replayed = reduceHostedRoomEvents(createHostedRoomReplayState({ roomId: 'room-1' }), [
+      event(1, 'message-1', 'message.user', {
+        attachments: [
+          {
+            attachment_id: 'att_0123456789abcdef0123456789abcdef',
+            kind: 'pdf',
+            mime: 'application/pdf',
+            name: 'review.pdf',
+            size: 42
+          },
+          {
+            attachment_id: '../local-path',
+            kind: 'file',
+            mime: 'text/plain',
+            name: 'unsafe.txt',
+            size: 1
+          }
+        ],
+        text: 'Review this'
+      })
+    ])
+
+    expect(replayed.messages[0].images).toEqual([
+      {
+        attachmentId: 'att_0123456789abcdef0123456789abcdef',
+        kind: 'pdf',
+        mime: 'application/pdf',
+        name: 'review.pdf',
+        size: 42
+      }
+    ])
+  })
+
   it('normalizes gateway epoch seconds before rendering relative time', () => {
     const seconds = 1_787_968_060.355
 
@@ -520,5 +555,37 @@ describe('hosted Group Chat command outbox', () => {
         }
       })
     ).toThrow(/waiting to sync/)
+  })
+
+  it('keeps a durable failed receipt outside the active cap and retries the same command id', () => {
+    const failed = reduceHostedRoomOutbox(
+      reduceHostedRoomOutbox(createHostedRoomOutbox(), { type: 'enqueue', command }),
+      {
+        type: 'terminal-failure',
+        commandId: command.commandId,
+        failureCode: 'retry-exhausted'
+      }
+    )
+
+    let full = failed
+
+    for (let index = 0; index < 256; index += 1) {
+      full = reduceHostedRoomOutbox(full, {
+        type: 'enqueue',
+        command: {
+          ...command,
+          commandId: `pending-${index}`,
+          roomId: `room-${index + 2}`
+        }
+      })
+    }
+
+    expect(full.commands).toHaveLength(257)
+    expect(reduceHostedRoomOutbox(failed, { type: 'retry', commandId: command.commandId }).commands[0]).toMatchObject({
+      attempts: 0,
+      commandId: command.commandId,
+      failureCode: null,
+      status: 'pending'
+    })
   })
 })

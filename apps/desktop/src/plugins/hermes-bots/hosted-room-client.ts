@@ -8,13 +8,14 @@
  * from React and the plugin lifecycle.
  */
 
-import type { GroupMember, GroupMessageAuthor } from './types'
+import type { Attachment, AttachmentKind, GroupMember, GroupMessageAuthor } from './types'
 
 const MIN_ROOM_MEMBERS = 2
 const MAX_ROOM_MEMBERS = 6
 const MAX_REPLAY_PAGE_SIZE = 500
 const MAX_REPLAY_PAGES = 100
 const FORBIDDEN_TRANSPORT_FIELD_TOKENS = new Set(['base64', 'byte', 'bytes', 'data', 'path', 'paths'])
+const ATTACHMENT_ID_RE = /^att_[0-9a-f]{32}$/
 export const ROOM_LINK_PROTOCOL_VERSION = 2
 
 export interface HostedRoomClientLimitations {
@@ -28,6 +29,15 @@ export const HOSTED_ROOM_CLIENT_LIMITATIONS: HostedRoomClientLimitations = Objec
   automaticFailover: false,
   crossGatewayMembers: true
 })
+
+function hostedCapabilityLimits(capabilities: Record<string, unknown>): HostedRoomClientLimitations {
+  const methods = Array.isArray(capabilities.methods) ? capabilities.methods.map(String) : []
+
+  return {
+    ...HOSTED_ROOM_CLIENT_LIMITATIONS,
+    attachments: methods.includes('groups.attachment.put') && methods.includes('groups.attachment.read')
+  }
+}
 
 const MAX_HOSTED_ROOM_OUTBOX_COMMANDS = 256
 
@@ -91,9 +101,45 @@ export interface HostedReplayMessage {
   at: number
   eventId: string
   from: GroupMessageAuthor
+  images?: Attachment[]
   seq: number
   text: string
   thread: string
+}
+
+function replayAttachments(value: unknown): Attachment[] {
+  if (!Array.isArray(value) || value.length > 8) {
+    return []
+  }
+
+  const result: Attachment[] = []
+
+  for (const raw of value) {
+    const item = record(raw)
+    const attachmentId = text(item?.attachment_id)
+    const kind = text(item?.kind) as AttachmentKind | null
+    const name = text(item?.name)
+    const mime = text(item?.mime)
+    const size = Number(item?.size)
+
+    if (
+      !attachmentId ||
+      !ATTACHMENT_ID_RE.test(attachmentId) ||
+      !kind ||
+      !['image', 'pdf', 'file'].includes(kind) ||
+      !name ||
+      !mime ||
+      !Number.isSafeInteger(size) ||
+      size < 0 ||
+      size > 15_000_000
+    ) {
+      continue
+    }
+
+    result.push({ attachmentId, kind, mime, name, size })
+  }
+
+  return result
 }
 
 export interface HostedRoomActivity {
@@ -153,6 +199,7 @@ export interface HostedRoomOutbox {
 
 export type HostedRoomOutboxAction =
   | { command: Partial<HostedRoomCommand>; type: 'enqueue' }
+  | { command: Partial<HostedRoomCommand>; type: 'enqueue-safety' }
   | { commandId: string; type: 'acknowledge' | 'dispatch' | 'retry' | 'transient-failure' }
   | { commandId: string; failureCode?: string; type: 'terminal-failure' }
 
@@ -374,7 +421,7 @@ export function classifyHostedRoomCapability(
       Array.isArray(capabilities.features) && capabilities.features.includes('peer_route_grant_fingerprint'),
     roomLink: roomLinkCapability(capabilities.room_link),
     maxLogLimit: positiveInteger(capabilities.max_log_limit, 100) || 100,
-    limits: HOSTED_ROOM_CLIENT_LIMITATIONS
+    limits: hostedCapabilityLimits(capabilities)
   }
 }
 
@@ -721,6 +768,7 @@ function memberLabel(event: HostedRoomEvent): string {
 
 function messageFromEvent(event: HostedRoomEvent): HostedReplayMessage {
   const user = event.kind === 'message.user'
+  const images = replayAttachments(event.payload.attachments)
 
   return {
     seq: event.seq,
@@ -732,7 +780,8 @@ function messageFromEvent(event: HostedRoomEvent): HostedReplayMessage {
     },
     text: typeof event.payload.text === 'string' ? event.payload.text : '',
     thread: text(event.payload.thread_id) || text(event.payload.thread) || 'legacy',
-    at: event.createdAt
+    at: event.createdAt,
+    ...(images.length ? { images } : {})
   }
 }
 
@@ -1136,20 +1185,46 @@ function commandSignature(command: HostedRoomCommand): string {
   })
 }
 
-export function createHostedRoomOutbox(persisted: unknown = null, recoverInFlight = true): HostedRoomOutbox {
+export function createHostedRoomOutbox(
+  persisted: unknown = null,
+  recoverInFlight = true,
+  tolerateInvalid = false
+): HostedRoomOutbox {
   const candidate = record(persisted)
   const commands: HostedRoomCommand[] = []
+  const quarantinedRooms = new Set<string>()
+  let quarantineTail = false
 
   for (const raw of Array.isArray(candidate?.commands) ? candidate.commands : []) {
-    const command = normalizeCommand((record(raw) || {}) as Partial<HostedRoomCommand>)
-    const existing = commands.find(entry => entry.commandId === command.commandId)
+    const rawRoomId = text(record(raw)?.roomId)
 
-    command.status = recoverInFlight && command.status === 'in-flight' ? 'pending' : command.status
+    if (quarantineTail || (rawRoomId && quarantinedRooms.has(rawRoomId))) {
+      continue
+    }
 
-    if (!existing) {
-      commands.push(command)
-    } else if (commandSignature(existing) !== commandSignature(command)) {
-      throw new TypeError(`commandId ${command.commandId} has conflicting persisted content`)
+    try {
+      const command = normalizeCommand((record(raw) || {}) as Partial<HostedRoomCommand>)
+      const existing = commands.find(entry => entry.commandId === command.commandId)
+
+      command.status = recoverInFlight && command.status === 'in-flight' ? 'pending' : command.status
+
+      if (!existing) {
+        commands.push(command)
+      } else if (commandSignature(existing) !== commandSignature(command)) {
+        throw new TypeError(`commandId ${command.commandId} has conflicting persisted content`)
+      }
+    } catch (error) {
+      if (!tolerateInvalid) {
+        throw error
+      }
+
+      if (rawRoomId) {
+        quarantinedRooms.add(rawRoomId)
+      } else {
+        // Without a room identity, no later row can be proven independent of
+        // the damaged command. Keep only the known-good prefix.
+        quarantineTail = true
+      }
     }
   }
 
@@ -1162,9 +1237,16 @@ export function createHostedRoomOutbox(persisted: unknown = null, recoverInFligh
 export function reduceHostedRoomOutbox(state: HostedRoomOutbox, action: HostedRoomOutboxAction): HostedRoomOutbox {
   const current = state && Array.isArray(state.commands) ? state : createHostedRoomOutbox()
 
-  if (action.type === 'enqueue') {
+  if (action.type === 'enqueue' || action.type === 'enqueue-safety') {
     const command = normalizeCommand(action.command)
-    const existing = current.commands.find(entry => entry.commandId === command.commandId)
+    const roomHasFailure = current.commands.some(entry => entry.roomId === command.roomId && entry.status === 'failed')
+
+    const commands =
+      action.type === 'enqueue-safety' && roomHasFailure
+        ? current.commands.filter(entry => entry.roomId !== command.roomId)
+        : current.commands
+
+    const existing = commands.find(entry => entry.commandId === command.commandId)
 
     command.status = 'pending'
 
@@ -1176,7 +1258,7 @@ export function reduceHostedRoomOutbox(state: HostedRoomOutbox, action: HostedRo
       return current
     }
 
-    if (current.commands.length >= MAX_HOSTED_ROOM_OUTBOX_COMMANDS) {
+    if (commands.filter(entry => entry.status !== 'failed').length >= MAX_HOSTED_ROOM_OUTBOX_COMMANDS) {
       throw new TypeError(
         'Too many Group Chat changes are waiting to sync. Reconnect the affected device and try again.'
       )
@@ -1184,7 +1266,7 @@ export function reduceHostedRoomOutbox(state: HostedRoomOutbox, action: HostedRo
 
     return {
       ...current,
-      commands: [...current.commands, command]
+      commands: [...commands, command]
     }
   }
 
@@ -1222,6 +1304,15 @@ export function reduceHostedRoomOutbox(state: HostedRoomOutbox, action: HostedRo
           ...command,
           status: 'failed' as const,
           failureCode: text(action.failureCode) || 'command-failed'
+        }
+      }
+
+      if (action.type === 'retry') {
+        return {
+          ...command,
+          status: 'pending' as const,
+          attempts: 0,
+          failureCode: null
         }
       }
 
