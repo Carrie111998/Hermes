@@ -569,7 +569,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3.5-plus",
         "big-pickle",
         "mimo-v2.5-free",
-        "hy3-free",
         "laguna-s-2.1-free",
         "nemotron-3-ultra-free",
         "nemotron-3.5-lightning-free",
@@ -583,12 +582,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # picker populated when the relay is unreachable. Note: this floor may lag
     # the live relay — that is intentional; the live revalidation is the
     # source of truth when reachable. Known-delisted models are REMOVED from
-    # the floor (x-preview-f-free delisted 2026-08-26 — offline fallback must
-    # not offer a model that 401s). deepseek-v4-flash-free and mimo-v2.5-free
-    # are back on the live list.
+    # the floor (x-preview-f-free delisted 2026-08-26; hy3-free delisted
+    # 2026-08-31 — dropped from live /zen/v1/models, anonymous requests 401
+    # 'Model hy3-free is not supported' — offline fallback must not offer a
+    # model that 401s). deepseek-v4-flash-free and mimo-v2.5-free are back on
+    # the live list.
     "opencode-free": [
         "deepseek-v4-flash-free",
-        "hy3-free",
         "mimo-v2.5-free",
         "laguna-s-2.1-free",
         "nemotron-3-ultra-free",

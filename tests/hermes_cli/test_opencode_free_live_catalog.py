@@ -32,10 +32,10 @@ from hermes_cli.models import (
 _STATIC_FLOOR = list(_PROVIDER_MODELS["opencode-free"])
 
 # The live relay's current free tier. x-preview-f-free was DELISTED 2026-08-26;
+# hy3-free was DELISTED 2026-08-31 (gone from live /models, anon 401);
 # deepseek-v4-flash-free + mimo-v2.5-free are back on the live list.
 _LIVE_FREE_MODELS = [
     "deepseek-v4-flash-free",
-    "hy3-free",
     "mimo-v2.5-free",
     "laguna-s-2.1-free",
     "nemotron-3-ultra-free",
