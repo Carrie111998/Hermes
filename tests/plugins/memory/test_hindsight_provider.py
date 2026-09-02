@@ -26,6 +26,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    UPDATE_MEMORY_SCHEMA,
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
@@ -83,8 +84,8 @@ def _make_mock_client():
     client.arecall = AsyncMock(
         return_value=SimpleNamespace(
             results=[
-                SimpleNamespace(text="Memory 1"),
-                SimpleNamespace(text="Memory 2"),
+                SimpleNamespace(id="mem-1", text="Memory 1"),
+                SimpleNamespace(id="mem-2", text="Memory 2"),
             ]
         )
     )
@@ -93,6 +94,8 @@ def _make_mock_client():
     )
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
+    client.memory = MagicMock()
+    client.memory.update_memory = AsyncMock(return_value={"id": "mem-1"})
     return client
 
 
@@ -237,15 +240,33 @@ class TestSchemas:
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
 
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_get_tool_schemas_returns_four(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
+        assert len(schemas) == 4
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {
+            "hindsight_retain", "hindsight_recall", "hindsight_reflect",
+            "hindsight_update_memory",
+        }
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
+
+    def test_update_memory_schema_requires_memory_id(self):
+        assert UPDATE_MEMORY_SCHEMA["name"] == "hindsight_update_memory"
+        props = UPDATE_MEMORY_SCHEMA["parameters"]["properties"]
+        assert set(props) == {"memory_id", "occurred_start", "occurred_end", "text", "context"}
+        assert UPDATE_MEMORY_SCHEMA["parameters"]["required"] == ["memory_id"]
+
+    def test_update_memory_schema_documents_relative_time_resolution(self):
+        # Guidance the model needs to resolve "yesterday"/"last week"/etc.
+        # against the current prompt time, and to distinguish point-in-time
+        # facts (start == end) from durations (distinct start/end).
+        description = UPDATE_MEMORY_SCHEMA["description"]
+        for phrase in ("yesterday", "last week", "two hours ago"):
+            assert phrase in description
+        assert "current prompt time" in description
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +531,23 @@ class TestToolHandlers:
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
 
+    def test_recall_output_surfaces_real_memory_id_for_update(self, provider):
+        # UPDATE_MEMORY_SCHEMA's memory_id description says "as returned by
+        # hindsight_recall" — pin that the recall tool actually surfaces the
+        # real memory id (not just a 1/2/3 enumerate index), so the id it
+        # returns is one hindsight_update_memory can accept.
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "dark mode"}
+        ))
+        assert "mem-1" in result["result"]
+        assert "mem-2" in result["result"]
+
+        provider.handle_tool_call(
+            "hindsight_update_memory", {"memory_id": "mem-1", "text": "corrected"}
+        )
+        call_kwargs = provider._client.memory.update_memory.call_args.kwargs
+        assert call_kwargs["memory_id"] == "mem-1"
+
 
     def test_reflect_success(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -525,12 +563,68 @@ class TestToolHandlers:
         assert "error" in result
 
 
+    def test_update_memory_sets_occurred_fields(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_update_memory",
+            {"memory_id": "mem-1", "occurred_start": "2026-08-24T03:48:54Z",
+             "occurred_end": "2026-08-24T03:48:54Z"},
+        ))
+        assert result["result"] == "Memory updated successfully."
+        provider._client.memory.update_memory.assert_called_once()
+        call_kwargs = provider._client.memory.update_memory.call_args.kwargs
+        assert call_kwargs["bank_id"] == "test-bank"
+        assert call_kwargs["memory_id"] == "mem-1"
+        request = call_kwargs["update_memory_request"]
+        assert request.occurred_start == "2026-08-24T03:48:54Z"
+        assert request.occurred_end == "2026-08-24T03:48:54Z"
+        # Fields the caller didn't pass stay unset on the request, so the
+        # server leaves them unchanged rather than clearing them.
+        assert request.text is None
+        assert request.context is None
+
+
+    def test_update_memory_missing_memory_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_update_memory", {"occurred_start": "2026-08-24T03:48:54Z"}
+        ))
+        assert "error" in result
+        provider._client.memory.update_memory.assert_not_called()
+
+
+    def test_update_memory_requires_at_least_one_field(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_update_memory", {"memory_id": "mem-1"}
+        ))
+        assert "error" in result
+        provider._client.memory.update_memory.assert_not_called()
+
+
+    def test_update_memory_empty_string_clears_field(self, provider):
+        provider.handle_tool_call(
+            "hindsight_update_memory", {"memory_id": "mem-1", "occurred_end": ""}
+        )
+        request = provider._client.memory.update_memory.call_args.kwargs["update_memory_request"]
+        # An explicit "" must be forwarded (clears server-side), not dropped
+        # like an omitted field would be.
+        assert request.occurred_end == ""
+
+
+    def test_update_memory_failure_returns_tool_error(self, provider):
+        provider._client.memory.update_memory.side_effect = RuntimeError(
+            "only world/experience facts can be curated"
+        )
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_update_memory", {"memory_id": "mem-1", "text": "corrected fact"}
+        ))
+        assert "error" in result
+
+
     def test_local_embedded_recall_reconnects_after_idle_shutdown(self, provider, monkeypatch):
         first_client = _make_mock_client()
         first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
         second_client = _make_mock_client()
         second_client.arecall.return_value = SimpleNamespace(
-            results=[SimpleNamespace(text="Recovered memory")]
+            results=[SimpleNamespace(id="mem-r1", text="Recovered memory")]
         )
         clients = iter([first_client, second_client])
 
@@ -542,7 +636,7 @@ class TestToolHandlers:
             "hindsight_recall", {"query": "test"}
         ))
 
-        assert result["result"] == "1. Recovered memory"
+        assert result["result"] == "1. [id: mem-r1] Recovered memory"
         assert provider._client is second_client
         first_client.arecall.assert_called_once()
         second_client.arecall.assert_called_once()
