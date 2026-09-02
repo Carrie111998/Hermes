@@ -30,7 +30,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.memory_manager import build_memory_context_block
-from agent.turn_context import build_turn_context, compose_user_api_content
+from agent.turn_context import (
+    build_turn_context,
+    cli_live_message_timestamp,
+    compose_user_api_content,
+)
 from hermes_state import SessionDB
 
 
@@ -47,6 +51,46 @@ class TestComposeUserApiContent:
         out = compose_user_api_content("hello", "likes tea", "PLUGIN-CTX")
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
+
+    def test_prepends_live_timestamp(self):
+        out = compose_user_api_content(
+            "hello", "", "", live_timestamp="[Tue 2026-04-28 13:40:53 CEST]"
+        )
+        assert out == "[Tue 2026-04-28 13:40:53 CEST] hello"
+
+    def test_live_timestamp_combines_with_other_injections(self):
+        out = compose_user_api_content(
+            "hello", "likes tea", "", live_timestamp="[Tue 2026-04-28 13:40:53 CEST]"
+        )
+        fenced = build_memory_context_block("likes tea")
+        assert out == "[Tue 2026-04-28 13:40:53 CEST] " + "hello" + "\n\n" + fenced
+
+
+# ---------------------------------------------------------------------------
+# cli_live_message_timestamp — CLI-only, config-gated, off by default
+# ---------------------------------------------------------------------------
+
+class TestCliLiveMessageTimestamp:
+    def test_none_for_non_cli_platform(self):
+        agent = types.SimpleNamespace(platform="telegram")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"agent": {"message_timestamps": {"enabled": True}}},
+        ):
+            assert cli_live_message_timestamp(agent, 1745836853.0) is None
+
+    def test_none_when_disabled_by_default(self):
+        agent = types.SimpleNamespace(platform="cli")
+        with patch("hermes_cli.config.load_config_readonly", return_value={}):
+            assert cli_live_message_timestamp(agent, 1745836853.0) is None
+
+    def test_renders_bracketed_prefix_when_enabled(self):
+        agent = types.SimpleNamespace(platform="cli")
+        cfg = {"agent": {"message_timestamps": {"enabled": True}}}
+        with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            out = cli_live_message_timestamp(agent, 1745836853.0)
+        assert out is not None
+        assert out.startswith("[") and out.endswith("]")
 
 
 
@@ -268,6 +312,40 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
+
+    def test_stamps_live_timestamp_when_cli_toggle_enabled(self):
+        """agent.message_timestamps.enabled=true stamps a live-clock sidecar
+        onto the CLI user message even with no other injections — the
+        stored/displayed content stays clean, only the wire copy carries it
+        (agent/system_prompt.py:878's "Conversation started" date otherwise
+        never updates for the life of the session)."""
+        agent = _FakeAgent()
+        assert agent.platform == "cli"
+        cfg = {"agent": {"message_timestamps": {"enabled": True}}}
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]), patch(
+            "hermes_cli.config.load_config_readonly", return_value=cfg
+        ):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"  # clean content untouched
+        assert msg["api_content"] != "hello"
+        assert msg["api_content"].endswith(" hello")
+        assert msg["api_content"].startswith("[")
+        assert agent.api_content_at_persist == msg["api_content"]
+
+    def test_no_live_timestamp_stamp_for_non_cli_platform(self):
+        """Same toggle must not fire for gateway platforms — they have their
+        own separate opt-in (gateway.message_timestamps) that rebuilds from
+        stored per-message metadata on every history replay; firing both
+        would double the prefix."""
+        agent = _FakeAgent()
+        agent.platform = "telegram"
+        cfg = {"agent": {"message_timestamps": {"enabled": True}}}
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]), patch(
+            "hermes_cli.config.load_config_readonly", return_value=cfg
+        ):
+            ctx = _build(agent)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
 
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the

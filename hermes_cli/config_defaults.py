@@ -43,6 +43,17 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Inject a human-readable timestamp prefix (e.g.
+        # "[Tue 2026-04-28 13:40:53 CEST]") onto each CLI user message IN THE
+        # MODEL'S CONTEXT, so a long-running session has live temporal
+        # awareness instead of only the date frozen in the system prompt at
+        # session start (agent/system_prompt.py). Off by default — when off,
+        # the model sees clean message text; persisted transcripts always
+        # stay clean either way. Gateway platforms have their own separate
+        # toggle for the same feature: ``gateway.message_timestamps``.
+        "message_timestamps": {
+            "enabled": False,
+        },
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —

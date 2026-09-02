@@ -132,12 +132,16 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    *,
+    live_timestamp: Optional[str] = None,
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default), plus an optional pre-rendered
+    ``live_timestamp`` prefix (see ``cli_live_message_timestamp``). All are
+    applied to the *API copy* of the user message only — the stored content
+    stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -147,7 +151,7 @@ def compose_user_api_content(
     what turn N sends must be what turn N+1 replays.
 
     Returns ``None`` when nothing is injected (multimodal/non-string content,
-    or no ephemeral context), meaning the message is sent as-is.
+    or no ephemeral context/timestamp), meaning the message is sent as-is.
     """
     if not isinstance(content, str):
         return None
@@ -158,9 +162,41 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
-    if not injections:
+    if not injections and not live_timestamp:
         return None
-    return content + "\n\n" + "\n\n".join(injections)
+    body = content + "\n\n" + "\n\n".join(injections) if injections else content
+    return f"{live_timestamp} {body}" if live_timestamp else body
+
+
+def cli_live_message_timestamp(agent: Any, msg_timestamp: Optional[float]) -> Optional[str]:
+    """Render a live ``[Tue 2026-08-23 09:31:10 CST]`` prefix for CLI turns.
+
+    Off by default — opt in via ``agent.message_timestamps.enabled`` in
+    config.yaml. Scoped to ``platform == "cli"`` only: gateway platforms have
+    their own separate opt-in (``gateway.message_timestamps``), rebuilt from
+    stored per-message metadata every time a session's history is replayed
+    from disk. A CLI session instead keeps its whole transcript as one
+    growing in-memory list, so this reuses the ``api_content`` sidecar
+    (composed once per turn via ``compose_user_api_content`` and replayed
+    byte-for-byte on every later turn) rather than gateway's rebuild-on-load
+    approach — either mechanism firing for the same turn would double the
+    prefix, so this never fires outside "cli".
+    """
+    if getattr(agent, "platform", None) != "cli":
+        return None
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return None
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    mt = agent_cfg.get("message_timestamps") if isinstance(agent_cfg, dict) else None
+    enabled = mt.get("enabled", False) if isinstance(mt, dict) else bool(mt)
+    if not enabled:
+        return None
+    from gateway.message_timestamps import format_message_timestamp
+    from hermes_time import get_timezone
+    return format_message_timestamp(msg_timestamp, tz=get_timezone()) or None
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -1587,7 +1623,12 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            live_timestamp=cli_live_message_timestamp(
+                agent, _turn_user_msg.get("timestamp")
+            ),
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
