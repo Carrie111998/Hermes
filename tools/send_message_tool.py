@@ -957,8 +957,11 @@ async def _send_via_adapter(
     for out-of-process callers (e.g. cron running separately from the gateway).
 
     Order of attempts:
-      1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
-         existed before this change).
+      1. **Live in-process adapter** via ``_gateway_runner_ref()``.
+         - Text is sent via ``adapter.send()``.
+         - Media are dispatched to ``send_image_file / send_voice / send_video /
+           send_document``.
+         - Failure is returned immediately — **no standalone fallback**.
       2. The plugin's ``standalone_sender_fn`` registered on its
          ``PlatformEntry`` (used when the gateway is not in this process, so
          the runner weakref is ``None``).
@@ -972,6 +975,9 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
+    media_files = media_files or []
+
+    # ── Live adapter ───────────────────────────────────────────────────
     if runner is not None:
         try:
             adapter = runner.adapters.get(platform)
@@ -993,6 +999,9 @@ async def _send_via_adapter(
                 # gets woken when the gateway loop resolves the future.
                 # When on a different loop, dispatch onto the gateway loop via
                 # run_coroutine_threadsafe and await the wrapped future.
+                # Media descriptors route through the adapter's native media
+                # APIs (same cross-loop rules apply — the media helper awaits
+                # adapter methods bound to the gateway loop).
                 gateway_loop = getattr(runner, "_gateway_loop", None)
                 try:
                     _current_loop = asyncio.get_running_loop()
@@ -1064,6 +1073,7 @@ async def _send_via_adapter(
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
 
+    # ── Standalone fallback ────────────────────────────────────────────
     entry = None
     try:
         from gateway.platform_registry import platform_registry
@@ -1446,6 +1456,28 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- QQBot: route through live adapter or standalone sender ---
+    # Both text and media are delivered via _send_via_adapter so that
+    # a single QQ outbound/upload implementation is used regardless of
+    # whether the gateway is in-process (live adapter) or standalone.
+    if platform == Platform.QQBOT:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- WeCom: native media attachment support via live gateway adapter ---
     if platform == Platform.WECOM and media_files:
         last_result = None
@@ -1500,8 +1532,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.BLUEBUBBLES:
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
-        elif platform == Platform.QQBOT:
-            result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
@@ -2375,83 +2405,6 @@ def _check_send_message():
         return is_gateway_running()
     except Exception:
         return False
-
-
-async def _send_qqbot(pconfig, chat_id, message):
-    """Send via QQBot using the REST API directly (no WebSocket needed).
-
-    Uses the QQ Bot Open Platform REST endpoints to get an access token
-    and post a message. Supports guild channels, C2C (private) chats,
-    and group chats by trying the appropriate endpoints.
-    """
-    try:
-        import httpx
-    except ImportError:
-        return _error("QQBot direct send requires httpx. Run: pip install httpx")
-
-    # Resolve credential fallbacks through the profile secret scope (with the
-    # plain-environ fallback for unscoped single-profile runs) so a multiplex
-    # profile's direct send never borrows another profile's QQ credentials.
-    from gateway.config import _getenv
-
-    extra = pconfig.extra or {}
-    appid = extra.get("app_id") or _getenv("QQ_APP_ID", "")
-    secret = (pconfig.token or extra.get("client_secret")
-              or _getenv("QQ_CLIENT_SECRET", ""))
-    if not appid or not secret:
-        return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Step 1: Get access token
-            token_resp = await client.post(
-                "https://bots.qq.com/app/getAppAccessToken",
-                json={"appId": str(appid), "clientSecret": str(secret)},
-            )
-            if token_resp.status_code != 200:
-                return _error(f"QQBot token request failed: {token_resp.status_code}")
-            token_data = token_resp.json()
-            access_token = token_data.get("access_token")
-            if not access_token:
-                return _error("QQBot: no access_token in response")
-
-            # Step 2: Send message via REST
-            # QQ Bot API has separate endpoints for channels, C2C, and groups.
-            # We try them in order: channel first, then fallback to C2C.
-            headers = {
-                "Authorization": f"QQBot {access_token}",
-                "Content-Type": "application/json",
-            }
-            payload = {"content": message[:4000], "msg_type": 0}
-
-            # Try channel endpoint first (works for guild channels)
-            url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code in {200, 201}:
-                data = resp.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
-            url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
-            resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
-            if resp_c2c.status_code in {200, 201}:
-                data = resp_c2c.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # If C2C also failed, try group endpoint
-            url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
-            resp_group = await client.post(url_group, json=payload, headers=headers)
-            if resp_group.status_code in {200, 201}:
-                data = resp_group.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # All endpoints failed — return the most informative error
-            return _error(f"QQBot send failed: channel={resp.status_code} c2c={resp_c2c.status_code} group={resp_group.status_code}")
-    except Exception as e:
-        return _error(f"QQBot send failed: {e}")
 
 
 async def _send_yuanbao(chat_id, message, media_files=None):
