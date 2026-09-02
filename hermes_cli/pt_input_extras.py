@@ -411,6 +411,25 @@ def install_modify_other_keys_aliases() -> int:
     _install_paired(7, ctrl_alt_map)
     _install_paired(8, ctrl_alt_map)  # Ctrl+Alt+Shift — same normalization
 
+    # -- Cmd/Super (9) and Cmd+Shift (10) letters & digits → plain chars ----
+    # macOS terminals normally intercept Cmd+key themselves (paste, window
+    # management, etc.), but when one passes a Cmd+letter through under
+    # modifyOtherKeys=2 / kitty (e.g. Cmd+V = ESC[27;9;118~) the sequence is
+    # otherwise unmapped and leaks as literal "[27;9;118~" text into the
+    # prompt.  We can't access the clipboard at the key-decode layer, so the
+    # least-surprising normalization is the plain character — the same way
+    # Ctrl+Shift / Ctrl+Alt combos above collapse onto their primary key.
+    # Digits included: Cmd+1..9 switches tabs in most terminals, but a
+    # passthrough should still type the digit rather than leak CSI noise.
+    super_map: dict[int, str] = {}
+    for ch in range(ord('a'), ord('z') + 1):
+        for cp in (ch, ch - 32):  # unshifted + shifted codepoints
+            super_map[cp] = chr(cp)
+    for d in range(10):
+        super_map[ord('0') + d] = str(d)
+    _install_paired(9, super_map)
+    _install_paired(10, super_map)
+
     # -- The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers) --
     # Disambiguate mode reports the Esc key as CSI-u so it is
     # distinguishable from the ESC byte that starts escape sequences

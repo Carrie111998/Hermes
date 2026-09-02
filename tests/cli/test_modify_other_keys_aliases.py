@@ -620,6 +620,31 @@ def test_cmd_backspace_alias_not_clobbered():
     assert _parse("\x1b[127;9u") == [Keys.ControlU]
 
 
+def test_super_letter_sequences_map_to_plain_char():
+    """Cmd/Super + letter must decode to the plain character, never leak.
+
+    Cmd+V under modifyOtherKeys=2 arrives as ESC[27;9;118~ — previously
+    unmapped, it leaked as literal "[27;9;118~" into the prompt.
+    """
+    install_modify_other_keys_aliases()
+    # modifyOtherKeys tilde form, Super (9) and Super+Shift (10)
+    assert _parse("\x1b[27;9;118~") == ["v"]
+    assert _parse("\x1b[27;10;118~") == ["v"]
+    # kitty CSI-u form, including lock-bit twins (9+64, 9+128)
+    assert _parse("\x1b[118;9u") == ["v"]
+    assert _parse("\x1b[118;73u") == ["v"]
+    assert _parse("\x1b[118;137u") == ["v"]
+    # shifted codepoint maps to the uppercase character
+    assert _parse("\x1b[27;9;86~") == ["V"]
+
+
+def test_super_digit_sequences_map_to_plain_char():
+    """Cmd/Super + digit must decode to the digit, never leak."""
+    install_modify_other_keys_aliases()
+    assert _parse("\x1b[27;9;49~") == ["1"]
+    assert _parse("\x1b[49;9u") == ["1"]
+
+
 # ---------------------------------------------------------------------------
 # Lock-bit variants (#89651): kitty/ghostty OR the CapsLock (64) / NumLock
 # (128) state into the CSI-u modifier parameter, so with a lock enabled
