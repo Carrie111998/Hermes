@@ -220,6 +220,13 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Compression-boundary hook. Fired once immediately before context
+    # compression discards old messages (agent/conversation_compression.py
+    # compress_context), while the full pre-compression transcript is still
+    # available. Plugins can capture or journal the about-to-be-summarised
+    # messages before they are lost. Observer-only: return values are ignored.
+    # Kwargs: messages, session_id, platform, compression_count, in_place.
+    "pre_compression",
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",

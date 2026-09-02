@@ -4120,6 +4120,27 @@ def compress_context(
             except Exception:
                 pass
 
+        # Notify plugins before compression discards context, so they can
+        # capture or journal the full pre-compression transcript. Fires AFTER
+        # the memory provider's on_pre_compress but BEFORE compress_fn runs, so
+        # `messages` is still the complete, unsummarised history.
+        # Observer-only: return values are ignored.
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+            _invoke_hook(
+                "pre_compression",
+                messages=messages,
+                session_id=agent.session_id,
+                platform=getattr(agent, "platform", "") or "",
+                compression_count=getattr(
+                    agent.context_compressor, "compression_count", 0
+                ),
+                in_place=in_place,
+            )
+        except Exception:
+            pass
+
         compress_fn = agent.context_compressor.compress
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,

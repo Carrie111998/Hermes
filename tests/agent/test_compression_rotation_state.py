@@ -2069,3 +2069,41 @@ class TestAbortedRotationDoesNotGrowParent:
 
         assert calls["n"] == 1, "the pre-flush guard never read the parent row"
         assert agent.session_id != parent  # rotation still happened
+
+
+class TestPreCompressionHook:
+    def test_pre_compression_fires_before_compress(self, tmp_path: Path):
+        """pre_compression fires once, before compress(), with the full messages."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_PRE_COMPRESS"
+        db.create_session(parent, source="telegram")
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+
+        msgs = _msgs()
+        with patch("hermes_cli.plugins.invoke_hook") as mock_invoke:
+            agent._compress_context(msgs, "sys", approx_tokens=120_000)
+
+        pre_calls = [
+            c for c in mock_invoke.call_args_list if c.args[0] == "pre_compression"
+        ]
+        assert pre_calls, "pre_compression hook was not fired"
+        assert len(pre_calls) == 1, "pre_compression fired more than once"
+        kwargs = pre_calls[0].kwargs
+        # The hook must receive the complete pre-compression transcript so a
+        # plugin can journal it before compress() summarises it away. The
+        # runner may adopt a durable snapshot (which annotates `_db_persisted`),
+        # so assert on content, not list identity.
+        hooked = kwargs["messages"]
+        assert len(hooked) >= len(msgs)
+        assert [m.get("content") for m in hooked[: len(msgs)]] == [
+            m["content"] for m in msgs
+        ]
+        assert kwargs["session_id"] == parent
+        assert kwargs["platform"] == "telegram"
+        assert kwargs["compression_count"] == 1
+        assert kwargs["in_place"] is False
+
+    def test_pre_compression_is_a_valid_hook(self):
+        from hermes_cli.plugins import VALID_HOOKS
+
+        assert "pre_compression" in VALID_HOOKS
