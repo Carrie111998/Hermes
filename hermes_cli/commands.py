@@ -787,6 +787,7 @@ _TELEGRAM_MENU_PRIORITY = (
     # Lower-priority but still useful operational built-ins.
     "reasoning",
     "usage",
+    "insights",
     "platforms",
     "platform",
     "profile",

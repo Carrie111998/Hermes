@@ -9949,9 +9949,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                scope = BotCommandScopeChat(chat_id=chat_id)
+                # A chat-specific menu may have been deliberately chosen via
+                # the Bot API.  Preserve it across gateway restarts instead of
+                # replacing it with the broad auto-generated list.
+                existing = await self._bot.get_my_commands(scope=scope)
+                if existing:
+                    self._forum_command_registered.add(chat_id)
+                    logger.info("[%s] Preserved existing chat-specific command menu for forum chat %s", self.name, chat_id)
+                    return
                 menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-                await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
+                await self._bot.set_my_commands(bot_commands, scope=scope)
                 self._forum_command_registered.add(chat_id)
                 logger.info("[%s] Lazy-registered %d commands for forum chat %s", self.name, len(bot_commands), chat_id)
             except Exception as e:

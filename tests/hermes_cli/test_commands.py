@@ -664,6 +664,18 @@ class TestDiscordSkillCmdKeyDispatch:
 class TestTelegramMenuCommands:
     """Integration: telegram_menu_commands enforces the 32-char limit."""
 
+    def test_default_menu_keeps_insights_visible(self, tmp_path, monkeypatch):
+        """A capped Telegram menu must keep aggregate usage discoverable."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        menu, hidden = telegram_menu_commands(max_commands=60)
+        names = [name for name, _description in menu]
+
+        assert len(menu) == 60
+        assert hidden > 0
+        assert "insights" in names
+
+
 
 
 
