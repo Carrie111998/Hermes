@@ -8,16 +8,17 @@ byte-identical because it never becomes a turn.
 import copy
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hermes_cli.bang_shell import (
-    USAGE_HINT,
     bang_shell_enabled,
     is_bang_command,
     parse_bang_command,
+    resolve_interactive_shell,
     run_bang_command,
+    run_bang_command_interactive,
 )
 
 
@@ -121,8 +122,81 @@ class TestBangExecution:
         assert code == 0
         assert "ok" in lines
 
+class _TerminalHandoff:
+    async def __aenter__(self):
+        return None
 
-# ── CLI handler: approval gate, usage hint, exit codes ─────────────────────
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+async def _run_inline(callback):
+    return callback()
+
+
+class TestInteractiveBangExecution:
+    @pytest.mark.asyncio
+    async def test_command_inherits_prompt_toolkit_terminal(self):
+        app = MagicMock()
+        app.input.fileno.return_value = 11
+        app.output.fileno.return_value = 12
+        proc = MagicMock()
+        proc.wait.return_value = 0
+
+        with patch(
+            "prompt_toolkit.application.in_terminal",
+            return_value=_TerminalHandoff(),
+        ), patch(
+            "prompt_toolkit.eventloop.run_in_executor_with_context",
+            side_effect=_run_inline,
+        ), patch("subprocess.Popen", return_value=proc) as popen:
+            code = await run_bang_command_interactive(app, "oauth-login")
+
+        assert code == 0
+        popen.assert_called_once()
+        assert popen.call_args.args == ("oauth-login",)
+        assert popen.call_args.kwargs["shell"] is True
+        assert popen.call_args.kwargs["stdin"] == 11
+        assert popen.call_args.kwargs["stdout"] == 12
+        assert popen.call_args.kwargs["stderr"] == 12
+        assert popen.call_args.kwargs["cwd"] is None
+
+    @pytest.mark.asyncio
+    async def test_bare_bang_runs_configured_shell_directly(self, monkeypatch):
+        monkeypatch.setenv("SHELL", "/bin/test-shell")
+        app = MagicMock()
+        app.input.fileno.return_value = 21
+        app.output.fileno.return_value = 22
+        proc = MagicMock()
+        proc.wait.return_value = 0
+
+        with patch(
+            "prompt_toolkit.application.in_terminal",
+            return_value=_TerminalHandoff(),
+        ), patch(
+            "prompt_toolkit.eventloop.run_in_executor_with_context",
+            side_effect=_run_inline,
+        ), patch("subprocess.Popen", return_value=proc) as popen:
+            code = await run_bang_command_interactive(app, None)
+
+        assert code == 0
+        assert popen.call_args.args == (["/bin/test-shell"],)
+        assert "shell" not in popen.call_args.kwargs
+        assert popen.call_args.kwargs["stdin"] == 21
+        assert popen.call_args.kwargs["stdout"] == 22
+        assert popen.call_args.kwargs["stderr"] == 22
+
+    def test_windows_shell_uses_comspec(self):
+        with patch("hermes_cli.bang_shell.os.name", "nt"), patch.dict(
+            os.environ,
+            {"COMSPEC": r"C:\Windows\System32\cmd.exe"},
+        ):
+            assert resolve_interactive_shell() == [
+                r"C:\Windows\System32\cmd.exe"
+            ]
+
+
+# ── CLI handler: approval gate, terminal handoff, exit codes ───────────────
 
 def _make_cli(history=None):
     """Build a HermesCLI shell with only what handle_bang_shell touches."""
@@ -155,12 +229,25 @@ class TestBangHandlerDispatch:
         assert cli.handle_bang_shell("please fix this bug!") is False
         assert cli.handle_bang_shell("/help") is False
 
-    def test_bare_bang_prints_usage_and_runs_nothing(self):
+    @pytest.mark.asyncio
+    async def test_bare_bang_launches_interactive_shell(self):
         cli = _make_cli()
-        with patch("hermes_cli.bang_shell.run_bang_command") as runner:
+        app = MagicMock()
+        app.is_running = True
+        scheduled = []
+        app.create_background_task.side_effect = scheduled.append
+        cli._app = app
+
+        with patch(
+            "hermes_cli.bang_shell.run_bang_command_interactive",
+            new=AsyncMock(return_value=0),
+        ) as runner:
             assert cli.handle_bang_shell("!") is True
-        runner.assert_not_called()
-        assert any(USAGE_HINT in line for line in _printed(cli))
+            assert len(scheduled) == 1
+            await scheduled[0]
+
+        runner.assert_awaited_once()
+        assert runner.await_args.args == (app, None)
 
     def test_command_output_is_printed(self):
         cli = _make_cli()
@@ -220,6 +307,30 @@ class TestBangApprovalGate:
         runner.assert_not_called()
         assert any("denied" in line.lower() for line in _printed(cli))
 
+    @pytest.mark.asyncio
+    async def test_denied_interactive_command_is_not_executed(self):
+        cli = _make_cli()
+        app = MagicMock()
+        app.is_running = True
+        scheduled = []
+        app.create_background_task.side_effect = scheduled.append
+        cli._app = app
+        cli._console_print = MagicMock()
+        gate = MagicMock(return_value={
+            "approved": False,
+            "message": "Command denied: recursive delete",
+        })
+
+        with patch("tools.terminal_tool._check_all_guards", gate), patch(
+            "hermes_cli.bang_shell.run_bang_command_interactive",
+            new=AsyncMock(return_value=0),
+        ) as runner:
+            assert cli.handle_bang_shell("!rm -rf /important") is True
+            await scheduled[0]
+
+        runner.assert_not_awaited()
+        assert "denied" in cli._console_print.call_args.args[0].lower()
+
     def test_real_gate_blocks_a_hardline_command(self):
         """End-to-end through the real approval module — no execution."""
         cli = _make_cli()
@@ -259,7 +370,7 @@ class TestBangLeavesHistoryByteIdentical:
     @pytest.mark.parametrize("submission", [
         "!echo history-check",     # succeeds
         "!exit 7",                 # non-zero exit
-        "!",                       # bare bang / usage hint
+        "!",                       # bare bang / interactive shell
         "!definitely-not-a-real-binary-xyz",  # command not found
     ])
     def test_history_is_byte_identical_before_and_after(self, submission):

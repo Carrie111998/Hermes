@@ -1,15 +1,15 @@
-"""``!<command>`` shell mode for the interactive CLI.
+"""Direct shell escapes for the interactive CLI.
 
-Typing ``!git status`` at the composer runs the command directly in the
-session's working directory. The model is never invoked: no user message, no
-assistant message, no tool result enters the conversation history, so a bang
-command costs zero tokens and cannot perturb role alternation or the prompt
-cache.
+Typing ``!git status`` runs one command in the session's working directory;
+typing a bare ``!`` hands the terminal to the user's shell until that shell
+exits. Both paths inherit the real terminal, so OAuth logins, pagers, REPLs,
+and other TTY-dependent programs work normally.
 
-A user-typed command still goes through the SAME dangerous-pattern approval
-gate the terminal tool uses (``tools.approval.check_all_command_guards``),
-reached here through ``tools.terminal_tool._check_all_guards`` so the CLI
-approval callback and Docker host-access handling behave identically.
+The model is never invoked: no user message, assistant message, or tool result
+enters conversation history. One-shot commands still pass through the terminal
+tool's dangerous-pattern approval gate. A bare ``!`` is an explicit escape
+into the user's own shell, so commands entered there are not mediated by
+Hermes.
 
 CLI-only by design: gateway/API/cron sessions have their own shells and no
 composer, so :func:`bang_shell_enabled` gates the feature off there.
@@ -21,7 +21,6 @@ import os
 import subprocess
 from typing import Optional
 
-USAGE_HINT = "Usage: !<command> — run a shell command without spending a model turn (e.g. !git status)"
 
 # Bang commands are interactive convenience, not agent work. Keep the ceiling
 # well under the terminal tool's foreground cap: a user watching output can
@@ -139,6 +138,67 @@ def _bang_env() -> dict:
         return _sanitize_subprocess_env(os.environ.copy())
     except Exception:
         return os.environ.copy()
+
+
+def resolve_interactive_shell() -> list[str]:
+    """Return the user's interactive shell without involving ``shell=True``."""
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC") or "cmd.exe"]
+    return [os.environ.get("SHELL") or "/bin/sh"]
+
+
+async def run_bang_command_interactive(
+    app,
+    command: Optional[str],
+    *,
+    cwd: Optional[str] = None,
+) -> int:
+    """Run a command, or the user's shell, on prompt_toolkit's real terminal."""
+    import sys
+
+    from prompt_toolkit.application import in_terminal
+    from prompt_toolkit.eventloop import run_in_executor_with_context
+
+    run_cwd = cwd if (cwd and os.path.isdir(os.path.expanduser(cwd))) else None
+    if run_cwd:
+        run_cwd = os.path.expanduser(run_cwd)
+
+    try:
+        input_fd = app.input.fileno()
+    except (AttributeError, OSError):
+        input_fd = sys.stdin.fileno()
+    try:
+        output_fd = app.output.fileno()
+    except (AttributeError, OSError):
+        output_fd = sys.stdout.fileno()
+
+    def run() -> int:
+        try:
+            if command is None:
+                proc = subprocess.Popen(
+                    resolve_interactive_shell(),
+                    stdin=input_fd,
+                    stdout=output_fd,
+                    stderr=output_fd,
+                    cwd=run_cwd,
+                    env=_bang_env(),
+                )
+            else:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdin=input_fd,
+                    stdout=output_fd,
+                    stderr=output_fd,
+                    cwd=run_cwd,
+                    env=_bang_env(),
+                )
+            return int(proc.wait() or 0)
+        except OSError:
+            return 127
+
+    async with in_terminal():
+        return await run_in_executor_with_context(run)
 
 
 def run_bang_command(

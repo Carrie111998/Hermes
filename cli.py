@@ -12444,13 +12444,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         through to normal routing.
         """
         from hermes_cli.bang_shell import (
-            USAGE_HINT,
             bang_shell_enabled,
             check_bang_approval,
             is_bang_command,
             parse_bang_command,
             resolve_bang_cwd,
             run_bang_command,
+            run_bang_command_interactive,
         )
 
         if not is_bang_command(text):
@@ -12462,10 +12462,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
 
         command = parse_bang_command(text)
+        cwd = resolve_bang_cwd(getattr(self, "session_id", None))
+        app = getattr(self, "_app", None)
+        on_event_loop = False
+        if app is not None and getattr(app, "is_running", False):
+            import asyncio
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                on_event_loop = True
+
+        if on_event_loop:
+            async def _run_interactive():
+                if command:
+
+                    approval = await asyncio.to_thread(check_bang_approval, command)
+                    if not approval.get("approved"):
+                        message = approval.get("message") or (
+                            f"Command denied: {approval.get('description', 'flagged as dangerous')}"
+                        )
+                        self._console_print(f"[bold red]{_escape(str(message))}[/]")
+                        return
+
+                exit_code = await run_bang_command_interactive(
+                    app,
+                    command or None,
+                    cwd=cwd,
+                )
+                if exit_code:
+                    self._console_print(f"[dim]! exited {exit_code}[/]")
+
+            app.create_background_task(_run_interactive())
+            return True
+
         if not command:
-            # Bare `!` — show what the feature does instead of running an
-            # empty shell or sending "!" to the model.
-            self._console_print(f"[dim]{USAGE_HINT}[/]")
+            # A real interactive application launches the user's shell for a
+            # bare `!`. Headless callers have no terminal to hand over.
             return True
 
         approval = check_bang_approval(command)
@@ -12476,7 +12511,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._console_print(f"[bold red]{_escape(str(message))}[/]")
             return True
 
-        cwd = resolve_bang_cwd(getattr(self, "session_id", None))
         exit_code = run_bang_command(
             command,
             cwd=cwd,
@@ -18753,19 +18787,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     event.app.invalidate()
                     return
 
+                # Shell escapes need prompt_toolkit to hand its real terminal
+                # to the child. Dispatch on the UI thread instead of queuing
+                # through process_loop, which cannot safely transfer the TTY.
+                if text.startswith("!") and self.handle_bang_shell(text):
+                    event.app.current_buffer.reset(append_to_history=True)
+                    event.app.invalidate()
+                    return
+
                 # Snapshot and clear attached images
                 images = list(self._attached_images)
                 self._attached_images.clear()
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
                 payload = (text, images) if images else text
-                # A bang command is treated like a slash command while the
-                # agent is busy: it must never be routed into steer/redirect
-                # (which would inject `!git status` into the model's context as
-                # a prompt). It queues and runs locally once the loop drains.
-                _is_local_dispatch = bool(text) and (
-                    _looks_like_slash_command(text) or text.strip().startswith("!")
-                )
+                _is_local_dispatch = bool(text) and _looks_like_slash_command(text)
                 if self._agent_running and not _is_local_dispatch:
                     _effective_mode = self.busy_input_mode
                     redirected = False

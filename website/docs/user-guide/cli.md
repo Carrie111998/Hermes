@@ -187,7 +187,7 @@ When resuming a previous session (`hermes -c` or `hermes --resume <id>`), a "Pre
 | `Ctrl+D` | Exit |
 | `Ctrl+Z` | Suspend Hermes to background (Unix only). Run `fg` in the shell to resume. |
 | `Tab` | Accept auto-suggestion (ghost text) or autocomplete slash commands |
-| `!<command>` | **Shell mode** — run a shell command yourself without spending a model turn (e.g. `!git status`, `!pytest -x`). See below. |
+| `!<command>` / `!` | **Shell mode** — run one command, or open your interactive shell, without spending a model turn. See below. |
 
 **Multiline paste preview.** When you paste a multi-line block, the CLI echoes a compact single-line preview (`[pasted: 47 lines, 1,842 chars — press Enter to send]`) instead of dumping the whole payload into the scrollback. The full content is still what gets sent; this is just display polish.
 
@@ -197,16 +197,20 @@ Start a line with `!` to run it as a shell command instead of sending it to the 
 
 ```
 > !git status
-> !ls -la
-> !pytest -x tests/cli
+> !hermes mcp login github
+> !
 ```
+
+One-shot commands and a shell opened by bare `!` inherit your real terminal.
+Interactive login flows, password prompts, pagers, and REPLs therefore work as
+they do outside Hermes. Type `exit` or press `Ctrl+D` to leave a shell opened
+by bare `!` and return to the Hermes composer.
 
 - **Zero cost.** The model is never invoked — no API call, no tokens, no latency.
 - **Nothing enters the conversation.** The command and its output are not added to history, so your context stays clean and the prompt cache is untouched.
 - **Runs where the agent's `terminal` tool runs.** Uses the session working directory, so `!pwd` matches what the agent would see.
-- **Approvals still apply.** A dangerous command (`rm -rf`, writes to `~/.hermes/config.yaml`, etc.) goes through the same approval prompt the agent's `terminal` tool uses. `!` is a cost/latency shortcut, not a security bypass.
-- **Non-zero exits are shown.** A failing command prints `! exited <code>` after its output.
-- `!` on its own prints a one-line usage reminder.
+- **One-shot approvals still apply.** `!<command>` goes through the same approval prompt as the agent's `terminal` tool. Bare `!` explicitly enters your own shell; commands entered there are not mediated by Hermes.
+- **Non-zero exits are shown.** A failing command or shell prints `! exited <code>` after it returns.
 
 Shell mode is CLI-only. Gateway platforms (Discord, Telegram, Slack) and cron runs ignore it — those users already have their own shells.
 
