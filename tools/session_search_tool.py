@@ -35,6 +35,7 @@ support.
 
 import json
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_state_common import _RESET_END_REASONS
@@ -94,6 +95,26 @@ _COMPACTION_PREFIXES = (
 # "new_session" is the CLI /new end reason (cli.py), which the gateway set
 # does not include.
 _FRESH_RESET_END_REASONS = frozenset(_RESET_END_REASONS) | {"new_session"}
+
+# Lazy import for the local BGE embedding engine for semantic search.
+# The engine instantiates a singleton ONNX session — we defer import so the
+# tool doesn't depend on onnxruntime/transformers unless semantic mode is used.
+_SEMANTIC_INDEX = None
+_SEMANTIC_INDEX_LOCK = threading.Lock()
+
+
+def _get_semantic_index():
+    global _SEMANTIC_INDEX
+    if _SEMANTIC_INDEX is None:
+        with _SEMANTIC_INDEX_LOCK:
+            if _SEMANTIC_INDEX is None:
+                try:
+                    from session_embedder import SessionEmbeddingIndex
+                    _SEMANTIC_INDEX = SessionEmbeddingIndex()
+                except Exception as e:
+                    logging.debug("Semantic search index unavailable: %s", e)
+                    _SEMANTIC_INDEX = False  # cache failure
+    return _SEMANTIC_INDEX if _SEMANTIC_INDEX is not False else None
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -767,8 +788,14 @@ def _discover(
     detail: str,
     current_session_id: str = None,
     link_profile: str = None,
+    semantic: bool = False,
 ) -> str:
-    """Discovery shape: FTS5 plus adaptive or full result hydration."""
+    """Discovery shape: FTS5 plus adaptive or full result hydration.
+
+    When ``semantic=True``, also runs embedding-based search and merges results
+    — FTS5 hits take priority, remaining slots are filled from semantic matches
+    not already covered by FTS5.
+    """
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
@@ -927,6 +954,41 @@ def _discover(
             entry["parent_session_id"] = lineage_root
         results.append(entry)
 
+    # ── Semantic enhancement: fill remaining slots with embedding matches ──
+    if semantic and results:
+        try:
+            semantic_idx = _get_semantic_index()
+            if semantic_idx is not None:
+                fts5_ids = {r["session_id"] for r in results}
+                semantic_hits = semantic_idx.search_semantic(
+                    query, top_k=limit * 2,
+                    exclude_ids=list(fts5_ids),
+                )
+                slot_count = limit - len(results)
+                for sh in semantic_hits[:slot_count]:
+                    try:
+                        session_meta = db.get_session(sh["session_id"]) or {}
+                    except Exception:
+                        session_meta = {}
+                    results.append({
+                        "session_id": sh["session_id"],
+                        "when": _format_timestamp(
+                            session_meta.get("started_at")
+                        ),
+                        "source": session_meta.get("source", "unknown"),
+                        "model": session_meta.get("model") or "unknown",
+                        "title": sh.get("title") or session_meta.get("title"),
+                        "semantic_score": sh["score"],
+                        "snippet": sh.get("preview", "")[:200],
+                        "bookend_start": [],
+                        "messages": [],
+                        "bookend_end": [],
+                        "messages_before": 0,
+                        "messages_after": 0,
+                    })
+        except Exception as e:
+            logging.debug("Semantic search merge skipped: %s", e)
+
     for entry in results:
         entry["link"] = _session_link(entry["session_id"], link_profile)
 
@@ -945,6 +1007,7 @@ def _discover(
             "title/id/date. To read more around a compact result, scroll: "
             "session_search(session_id=..., around_message_id=match_message_id)."
         ),
+        "semantic": semantic,
     }
     _annotate_rebuild_status(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
@@ -962,6 +1025,7 @@ def _session_search_impl(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    semantic: bool = False,
     # Cross-profile (any shape)
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
@@ -1076,6 +1140,7 @@ def _session_search_impl(
         detail=detail_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        semantic=semantic,
     )
 
 
@@ -1095,6 +1160,8 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Semantic rerank (keyword-only, appended last to preserve positional compat)
+    semantic: bool = False,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []
@@ -1121,6 +1188,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             sort=sort,
+            semantic=semantic,
             profile=profile,
             detail=detail,
             _owned_dbs=owned_dbs,
@@ -1243,6 +1311,17 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "semantic": {
+                "type": "boolean",
+                "description": (
+                    "Optional. When true, also runs local embedding-based search using "
+                    "the bge-small-zh model. FTS5 results are returned first with full "
+                    "context, and remaining slots are filled with semantic-only matches. "
+                    "Semantic-only results carry a `semantic_score` field (cosine similarity "
+                    "0-1). Default: false (pure FTS5). Requires the session_embedder "
+                    "module and BGE ONNX model to be installed."
+                ),
+            },
         },
         "required": [],
     },
@@ -1265,6 +1344,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         detail=args.get("detail", "adaptive"),
+        semantic=args.get("semantic", False),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
