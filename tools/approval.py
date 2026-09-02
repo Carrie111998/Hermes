@@ -1132,6 +1132,21 @@ DANGEROUS_PATTERNS = [
      "docker compose restart/stop/kill/down (container lifecycle)"),
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(restart|stop|kill)\b',
      "docker restart/stop/kill (container lifecycle)"),
+
+    # Cross-container exec / container escape: any user with docker.sock
+    # mounted can `docker exec <other-container> ...` and land as root
+    # inside a container it doesn't own (e.g. the gateway execing into the
+    # separate Forge container). `run`/`cp`/`create`/`commit`/`start` carry
+    # the same escape shape (spin up or hijack a container, or move data
+    # in/out of one). Read-only verbs (`ps`, `logs`, `inspect`, `images`,
+    # ...) are not in this alternation and stay auto-approved.
+    # `docker compose exec <svc> sh` and legacy `docker-compose exec` are the
+    # same escape, and global flags may sit between `docker`/`compose` and
+    # the verb (`docker --log-level debug exec ...`, `docker compose -f
+    # prod.yml run ...`), so mirror the lifecycle rules above: optional
+    # compose spelling, the same interleaved-flag loop, then the verb.
+    (r'\bdocker(?:-compose|\s+compose)?\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(exec|run|cp|create|commit|start)\b',
+     "docker exec/run/cp/create/commit/start (cross-container / container escape — root in the target container)"),
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
@@ -1165,6 +1180,30 @@ DANGEROUS_PATTERNS = [
     # that's the correct direction to err: an extra approval prompt is
     # cheap, a missed one took down the whole gateway fleet.
     (r'(?=[\s\S]*\blaunchctl\s+(?:stop|kickstart|bootout|unload|kill|disable|remove)\b)(?=[\s\S]*\b(?:hermes|ai\.hermes)\b)', "stop/restart hermes launchd service (kills running agents)"),
+    # Supervisor-primitive protection: the container gateway runs under an
+    # s6 supervision tree (PID 1 = s6 /init). The patterns above gate
+    # `hermes gateway stop|restart`, `docker compose restart/stop/kill/down`,
+    # and `pkill/killall hermes` — but the agent can reach straight past all
+    # of them to the underlying s6 primitives (or signal PID 1 directly) and
+    # produce the identical effect: the gateway dies and every in-flight
+    # agent turn is killed with it. Target the EFFECT/primitive rather than
+    # enumerating wrapper spellings, so this also covers a
+    # `docker exec hermes s6-svc ...` wrapper for free (detection runs over
+    # the full command string). See the 2026-07-12 crash-loop-guard audit.
+    #
+    # s6-svc's down/signal flags (-d down, -o once-down, -t SIGTERM,
+    # -k SIGKILL, -h SIGHUP, -i SIGINT, -q SIGQUIT, -p SIGSTOP, -r restart-ish
+    # combos). s6-svc is write-only by design, so gating the whole command
+    # unconditionally is safe; the read-only s6-svstat/s6-svwait siblings do
+    # not share the "s6-svc" token and are unaffected.
+    (r'\bs6-svc\b.*\s-[a-z0-9]*[dtkhioqrp]', "s6-svc down/signal flag (supervised service lifecycle)"),
+    # s6-svscanctl controls the whole supervision tree (rescan/halt/reload),
+    # i.e. every supervised process at once — always gate it.
+    (r'\bs6-svscanctl\b', "s6-svscanctl (supervision-tree control)"),
+    # Signaling PID 1 tears down the container's s6 /init and everything
+    # under it. The existing HARDLINE `kill -1` pattern requires a leading
+    # dash and does not match this bare-PID form, so it needs its own rule.
+    (r'\bkill\b\s+(-[^\s]+\s+)*1\b', "kill PID 1 (container init/supervision tree)"),
     # File copy/move/edit into sensitive system paths (/etc/ and macOS
     # /private/etc/ mirror).
     (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
