@@ -218,6 +218,7 @@ class PeerRunsHTTPClient:
         *,
         base_url: str,
         api_key: str,
+        target_profile: str | None = None,
         timeout_seconds: float = 30,
         receipt_db_path: Path | str | None = None,
         poll_min_seconds: float = 0.1,
@@ -229,6 +230,12 @@ class PeerRunsHTTPClient:
             raise ValueError("peer API key is missing or too short")
         self.base_url = base_url
         self.api_key = api_key
+        profile = str(target_profile or "").strip()
+        if profile and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", profile) is None:
+            raise ValueError("peer target profile is invalid")
+        self._profile_prefix = (
+            f"/p/{urllib.parse.quote(profile, safe='')}" if profile else ""
+        )
         self.timeout_seconds = float(timeout_seconds)
         self.receipt_db_path = Path(receipt_db_path) if receipt_db_path else None
         if poll_min_seconds <= 0 or poll_max_seconds < poll_min_seconds:
@@ -346,7 +353,7 @@ class PeerRunsHTTPClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(
-            f"{self.base_url}{path}",
+            f"{self.base_url}{self._profile_prefix}{path}",
             data=(
                 json.dumps(body, separators=(",", ":")).encode("utf-8")
                 if body is not None
@@ -981,33 +988,43 @@ class PeerRunsHTTPClient:
         replacement = str(refreshed.get("grant") or "")
         if not replacement:
             raise PeerRunsHTTPError("peer returned no refreshed room grant")
-        # Persist only after the target proves the replacement can authorize
-        # the same scoped capability endpoint.
-        probe = self.probe(grant=replacement)
-        from gateway.hosted_room_peer import GatewayRoomCatalog
+        try:
+            # Persist only after the target proves the replacement can authorize
+            # the same scoped capability endpoint.
+            probe = self.probe(grant=replacement)
+            from gateway.hosted_room_peer import GatewayRoomCatalog
 
-        catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
-        if (
-            execution_policy_digest is not None
-            and catalog.execution_policy.policy_digest
-            != execution_policy_digest
-        ):
-            raise PeerRunsHTTPError(
-                "peer room execution policy needs reauthorization",
-                status_code=403,
-                error_code="room_execution_policy_changed",
-                not_admitted=True,
-            )
-        if (
-            capability_digest is not None
-            and catalog.catalog_digest != capability_digest
-        ):
-            raise PeerRunsHTTPError(
-                "peer room capabilities need reauthorization",
-                status_code=403,
-                error_code="room_capability_catalog_changed",
-                not_admitted=True,
-            )
+            catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
+            if (
+                execution_policy_digest is not None
+                and catalog.execution_policy.policy_digest
+                != execution_policy_digest
+            ):
+                raise PeerRunsHTTPError(
+                    "peer room execution policy needs reauthorization",
+                    status_code=403,
+                    error_code="room_execution_policy_changed",
+                    not_admitted=True,
+                )
+            if (
+                capability_digest is not None
+                and catalog.catalog_digest != capability_digest
+            ):
+                raise PeerRunsHTTPError(
+                    "peer room capabilities need reauthorization",
+                    status_code=403,
+                    error_code="room_capability_catalog_changed",
+                    not_admitted=True,
+                )
+        except Exception:
+            try:
+                self.revoke_grant(grant=replacement)
+            except Exception:
+                logger.warning(
+                    "Could not revoke an unpublished refreshed room grant",
+                    exc_info=True,
+                )
+            raise
         return {**refreshed, "catalog": probe.get("catalog")}
 
     def revoke_grant(self, *, grant: str) -> Mapping[str, Any]:

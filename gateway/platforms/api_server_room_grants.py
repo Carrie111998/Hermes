@@ -198,8 +198,13 @@ async def _handle_room_member_invitation(
         claims = decode_room_grant(
             self._room_grant_secret(), token, permission="status"
         )
-        hosted_rooms.reserve_peer_room(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            reserve_grant_state,
+        )
+
+        reserve_grant_state(
+            grant_state_db_paths(),
             claims=claims,
             expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
@@ -345,6 +350,10 @@ async def _handle_room_member_grant_refresh(
             ttl_seconds=dispatch_ttl,
             status_expires_at=hard_expiry,
         )
+        # Close the refresh-versus-retirement race. If revocation landed after
+        # the first authorization check, never return the replacement. If it
+        # lands after this check, its scope timestamp also covers this token.
+        self._room_grant_claims(request, permission="dispatch")
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_openai_error)
     return web.json_response(
@@ -399,8 +408,13 @@ async def _handle_room_member_grant_revoke(
             or claims["target_install_id"] != installation_id
         ):
             raise ValueError("room grant target does not match this profile")
-        hosted_rooms.revoke_room_grant_scope(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            revoke_grant_state,
+        )
+
+        revoke_grant_state(
+            grant_state_db_paths(),
             claims=claims,
             expires_at=float(
                 claims.get("status_expires_at", claims["expires_at"])

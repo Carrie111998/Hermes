@@ -69,8 +69,6 @@ class HostedRoomService:
         server: ModuleType,
         *,
         db_path: Path | str | None = None,
-        peer_routes: Mapping[tuple[str, str], PeerMemberRoute] | None = None,
-        peer_clients: Mapping[Any, HostedRoomPeerClient] | None = None,
     ) -> None:
         self.server = server
         self.db_path = Path(db_path or hosted_rooms.default_db_path())
@@ -81,6 +79,7 @@ class HostedRoomService:
         self.rpc = HostedRoomServerRPC(server)
         self._link_load_error = None
         self._peer_route_status: dict[tuple[str, str], str] = {}
+        self._persisted_peer_route_keys: set[tuple[str, str]] = set()
         self.peer_routes = {}
         self.peer_clients = {}
         try:
@@ -97,6 +96,7 @@ class HostedRoomService:
                 client = PeerRunsHTTPClient(
                     base_url=stored.target_url,
                     api_key="",
+                    target_profile=stored.target_profile,
                     receipt_db_path=self.db_path,
                 )
                 route = PeerMemberRoute(
@@ -114,6 +114,9 @@ class HostedRoomService:
                 )
                 self.peer_routes[(stored.room_id, stored.member_id)] = route
                 self.peer_clients[(stored.room_id, stored.member_id)] = client
+                self._persisted_peer_route_keys.add(
+                    (stored.room_id, stored.member_id)
+                )
                 self._peer_route_status[(stored.room_id, stored.member_id)] = (
                     stored.status
                 )
@@ -121,15 +124,6 @@ class HostedRoomService:
                 self._link_load_error = ",".join(errors)
         except Exception as exc:
             self._link_load_error = str(exc)
-        supplied_routes = dict(peer_routes or {})
-        supplied_clients = dict(peer_clients or {})
-        self.peer_routes.update(supplied_routes)
-        for key, route in supplied_routes.items():
-            client = supplied_clients.get(key)
-            if client is None:
-                client = supplied_clients.get(route.target_install_id)
-            if client is not None:
-                self.peer_clients[key] = client
         self.runtime = HostedRoomRuntime(
             db_path=self.db_path,
             rooms=self.bindings,
@@ -205,7 +199,9 @@ class HostedRoomService:
         target_url: str | None = None,
         catalog: GatewayRoomCatalog | None = None,
     ) -> None:
-        """Register one verified route and optionally persist its scoped grant."""
+        """Persist and publish one verified route with its scoped grant."""
+        if target_url is None or catalog is None:
+            raise ValueError("peer route persistence identity is required")
         bind_store = getattr(client, "bind_receipt_store", None)
         if callable(bind_store):
             bind_store(self.db_path)
@@ -223,26 +219,34 @@ class HostedRoomService:
                 != catalog.execution_policy.policy_digest
             ):
                 raise ValueError("peer route does not match its target catalog")
-        if target_url is not None and catalog is not None:
-            hosted_room_links.save_room_link(
-                self.db_path,
-                hosted_room_links.make_stored_link(
-                    room_id=room_id,
-                    member_id=member_id,
-                    target_url=target_url,
-                    target_profile=route.target_profile,
-                    grant=route.grant,
-                    catalog=catalog,
-                    cancellation_scope_id=route.cancellation_scope_id,
-                    trace_id=route.trace_id,
-                ),
-            )
+        hosted_room_links.save_room_link(
+            self.db_path,
+            hosted_room_links.make_stored_link(
+                room_id=room_id,
+                member_id=member_id,
+                target_url=target_url,
+                target_profile=route.target_profile,
+                grant=route.grant,
+                catalog=catalog,
+                cancellation_scope_id=route.cancellation_scope_id,
+                trace_id=route.trace_id,
+            ),
+        )
         # Persistence is the publication boundary. A failed disk write must
         # never leave a process-local route that disappears after restart.
         with self._policy_lock:
-            self.peer_routes[(room_id, member_id)] = route
-            self.peer_clients[(room_id, member_id)] = client
-            self._peer_route_status[(room_id, member_id)] = "ready"
+            key = (room_id, member_id)
+            if hosted_rooms.room_link_retirement_started(
+                self.db_path,
+                room_id=room_id,
+            ):
+                raise hosted_rooms.HostedRoomError(
+                    "Group Chat route registration is fenced"
+                )
+            self.peer_routes[key] = route
+            self.peer_clients[key] = client
+            self._peer_route_status[key] = "ready"
+            self._persisted_peer_route_keys.add(key)
         self.runtime.wakeup()
 
     def revoke_room_routes(self, room_id: str) -> int:
@@ -253,6 +257,30 @@ class HostedRoomService:
         false successful disband while a grant is still live.
         """
         with self._policy_lock:
+            try:
+                room = hosted_rooms.room_state(
+                    self.db_path,
+                    room_id=room_id,
+                    include_disbanded=True,
+                )
+            except hosted_rooms.RoomNotFoundError:
+                authority_gateway_id = hosted_rooms.local_authority_gateway_id()
+                authority_epoch = 1
+            else:
+                authority_gateway_id = str(room["authority_gateway_id"])
+                authority_epoch = int(room["authority_epoch"])
+            hosted_rooms.begin_room_link_retirement(
+                self.db_path,
+                room_id=room_id,
+                authority_gateway_id=authority_gateway_id,
+                authority_epoch=authority_epoch,
+            )
+            links, errors = hosted_room_links.load_room_links_tolerant(self.db_path)
+            if any(error.startswith(f"{room_id}:") for error in errors):
+                raise RuntimeError("persisted peer room routes need repair")
+            for stored in links:
+                if stored.room_id == room_id:
+                    self._hydrate_persisted_peer_route(room_id, stored.member_id)
             routes = [
                 (key, route)
                 for key, route in self.peer_routes.items()
@@ -269,13 +297,98 @@ class HostedRoomService:
                 if not _grant_revoke_is_terminal(exc):
                     raise
 
+        hosted_rooms.complete_room_link_retirement(
+            self.db_path,
+            room_id=room_id,
+            authority_gateway_id=authority_gateway_id,
+            authority_epoch=authority_epoch,
+        )
         hosted_rooms.delete_room_link_records(self.db_path, room_id=room_id)
         with self._policy_lock:
             for key, route in routes:
                 self.peer_routes.pop(key, None)
                 self._peer_route_status.pop(key, None)
                 self.peer_clients.pop(key, None)
+                self._persisted_peer_route_keys.discard(key)
         return len(routes)
+
+    def _hydrate_persisted_peer_route(
+        self,
+        room_id: str,
+        member_id: str,
+    ) -> tuple[PeerMemberRoute, HostedRoomPeerClient] | None:
+        """Hydrate or refresh one exact route persisted by another process."""
+
+        key = (room_id, member_id)
+        with self._policy_lock:
+            route = self.peer_routes.get(key)
+            client = self.peer_clients.get(key)
+            if route is not None and client is not None and not isinstance(
+                client, PeerRunsHTTPClient
+            ):
+                return route, client
+            try:
+                stored = hosted_room_links.load_room_link(
+                    self.db_path,
+                    room_id=room_id,
+                    member_id=member_id,
+                )
+            except Exception as exc:
+                self.peer_routes.pop(key, None)
+                self.peer_clients.pop(key, None)
+                self._peer_route_status[key] = "needs_reauthorization"
+                raise RuntimeError("persisted peer room routes need repair") from exc
+            if stored is None:
+                if key in self._persisted_peer_route_keys:
+                    self.peer_routes.pop(key, None)
+                    self.peer_clients.pop(key, None)
+                    self._peer_route_status.pop(key, None)
+                    self._persisted_peer_route_keys.discard(key)
+                    return None
+                return (
+                    (route, client)
+                    if route is not None and client is not None
+                    else None
+                )
+            if PROTOCOL_VERSION not in stored.catalog.protocol_versions:
+                raise RuntimeError("persisted peer room route needs a protocol update")
+            if (
+                route is not None
+                and isinstance(client, PeerRunsHTTPClient)
+                and route.grant == stored.grant
+                and route.target_install_id == stored.catalog.installation_id
+                and route.target_profile == stored.target_profile
+                and route.capability_digest == stored.catalog.catalog_digest
+                and route.execution_policy_digest
+                == stored.catalog.execution_policy.policy_digest
+                and route.cancellation_scope_id == stored.cancellation_scope_id
+                and route.trace_id == stored.trace_id
+                and client.base_url == stored.target_url
+            ):
+                self._peer_route_status[key] = stored.status
+                return route, client
+            client = PeerRunsHTTPClient(
+                base_url=stored.target_url,
+                api_key="",
+                target_profile=stored.target_profile,
+                receipt_db_path=self.db_path,
+            )
+            route = PeerMemberRoute(
+                home_install_id=hosted_rooms.local_authority_gateway_id(),
+                member_id=stored.member_id,
+                target_install_id=stored.catalog.installation_id,
+                target_profile=stored.target_profile,
+                capability_digest=stored.catalog.catalog_digest,
+                execution_policy_digest=stored.catalog.execution_policy.policy_digest,
+                cancellation_scope_id=stored.cancellation_scope_id,
+                trace_id=stored.trace_id,
+                grant=stored.grant,
+            )
+            self.peer_routes[key] = route
+            self.peer_clients[key] = client
+            self._peer_route_status[key] = stored.status
+            self._persisted_peer_route_keys.add(key)
+            return route, client
 
     def _resolve_member_transport(
         self,
@@ -286,12 +399,15 @@ class HostedRoomService:
         member_id = str(
             payload.get("target_member_id") or payload.get("target_profile") or ""
         )
-        route = self.peer_routes.get((binding.room_id, member_id))
-        if route is None:
-            if self._member_is_peer(binding.room_id, member_id):
-                raise RuntimeError("peer room route is unavailable")
+        key = (binding.room_id, member_id)
+        route = self.peer_routes.get(key)
+        if route is None and not self._member_is_peer(binding.room_id, member_id):
             return self.rpc
-        client = self.peer_clients.get((binding.room_id, member_id))
+        hydrated = self._hydrate_persisted_peer_route(binding.room_id, member_id)
+        route = hydrated[0] if hydrated is not None else self.peer_routes.get(key)
+        if route is None:
+            raise RuntimeError("peer room route is unavailable")
+        client = hydrated[1] if hydrated is not None else self.peer_clients.get(key)
         if client is None:
             raise RuntimeError("peer room client is unavailable")
         identity = task.get("identity")
@@ -425,13 +541,10 @@ class HostedRoomService:
         route = self.peer_routes.get(key)
         if route is None:
             raise RuntimeError("peer room route is unavailable")
-        stored = next(
-            (
-                link
-                for link in hosted_room_links.load_room_links(self.db_path)
-                if (link.room_id, link.member_id) == key
-            ),
-            None,
+        stored = hosted_room_links.load_room_link(
+            self.db_path,
+            room_id=room_id,
+            member_id=member_id,
         )
         if stored is None:
             raise RuntimeError("peer room route cannot be renewed before persistence")
@@ -962,38 +1075,48 @@ class _RouteStatusPeerClient:
                                 raise RuntimeError(
                                     "peer returned no refreshed room grant"
                                 )
-                            refreshed_catalog = None
-                            if refreshed.get("catalog") is not None:
-                                from gateway.hosted_room_peer import (
-                                    GatewayRoomCatalog,
-                                )
+                            try:
+                                refreshed_catalog = None
+                                if refreshed.get("catalog") is not None:
+                                    from gateway.hosted_room_peer import (
+                                        GatewayRoomCatalog,
+                                    )
 
-                                refreshed_catalog = GatewayRoomCatalog.from_mapping(
-                                    refreshed.get("catalog")
-                                )
-                                if (
-                                    refreshed_catalog.execution_policy.policy_digest
-                                    != checked.execution_policy_digest
-                                ):
-                                    self._on_reauthorization()
-                                    raise PeerRunsHTTPError(
-                                        "peer room execution policy needs reauthorization",
-                                        status_code=403,
-                                        error_code="room_execution_policy_changed",
-                                        not_admitted=True,
+                                    refreshed_catalog = (
+                                        GatewayRoomCatalog.from_mapping(
+                                            refreshed.get("catalog")
+                                        )
                                     )
-                                if (
-                                    refreshed_catalog.catalog_digest
-                                    != checked.capability_digest
-                                ):
-                                    self._on_reauthorization()
-                                    raise PeerRunsHTTPError(
-                                        "peer room capabilities need reauthorization",
-                                        status_code=403,
-                                        error_code="room_capability_catalog_changed",
-                                        not_admitted=True,
+                                    if (
+                                        refreshed_catalog.execution_policy.policy_digest
+                                        != checked.execution_policy_digest
+                                    ):
+                                        raise PeerRunsHTTPError(
+                                            "peer room execution policy needs reauthorization",
+                                            status_code=403,
+                                            error_code="room_execution_policy_changed",
+                                            not_admitted=True,
+                                        )
+                                    if (
+                                        refreshed_catalog.catalog_digest
+                                        != checked.capability_digest
+                                    ):
+                                        raise PeerRunsHTTPError(
+                                            "peer room capabilities need reauthorization",
+                                            status_code=403,
+                                            error_code="room_capability_catalog_changed",
+                                            not_admitted=True,
+                                        )
+                                self._on_refreshed(replacement, refreshed_catalog)
+                            except Exception:
+                                revoke = getattr(self._client, "revoke_grant", None)
+                                if not callable(revoke):
+                                    raise RuntimeError(
+                                        "unpublished refreshed grant cannot be revoked"
                                     )
-                            self._on_refreshed(replacement, refreshed_catalog)
+                                revoke(grant=replacement)
+                                self._on_reauthorization()
+                                raise
                             kwargs = {**kwargs, "grant": replacement}
             try:
                 result = value(*args, **kwargs)
