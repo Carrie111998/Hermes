@@ -1178,3 +1178,114 @@ def test_nous_device_code_login_timeout_raises_actionable_message(monkeypatch):
     assert "CAPTCHA" in msg
     assert "hermes portal" in msg
     assert "https://portal.nousresearch.com/login" in msg
+
+
+@pytest.mark.parametrize(
+    "model_id, expected",
+    [
+        ("meta/muse-spark-1.2-contributor", True),
+        ("muse-spark-1.2-contributor", True),
+        ("meta/muse-spark-1.2-contributor-20260805", True),
+        ("meta/muse-spark-1.2", False),
+        ("muse-spark-1.2-contributor-free", False),
+        ("opencode/muse-spark-1.2-contributor-free", False),
+        ("", False),
+    ],
+)
+def test_is_nous_catalog_uncallable(model_id: str, expected: bool) -> None:
+    from hermes_cli.auth import is_nous_catalog_uncallable
+
+    assert is_nous_catalog_uncallable(model_id) is expected
+
+
+def test_fetch_nous_models_skips_catalog_uncallable_contributor(monkeypatch) -> None:
+    from hermes_cli import auth as auth_mod
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "meta/muse-spark-1.2-contributor"},
+                    {"id": "meta/muse-spark-1.2"},
+                    {"id": "anthropic/claude-opus-4.8"},
+                ]
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, *args, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr(auth_mod.httpx, "Client", _Client)
+    ids = auth_mod.fetch_nous_models(
+        inference_base_url="https://inference-api.nousresearch.com/v1",
+        api_key="sk-test",
+    )
+    assert "meta/muse-spark-1.2-contributor" not in ids
+    assert "meta/muse-spark-1.2" in ids
+    assert "anthropic/claude-opus-4.8" in ids
+
+
+class TestNousCatalogUncallable:
+    def test_paid_muse_spark_contributor_is_uncallable(self):
+        from hermes_cli.auth import is_nous_catalog_uncallable
+
+        assert is_nous_catalog_uncallable("meta/muse-spark-1.2-contributor") is True
+        assert is_nous_catalog_uncallable("muse-spark-1.2-contributor") is True
+        assert is_nous_catalog_uncallable(
+            "meta/muse-spark-1.2-contributor-20260805"
+        ) is True
+
+    def test_standard_and_free_variants_stay_selectable(self):
+        from hermes_cli.auth import is_nous_catalog_uncallable
+
+        assert is_nous_catalog_uncallable("meta/muse-spark-1.2") is False
+        assert is_nous_catalog_uncallable("muse-spark-1.2-contributor-free") is False
+        assert is_nous_catalog_uncallable("anthropic/claude-sonnet-4.6") is False
+
+    def test_fetch_nous_models_drops_uncallable_contributor(self, monkeypatch):
+        from hermes_cli.auth import fetch_nous_models
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "data": [
+                        {"id": "meta/muse-spark-1.2"},
+                        {"id": "meta/muse-spark-1.2-contributor"},
+                        {"id": "nousresearch/hermes-4-405b"},
+                    ]
+                }
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def get(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "Client", _Client)
+        ids = fetch_nous_models(
+            inference_base_url="https://inference-api.nousresearch.com/v1",
+            api_key="test-key",
+        )
+        assert "meta/muse-spark-1.2" in ids
+        assert "meta/muse-spark-1.2-contributor" not in ids
+        assert all("hermes" not in mid.lower() for mid in ids)

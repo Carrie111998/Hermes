@@ -569,6 +569,20 @@ class TestClassifyApiError:
         assert result.should_fallback is True
         assert result.retryable is False
 
+    def test_404_nous_opaque_couldnt_find_that_is_model_not_found(self):
+        """Portal catalog-listed-but-uncallable 404 must not retry (#95837)."""
+        e = MockAPIError(
+            'HTTP 404: {"status":404,"message":"Couldn\'t find that, sorry."}',
+            status_code=404,
+            body={"status": 404, "message": "Couldn't find that, sorry."},
+        )
+        result = classify_api_error(
+            e, provider="nous", model="meta/muse-spark-1.2-contributor"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+        assert result.should_fallback is True
+
     def test_404_generic(self):
         # Generic 404 with no "model not found" signal — common for local
         # llama.cpp/Ollama/vLLM endpoints with slightly wrong paths.  Treat

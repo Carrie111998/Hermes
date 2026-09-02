@@ -2220,8 +2220,14 @@ def get_curated_nous_model_ids() -> list[str]:
     except Exception:
         remote = None
     if remote:
-        return list(remote)
-    return list(_PROVIDER_MODELS.get("nous", []))
+        ids = list(remote)
+    else:
+        ids = list(_PROVIDER_MODELS.get("nous", []))
+    try:
+        from hermes_cli.auth import is_nous_catalog_uncallable
+    except Exception:
+        return ids
+    return [mid for mid in ids if not is_nous_catalog_uncallable(mid)]
 
 
 def _ai_gateway_model_is_free(pricing: Any) -> bool:

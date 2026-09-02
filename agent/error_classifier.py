@@ -419,6 +419,12 @@ _MODEL_NOT_FOUND_PATTERNS = [
     # and the error surfaces as a confusing "model not found" message
     # instead of automatically failing over.  See PR #58446.
     "no endpoints found that support tool use",
+    # Nous Portal catalog-listed-but-not-callable 404 (#95837, #45362).
+    # Prefixed ids such as meta/muse-spark-1.2-contributor return this
+    # opaque body instead of "model not found" / "does not exist". Without
+    # this entry the 404 falls through to unknown+retryable and burns three
+    # identical attempts before the user sees anything.
+    "couldn't find that, sorry",
 ]
 
 

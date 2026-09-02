@@ -6585,6 +6585,25 @@ def _refresh_access_token(
     raise AuthError(description, provider="nous", code=code, relogin_required=relogin)
 
 
+def is_nous_catalog_uncallable(model_id: str) -> bool:
+    """True when Portal lists *model_id* but chat/responses cannot serve it.
+
+    Paid Muse Spark contributor slugs appear in GET /v1/models (and on the
+    Portal pricing page) but every POST /v1/chat/completions and
+    /v1/responses returns HTTP 404 ``Couldn't find that, sorry.`` — the
+    catalog-listed-but-not-callable class from #95837. The free Zen
+    ``-contributor-free`` SKU is a different provider and stays selectable.
+    """
+    low = (model_id or "").strip().lower()
+    if not low:
+        return False
+    return (
+        "muse-spark" in low
+        and "contributor" in low
+        and "free" not in low
+    )
+
+
 def fetch_nous_models(
     *,
     inference_base_url: str,
@@ -6623,6 +6642,8 @@ def fetch_nous_models(
             mid = model_id.strip()
             # Skip Hermes models — they're not reliable for agentic tool-calling
             if "hermes" in mid.lower():
+                continue
+            if is_nous_catalog_uncallable(mid):
                 continue
             model_ids.append(mid)
 
