@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import nullcontext
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -1004,12 +1005,47 @@ class GatewayKanbanWatchersMixin:
                             # push-capable adapters (the non-push /
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
-                            await deliver_wake(
-                                adapter,
-                                text=_synth,
-                                session_id=_session_key,
-                                source=_source,
-                            )
+                            # Run the wake turn under the target profile's
+                            # runtime scope (#93851): handle_message() here
+                            # bypasses the inbound dispatch layer that
+                            # installs the per-turn secret scope, so under
+                            # multiplexing the woken agent's credential
+                            # reads and in-turn adapter/client resolution
+                            # fell back to the default profile — its Slack
+                            # bot is not a member of the target DM and
+                            # every in-turn send failed channel_not_found,
+                            # silently losing the completion report. Same
+                            # _profile_runtime_scope wrapper slash commands
+                            # use for the identical bypass; a resolution
+                            # failure falls back to the unscoped wake
+                            # (exactly the old behavior) rather than
+                            # skipping the turn.
+                            try:
+                                # Local import: gateway.run imports this
+                                # module — hoisting it would be a cycle.
+                                from gateway.run import _profile_runtime_scope
+
+                                _wake_ctx = _profile_runtime_scope(
+                                    self._resolve_profile_home_for_source(_source)
+                                )
+                            except Exception as exc:
+                                # Fail-open to the unscoped wake (the old
+                                # behavior) rather than skipping the turn —
+                                # but leave a trace so operators can tell
+                                # scoped from unscoped wakes in retrospect.
+                                logger.warning(
+                                    "kanban notifier: profile scope unavailable"
+                                    " for %s/%s (%s); delivering unscoped",
+                                    platform_str, sub["chat_id"], exc,
+                                )
+                                _wake_ctx = nullcontext()
+                            with _wake_ctx:
+                                await deliver_wake(
+                                    adapter,
+                                    text=_synth,
+                                    session_id=_session_key,
+                                    source=_source,
+                                )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,

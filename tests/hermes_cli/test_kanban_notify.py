@@ -1158,3 +1158,155 @@ def test_gc_archived_rows_already_removed_by_unsub(kanban_home):
         assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_notifier_wake_runs_under_profile_secret_scope(kanban_home, tmp_path):
+    """The wake turn must run inside the target profile's secret scope (#93851).
+
+    handle_message() in the wake path bypasses the inbound dispatch layer
+    that installs the per-turn profile scope, so under multiplexing the
+    woken agent's credential reads and in-turn adapter resolution fell
+    back to the default profile — its Slack bot was not a member of the
+    target DM and every in-turn send failed channel_not_found, silently
+    losing the completion report.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    profile_home = tmp_path / "profiles" / "jini"
+    profile_home.mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="scoped task", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake", notifier_profile="jini",
+        )
+        kb.block_task(conn, tid, reason="scoped block")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+    # notifier_profile="jini" routes adapter resolution through the
+    # multiplex per-profile registry, not the default map.
+    runner._profile_adapters = {"jini": {Platform.TELEGRAM: fake_adapter}}
+    runner._resolve_profile_home_for_source = lambda source: profile_home
+
+    scope_at_wake: list = [None]
+    home_override_at_wake: list = [None]
+
+    async def _capture_wake(*args, **kwargs):
+        from agent.secret_scope import current_secret_scope
+        from hermes_constants import get_hermes_home_override
+        scope_at_wake[0] = current_secret_scope()
+        home_override_at_wake[0] = get_hermes_home_override()
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock(side_effect=_capture_wake)
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    wake_mock.assert_awaited_once()
+    assert scope_at_wake[0] is not None, (
+        "wake turn ran without any profile secret scope active"
+    )
+    # Identity, not just presence: a regression that wrapped the wake in the
+    # DEFAULT profile's scope would still pass the check above.
+    assert home_override_at_wake[0] == str(profile_home), (
+        "wake turn ran under the wrong profile's scope"
+    )
+
+
+@pytest.mark.asyncio
+async def test_notifier_wake_fails_open_unscoped_on_resolution_error(
+    kanban_home, tmp_path, caplog
+):
+    """Resolution failure must degrade to the unscoped wake (the old
+    behavior), not skip the turn — and leave a warning trace so operators
+    can tell scoped from unscoped wakes apart (#93851 review)."""
+    import logging
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="fail-open task", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat1",
+            delivery_mode="notify+wake", notifier_profile="jini",
+        )
+        kb.block_task(conn, tid, reason="fail-open block")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+    runner._profile_adapters = {"jini": {Platform.TELEGRAM: fake_adapter}}
+
+    def _boom(source):
+        raise RuntimeError("profile home lookup exploded")
+
+    runner._resolve_profile_home_for_source = _boom
+
+    scope_at_wake: list = ["unset"]
+
+    async def _capture_wake(*args, **kwargs):
+        from agent.secret_scope import current_secret_scope
+        scope_at_wake[0] = current_secret_scope()
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    wake_mock = AsyncMock(side_effect=_capture_wake)
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("gateway.wake.deliver_wake", new=wake_mock), \
+         caplog.at_level(logging.WARNING, logger="gateway.kanban_watchers"):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    wake_mock.assert_awaited_once(), (
+        "resolution failure must not skip the wake turn"
+    )
+    assert scope_at_wake[0] is None, (
+        "failed scope resolution should deliver the wake unscoped"
+    )
+    assert any(
+        "profile scope unavailable" in r.message for r in caplog.records
+    ), "fail-open fallback should leave a warning trace"
