@@ -4423,6 +4423,34 @@ class TestRunConversation:
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/reasoning" in result["final_response"]
 
+    def test_length_unterminated_think_runs_continuation(self, agent):
+        """An unterminated <think> is truncation, not thinking-budget exhaustion.
+
+        The closing tag never arrived because the output cap was hit, so the
+        continuation ladder (which boosts the output budget 2x..16x) is exactly
+        the right recovery and must not be short-circuited. Regression: these
+        responses used to dead-end after a single API call with a message
+        telling the user to LOWER reasoning effort, when the actual remedy is
+        more output tokens.
+        """
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="<think>internal reasoning cut off mid-thou",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Continuation must be attempted, not skipped.
+        assert result["api_calls"] > 1
+        assert "Thinking Budget Exhausted" not in (result["final_response"] or "")
+
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)

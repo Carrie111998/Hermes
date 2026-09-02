@@ -4158,9 +4158,27 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # An opening reasoning tag with NO closing tag means the model
+                    # was cut off mid-thought: the closing tag never arrived because
+                    # the output cap was hit.  That is an ordinary truncation, and
+                    # the continuation ladder (2x..16x budget, up to 4 attempts) is
+                    # built to recover it, so it must not be short-circuited here.
+                    # Only a CLOSED reasoning block with nothing after it means the
+                    # model finished thinking and produced no answer.
+                    # ``_strip_think_blocks`` strips an unterminated open tag through
+                    # to end of string, so ``_has_content_after_think_block`` returns
+                    # False for both shapes and cannot separate them on its own.
+                    _think_block_closed = bool(
+                        _trunc_content and re.search(
+                            r'</(?:think|thinking|reasoning|REASONING_SCRATCHPAD)\s*>',
+                            _trunc_content,
+                            re.IGNORECASE,
+                        )
+                    )
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
                         and _has_think_tags
+                        and _think_block_closed
                         and (
                             (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
                             or _trunc_content is None
