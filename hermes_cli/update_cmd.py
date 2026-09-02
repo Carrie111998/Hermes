@@ -35,6 +35,7 @@ import time as _time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import get_default_hermes_root, venv_python_path
@@ -3162,6 +3163,7 @@ OFFICIAL_REPO_URLS = {
 }
 
 OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
@@ -3180,9 +3182,56 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
         pass
     return None
 
+
+def _canonical_remote_url(url: Optional[str]) -> str:
+    """Normalize common GitHub remote forms to ``host/owner/repo``."""
+    value = str(url or "").strip().lower()
+
+    if value.startswith("git@github.com:"):
+        value = f"github.com/{value[len('git@github.com:'):]}"
+    elif value.startswith("ssh://git@github.com/"):
+        value = f"github.com/{value[len('ssh://git@github.com/'):]}"
+    else:
+        try:
+            parsed = urlsplit(value)
+            if parsed.hostname and parsed.path:
+                value = f"{parsed.hostname}{parsed.path}"
+        except ValueError:
+            pass
+
+    value = value.rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    return value
+
+
+def _is_official_ssh_remote(url: Optional[str]) -> bool:
+    """Whether *url* is the official Hermes repo over an SSH transport."""
+    value = str(url or "").strip().lower()
+    if not (value.startswith("git@") or value.startswith("ssh://")):
+        return False
+    return _canonical_remote_url(value) == OFFICIAL_REPO_CANONICAL
+
+
+def _git_cmd_for_remote_fetch(
+    git_cmd: list[str], remote: str, remote_url: Optional[str]
+) -> list[str]:
+    """Use anonymous HTTPS for official SSH fetches without mutating Git config.
+
+    Public Hermes source does not need SSH authentication. The command-local
+    URL override prevents a FIDO2/passkey prompt during update while preserving
+    the user's configured remote and all fork/custom SSH remotes.
+    """
+    if not _is_official_ssh_remote(remote_url):
+        return git_cmd
+    return [*git_cmd, "-c", f"remote.{remote}.url={OFFICIAL_REPO_URL}"]
+
+
 def _is_fork(origin_url: Optional[str]) -> bool:
     """Check if the origin remote points to a fork (not the official repo)."""
     if not origin_url:
+        return False
+    if _canonical_remote_url(origin_url) == OFFICIAL_REPO_CANONICAL:
         return False
     # Normalize URL for comparison (strip trailing .git if present)
     normalized = origin_url.rstrip("/")
@@ -4629,20 +4678,24 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # before spending a network fetch on it. Non-fork installs have no
         # 'upstream' remote, and the old flow burned a failed network attempt
         # (~0.3-1 s) on every --check before falling back to origin.
-        has_upstream_remote = (
-            subprocess.run(
-                git_cmd + ["remote", "get-url", "upstream"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).returncode
-            == 0
+        upstream_probe = subprocess.run(
+            git_cmd + ["remote", "get-url", "upstream"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
         )
+        has_upstream_remote = upstream_probe.returncode == 0
+        upstream_url = upstream_probe.stdout.strip() if has_upstream_remote else None
         fetch_result = None
         if has_upstream_remote:
             print("→ Fetching from upstream...")
+            fetch_git_cmd = _git_cmd_for_remote_fetch(
+                git_cmd, "upstream", upstream_url
+            )
+            if fetch_git_cmd != git_cmd:
+                print("  (using anonymous HTTPS for the official SSH remote)")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["upstream", branch],
+                fetch_git_cmd + ["fetch"] + depth_args + ["upstream", branch],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -4653,8 +4706,14 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         else:
             # No upstream remote, or the upstream fetch failed — use origin.
             print("→ Fetching from origin...")
+            origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
+            fetch_git_cmd = _git_cmd_for_remote_fetch(
+                git_cmd, "origin", origin_url
+            )
+            if fetch_git_cmd != git_cmd:
+                print("  (using anonymous HTTPS for the official SSH remote)")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch"] + depth_args + ["origin", branch],
+                fetch_git_cmd + ["fetch"] + depth_args + ["origin", branch],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -4664,8 +4723,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     else:
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
+        origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
+        fetch_git_cmd = _git_cmd_for_remote_fetch(git_cmd, "origin", origin_url)
+        if fetch_git_cmd != git_cmd:
+            print("  (using anonymous HTTPS for the official SSH remote)")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            fetch_git_cmd + ["fetch"] + depth_args + ["origin", branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -8586,8 +8649,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._warn_orphaned_update_autostashes(git_cmd, _m().PROJECT_ROOT)
 
         print("→ Fetching updates...")
+        fetch_git_cmd = _git_cmd_for_remote_fetch(git_cmd, "origin", origin_url)
+        if fetch_git_cmd != git_cmd:
+            print("  (using anonymous HTTPS for the official SSH remote)")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            fetch_git_cmd + ["fetch", "origin", branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
