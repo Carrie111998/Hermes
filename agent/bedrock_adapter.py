@@ -1887,6 +1887,15 @@ def classify_bedrock_error(error_message: str) -> str:
 # Static fallback table for models where the Bedrock API doesn't expose
 # context window sizes.  Used by agent/model_metadata.py when dynamic
 # detection is unavailable.
+#
+# Rows marked "measured" were obtained by sending Converse a prompt padded
+# just past the suspected window and reading the maximum out of the resulting
+# ValidationException.  Length validation runs before inference, so a rejected
+# probe costs nothing.  This matters because several vendors return a length
+# error with no number in it at all — Nova ("Input Tokens Exceeded: Number of
+# input tokens exceeds maximum length.") and DeepSeek R1 ("Input is too long
+# for requested model.") both do — which means probe_bedrock_context_length()
+# returns None for them and this table is their only source of truth.
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Anthropic Claude models on Bedrock.
@@ -1921,13 +1930,36 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     "amazon.nova-lite":              300_000,
     "amazon.nova-micro":             128_000,
     # Meta Llama
-    "meta.llama4-maverick":          128_000,
-    "meta.llama4-scout":             128_000,
+    # Llama 4 is long-context, not 128K. Both rows were capping it at an
+    # eighth (Maverick) and a twenty-seventh (Scout) of the real window, so a
+    # Llama 4 session compacted almost immediately.
+    # Maverick measured against Converse in us-east-1 and us-east-2 — both
+    # reject at the same value: "This model's maximum context length is
+    # 1048576 tokens". The model card rounds that to "1M"; the API enforces
+    # the exact binary multiple, so use the enforced number.
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-4-maverick-17b-instruct.html
+    "meta.llama4-maverick":          1_048_576,
+    # Scout measured at 3,500,000: "This model's maximum context length is
+    # 3500000 tokens". Deliberately *not* the 10M its Bedrock model card
+    # states — that is Meta's native window, and Bedrock serves less. Taking
+    # the documented figure here would overshoot by 3x and turn premature
+    # compaction into hard ValidationExceptions, so the measured value wins.
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-4-scout-17b-instruct.html
+    "meta.llama4-scout":             3_500_000,
     "meta.llama3-3-70b-instruct":    128_000,
     # Mistral
     "mistral.mistral-large":         128_000,
+    "mistral.pixtral-large":         131_072,   # measured
     # DeepSeek
     "deepseek.v3":                   128_000,
+    "deepseek.v3.2":                 163_840,   # measured; longest-match beats "deepseek.v3"
+    # MiniMax — measured identically on minimax-m2, m2.1 and m2.5.
+    "minimax.minimax-m2":            196_608,
+    # Moonshot Kimi K2. Bedrock ships this family under two different vendor
+    # prefixes ("moonshot." and "moonshotai."), so the key deliberately omits
+    # the prefix to match both. Measured identically on kimi-k2-thinking and
+    # kimi-k2.5.
+    "kimi-k2":                       262_144,
     # OpenAI on Bedrock (Mantle/Responses route)
     # https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards-openai.html
     "openai.gpt-5.5":                272_000,

@@ -1112,6 +1112,119 @@ class TestBedrockContextProbe:
                 region="eu-central-1") == 1_000_000
 
 
+class TestMeasuredBedrockContextWindows:
+    """Pin context windows that were measured against live Bedrock Converse.
+
+    Each value here came from padding a Converse request just past the
+    suspected window and reading the maximum out of the ValidationException.
+    The tests assert against the real model IDs Bedrock serves — including the
+    ``us.`` inference-profile forms the picker actually offers — because the
+    lookup is substring-based and it is the *resolution* that regressed, not
+    the literal dict entry.
+    """
+
+    # (model_id, expected_window)
+    MEASURED = [
+        # Llama 4 was the actual bug: both rows read 128_000, capping Maverick
+        # at 1/8 and Scout at 1/27 of their real windows.
+        ("meta.llama4-maverick-17b-instruct-v1:0", 1_048_576),
+        ("us.meta.llama4-maverick-17b-instruct-v1:0", 1_048_576),
+        ("meta.llama4-scout-17b-instruct-v1:0", 3_500_000),
+        ("us.meta.llama4-scout-17b-instruct-v1:0", 3_500_000),
+        ("us.mistral.pixtral-large-2502-v1:0", 131_072),
+        ("deepseek.v3.2", 163_840),
+        ("minimax.minimax-m2", 196_608),
+        ("minimax.minimax-m2.1", 196_608),
+        ("minimax.minimax-m2.5", 196_608),
+        # Bedrock ships Kimi K2 under two vendor prefixes.
+        ("moonshot.kimi-k2-thinking", 262_144),
+        ("moonshotai.kimi-k2.5", 262_144),
+    ]
+
+    @pytest.mark.parametrize("model_id,expected", MEASURED)
+    def test_measured_window_resolves(self, model_id, expected):
+        from agent.bedrock_adapter import _static_bedrock_context_length
+        assert _static_bedrock_context_length(model_id) == expected
+
+    @pytest.mark.parametrize("model_id,expected", MEASURED)
+    def test_measured_window_is_not_the_default(self, model_id, expected):
+        """The regression these rows fix: every one of these models silently
+        took the 128K default (or, for Llama 4, an explicit wrong 128K), so the
+        agent compacted long before it had to."""
+        from agent.bedrock_adapter import (
+            BEDROCK_DEFAULT_CONTEXT_LENGTH,
+            _static_bedrock_context_length,
+        )
+        assert _static_bedrock_context_length(model_id) != BEDROCK_DEFAULT_CONTEXT_LENGTH
+        assert expected > BEDROCK_DEFAULT_CONTEXT_LENGTH
+
+    def test_deepseek_v3_2_longest_match_beats_v3(self):
+        """``deepseek.v3`` is a substring of ``deepseek.v3.2``; longest-match
+        must pick the more specific row or v3.2 silently reads 128K."""
+        from agent.bedrock_adapter import _static_bedrock_context_length
+        assert _static_bedrock_context_length("deepseek.v3.2") == 163_840
+        assert _static_bedrock_context_length("deepseek.v3-v1:0") == 128_000
+
+    def test_llama4_rows_do_not_shadow_each_other(self):
+        from agent.bedrock_adapter import _static_bedrock_context_length
+        assert _static_bedrock_context_length(
+            "meta.llama4-scout-17b-instruct-v1:0"
+        ) != _static_bedrock_context_length(
+            "meta.llama4-maverick-17b-instruct-v1:0"
+        )
+
+    def test_llama3_is_untouched(self):
+        """Only Llama 4 is long-context; the Llama 3 rows must stay 128K."""
+        from agent.bedrock_adapter import _static_bedrock_context_length
+        assert _static_bedrock_context_length(
+            "meta.llama3-3-70b-instruct-v1:0") == 128_000
+
+
+class TestBedrockLengthErrorDialects:
+    """``parse_context_limit_from_error`` against verbatim Bedrock errors.
+
+    These strings were captured from real ValidationExceptions during the
+    measurement above.  Bedrock has several length-error dialects and two of
+    them carry no number at all, which is why the static table remains the
+    only source of truth for those models.
+    """
+
+    def test_llama4_dialect_parses(self):
+        from agent.model_metadata import parse_context_limit_from_error
+        msg = (
+            "An error occurred (ValidationException) when calling the Converse "
+            "operation: The model returned the following errors: This model's "
+            "maximum context length is 1048576 tokens. Please reduce the "
+            "length of the prompt"
+        )
+        assert parse_context_limit_from_error(msg) == 1_048_576
+
+    def test_scout_3_5m_is_within_the_sanity_ceiling(self):
+        """The largest window Bedrock actually serves must survive the
+        1024..10_000_000 sanity check rather than being discarded."""
+        from agent.model_metadata import parse_context_limit_from_error
+        msg = (
+            "The model returned the following errors: This model's maximum "
+            "context length is 3500000 tokens. Please reduce the length of "
+            "the prompt"
+        )
+        assert parse_context_limit_from_error(msg) == 3_500_000
+
+    @pytest.mark.parametrize("msg", [
+        # Nova: no number anywhere in the message.
+        "The model returned the following errors: Input Tokens Exceeded: "
+        "Number of input tokens exceeds maximum length. Please update the "
+        "input to try again.",
+        # DeepSeek R1: likewise.
+        "The model returned the following errors: Input is too long for "
+        "requested model.",
+    ])
+    def test_numberless_dialects_return_none(self, msg):
+        """None is the right answer — the caller must fall back to the static
+        table rather than invent a window."""
+        from agent.model_metadata import parse_context_limit_from_error
+        assert parse_context_limit_from_error(msg) is None
+
 
 # ---------------------------------------------------------------------------
 # Tool-calling capability detection
