@@ -2207,6 +2207,7 @@ def _validate_job_mode_invariants(
     no_agent: bool,
     script: Optional[str],
     delivery_source: Optional[str] = None,
+    delivery_script: Optional[str] = None,
 ) -> None:
     """Shared create/update validation for job execution-mode invariants.
 
@@ -2232,9 +2233,9 @@ def _validate_job_mode_invariants(
             "delivery_source='script' cannot be combined with no_agent=True — "
             "no_agent already delivers script stdout without running an agent."
         )
-    if delivery_source == "script" and not script:
+    if delivery_source == "script" and not delivery_script:
         raise ValueError(
-            "delivery_source='script' requires a pre-run script."
+            "delivery_source='script' requires a post-run delivery script."
         )
 
 
@@ -2274,6 +2275,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     delivery_source: Optional[str] = None,
+    delivery_script: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2342,10 +2344,15 @@ def create_job(
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
         delivery_source: Optional operator-owned delivery boundary. ``script``
-                keeps the agent run and full saved transcript, but successful
-                chat delivery uses the pre-run script stdout as its body. Script
-                failure fails closed and never falls back to agent narration.
-                ``None``/``agent`` preserves the existing final-response path.
+                keeps the agent run and full saved transcript, then runs
+                ``delivery_script`` exactly once and uses its stdout as the
+                successful chat-delivery body. Delivery-script failure fails
+                closed and never falls back to agent narration. ``None``/``agent``
+                preserves the existing final-response path.
+        delivery_script: Optional post-agent script used only with
+                ``delivery_source='script'``. It is distinct from the pre-run
+                ``script`` wake/context hook so monitor jobs can project state
+                written by the completed agent turn.
 
     Returns:
         The created job dict
@@ -2376,6 +2383,10 @@ def create_job(
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_delivery_source = _normalize_delivery_source(delivery_source)
+    normalized_delivery_script = (
+        str(delivery_script).strip() if isinstance(delivery_script, str) else None
+    )
+    normalized_delivery_script = normalized_delivery_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -2399,6 +2410,7 @@ def create_job(
         normalized_no_agent,
         normalized_script,
         normalized_delivery_source,
+        normalized_delivery_script,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2421,6 +2433,7 @@ def create_job(
     # covered, not just `hermes cron create`.
     from cron.lifecycle_guard import check_gateway_lifecycle
     check_gateway_lifecycle(prompt_text, normalized_script)
+    check_gateway_lifecycle(prompt_text, normalized_delivery_script)
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -2492,6 +2505,8 @@ def create_job(
     }
     if normalized_delivery_source is not None:
         job["delivery_source"] = normalized_delivery_source
+    if normalized_delivery_script is not None:
+        job["delivery_script"] = normalized_delivery_script
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2612,6 +2627,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["delivery_source"]
                 )
 
+            if "delivery_script" in updates:
+                _delivery_script = updates["delivery_script"]
+                _delivery_script = (
+                    str(_delivery_script).strip()
+                    if isinstance(_delivery_script, str)
+                    else None
+                )
+                updates["delivery_script"] = _delivery_script or None
+
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
             # None) clears. Invalid values raise BEFORE the merge so the
@@ -2670,6 +2694,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 "no_agent",
                 "script",
                 "delivery_source",
+                "delivery_script",
             }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
@@ -2679,6 +2704,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                     updated.get("delivery_source") or None,
+                    updated.get("delivery_script") or None,
+                )
+
+            if {
+                "prompt",
+                "script",
+                "delivery_source",
+                "delivery_script",
+            }.intersection(updates):
+                from cron.lifecycle_guard import check_gateway_lifecycle
+
+                _updated_prompt = _coerce_job_text(updated.get("prompt")).strip()
+                check_gateway_lifecycle(_updated_prompt, updated.get("script") or None)
+                check_gateway_lifecycle(
+                    _updated_prompt, updated.get("delivery_script") or None
                 )
 
             if any(k in updates for k in _PAYLOAD_FIELDS):

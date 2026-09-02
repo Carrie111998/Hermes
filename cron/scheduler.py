@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -353,10 +354,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             f"⚠️ Cron '{job_name}' failed: script timed out. "
             "No model was invoked. Full details saved in cron output."
         )
-    if lower.startswith("pre-run delivery script failed"):
+    if lower.startswith("post-run delivery script failed"):
         return (
-            f"⚠️ Cron '{job_name}' failed: pre-run delivery script failed. "
-            "No model was invoked. Full details saved in cron output."
+            f"⚠️ Cron '{job_name}' failed: post-run delivery script failed. "
+            "The agent response was not delivered. Full details saved in cron output."
         )
 
     # Provider/API failures are the common noisy path. Keep these short.
@@ -764,6 +765,12 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+def _is_script_delivery_silent(text: str) -> bool:
+    """Return whether authoritative post-run script stdout suppresses delivery."""
+    stripped = text.strip()
+    return not stripped or stripped == SILENT_MARKER
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -4273,6 +4280,8 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    preserve_stdout: bool = False,
+    expected_sha256: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4355,6 +4364,19 @@ def _run_job_script(
         return False, f"Script not found: {path}"
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
+    if expected_sha256 is not None:
+        try:
+            with path.open("rb") as script_file:
+                if os.fstat(script_file.fileno()).st_size > 1024 * 1024:
+                    return False, f"Script changed before execution: {path}"
+                script_bytes = script_file.read(1024 * 1024 + 1)
+            if len(script_bytes) > 1024 * 1024:
+                return False, f"Script changed before execution: {path}"
+            current_sha256 = hashlib.sha256(script_bytes).hexdigest()
+        except OSError as exc:
+            return False, f"Script identity check failed: {exc}"
+        if current_sha256 != expected_sha256:
+            return False, f"Script changed before execution: {path}"
 
     script_timeout = _get_script_timeout()
 
@@ -4445,7 +4467,9 @@ def _run_job_script(
             except subprocess.TimeoutExpired:
                 continue
 
-        stdout = (stdout_raw or "").strip()
+        stdout = stdout_raw or ""
+        if not preserve_stdout:
+            stdout = stdout.strip()
         stderr = (stderr_raw or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
@@ -4477,6 +4501,8 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    preserve_stdout: bool = False,
+    expected_sha256: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4498,7 +4524,13 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            preserve_stdout=preserve_stdout,
+            expected_sha256=expected_sha256,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4529,15 +4561,97 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            preserve_stdout=preserve_stdout,
+            expected_sha256=expected_sha256,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            preserve_stdout=preserve_stdout,
+            expected_sha256=expected_sha256,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
         # heartbeat is already waiting on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _delivery_script_identity(
+    script_path: str,
+) -> Optional[tuple[str, str, bytes]]:
+    """Return the resolved path, SHA-256 and bounded immutable script bytes."""
+    scripts_dir = (_get_hermes_home() / "scripts").resolve()
+    try:
+        raw = Path(script_path).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+        path.relative_to(scripts_dir)
+        if not path.is_file():
+            return None
+        with path.open("rb") as script_file:
+            if os.fstat(script_file.fileno()).st_size > 1024 * 1024:
+                return None
+            content = script_file.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            return None
+        return str(path), hashlib.sha256(content).hexdigest(), content
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _run_delivery_script_snapshot(
+    job: dict,
+    identity: tuple[str, str, bytes],
+    workdir: Optional[str],
+    cancel_event: Optional[_CancelEventLike],
+) -> tuple[bool, str]:
+    """Execute immutable validated delivery-script bytes from a private copy."""
+    import tempfile
+
+    original_path = Path(identity[0])
+    snapshot_path: Optional[Path] = None
+    try:
+        fd, raw_snapshot_path = tempfile.mkstemp(
+            prefix=f".{original_path.stem}-delivery-",
+            suffix=original_path.suffix,
+            dir=original_path.parent,
+        )
+        snapshot_path = Path(raw_snapshot_path)
+        with os.fdopen(fd, "wb") as snapshot_file:
+            snapshot_file.write(identity[2])
+            snapshot_file.flush()
+            os.fsync(snapshot_file.fileno())
+        try:
+            snapshot_path.chmod(0o500)
+        except OSError:
+            pass
+        return _run_job_script_with_claim_heartbeat(
+            job,
+            str(snapshot_path),
+            workdir=workdir,
+            cancel_event=cancel_event,
+            preserve_stdout=True,
+            expected_sha256=identity[1],
+        )
+    except OSError as exc:
+        return False, f"Delivery script snapshot failed: {exc}"
+    finally:
+        if snapshot_path is not None:
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove delivery script snapshot %s",
+                    snapshot_path,
+                    exc_info=True,
+                )
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -5489,6 +5603,17 @@ def run_job(
     *,
     defer_agent_teardown: Optional[list] = None,
     script_delivery_capture: Optional[list] = None,
+    delivery_script_runner: Optional[
+        Callable[
+            [
+                dict,
+                tuple[str, str, bytes],
+                Optional[str],
+                Optional[_CancelEventLike],
+            ],
+            tuple[bool, str],
+        ]
+    ] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     execution_id: Optional[str] = None,
@@ -5511,9 +5636,14 @@ def run_job(
     never persisted to the job definition.
 
     ``script_delivery_capture``: optional caller-owned list populated with the
-    cached ``(success, stdout)`` result of the agent job's pre-run script. This
-    lets the end-to-end firing path use that exact stdout as an explicit
-    delivery boundary without executing the script a second time.
+    cached ``(success, stdout)`` result of the agent job's post-run delivery
+    script. This lets the end-to-end firing path use that exact stdout as an
+    explicit delivery boundary without executing the script a second time.
+
+    ``delivery_script_runner``: optional caller-owned execution boundary for
+    the post-run delivery script. The scheduler firing path supplies a runner
+    guarded by its durable fire-claim fence; direct callers use the ordinary
+    script runner.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -5528,13 +5658,32 @@ def run_job(
         )
         return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
     if raw_delivery_source == "script" and (
-        job.get("no_agent") or not str(job.get("script") or "").strip()
+        job.get("no_agent")
+        or not str(job.get("delivery_script") or "").strip()
     ):
         error = (
             "delivery_source='script' requires an agent-backed job with a "
-            "pre-run script. Refusing agent-response fallback."
+            "post-run delivery script. Refusing agent-response fallback."
         )
         return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
+
+    delivery_script_identity = None
+    if raw_delivery_source == "script":
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        try:
+            check_gateway_lifecycle(
+                str(job.get("prompt") or ""), str(job["delivery_script"])
+            )
+        except Exception as exc:
+            error = f"Post-run delivery script blocked by lifecycle guard: {exc}"
+            return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
+        delivery_script_identity = _delivery_script_identity(
+            str(job["delivery_script"])
+        )
+        if delivery_script_identity is None:
+            error = "Post-run delivery script is missing or unreadable."
+            return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
 
     # Fail closed on a corrupt config.yaml before any agent-driven work
     # (issue #81952): a cron fire is fully non-interactive, and continuing
@@ -5743,6 +5892,8 @@ def run_job(
                 f"**Mode:** monitor\n"
                 f"**Status:** no_change (agent run suppressed)\n"
             )
+            if raw_delivery_source == "script" and script_delivery_capture is not None:
+                script_delivery_capture.append((True, SILENT_MARKER))
             return True, _mon_doc, SILENT_MARKER, None
         # Changed (or first run): inject the monitor context into the prompt
         # through the existing per-run context seam and fall through to a
@@ -5778,20 +5929,7 @@ def run_job(
         prerun_script = _run_job_script_with_claim_heartbeat(
             job, script_path, cancel_event=cancel_event,
         )
-        if script_delivery_capture is not None:
-            script_delivery_capture.append(prerun_script)
         _ran_ok, _script_output = prerun_script
-        if raw_delivery_source == "script" and not _ran_ok:
-            error = f"Pre-run delivery script failed: {_script_output}"
-            failed_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                "**Delivery Source:** script stdout\n"
-                "**Status:** script failed; agent not run\n\n"
-                f"{_script_output}\n"
-            )
-            return False, failed_doc, "", error
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -5803,6 +5941,8 @@ def run_job(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
+            if raw_delivery_source == "script" and script_delivery_capture is not None:
+                script_delivery_capture.append((True, SILENT_MARKER))
             return True, silent_doc, SILENT_MARKER, None
 
     try:
@@ -5834,15 +5974,8 @@ def run_job(
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        if raw_delivery_source == "script":
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                "**Delivery Source:** script stdout\n"
-                "**Status:** silent (empty script output); agent not run\n"
-            )
-            return True, silent_doc, SILENT_MARKER, None
+        if raw_delivery_source == "script" and script_delivery_capture is not None:
+            script_delivery_capture.append((True, SILENT_MARKER))
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -6783,6 +6916,95 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        if raw_delivery_source == "script":
+            current_identity = _delivery_script_identity(
+                str(job["delivery_script"])
+            )
+            if current_identity != delivery_script_identity:
+                error_msg = (
+                    "Post-run delivery script changed during the agent turn; "
+                    "refusing model-influenced delivery."
+                )
+                if script_delivery_capture is not None:
+                    script_delivery_capture.append((False, error_msg))
+                output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+**Delivery Source:** post-run script stdout
+
+## Prompt
+
+{prompt}
+
+## Agent Response
+
+{logged_response}
+
+## Delivery Script Error
+
+{error_msg}
+"""
+                return False, output, "", error_msg
+            if delivery_script_runner is None:
+                delivery_script_result = _run_delivery_script_snapshot(
+                    job,
+                    delivery_script_identity,
+                    _job_workdir,
+                    cancel_event,
+                )
+            else:
+                delivery_script_result = delivery_script_runner(
+                    job,
+                    delivery_script_identity,
+                    _job_workdir,
+                    cancel_event,
+                )
+            if script_delivery_capture is not None:
+                script_delivery_capture.append(delivery_script_result)
+            _delivery_ok, _delivery_output = delivery_script_result
+            if not _delivery_ok:
+                error_msg = f"Post-run delivery script failed: {_delivery_output}"
+                output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+**Delivery Source:** post-run script stdout
+**Delivery Script:** {delivery_script_identity[0]}
+**Delivery Script SHA-256:** {delivery_script_identity[1]}
+
+## Prompt
+
+{prompt}
+
+## Agent Response
+
+{logged_response}
+
+## Delivery Script Error
+
+```
+{_delivery_output}
+```
+"""
+                _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
+                _write_usage_audit({
+                    "ts": _utcnow_iso_ms(),
+                    "job_id": job_id,
+                    "fire_id": _audit_fire_id,
+                    "prompt_tokens": result.get("prompt_tokens"),
+                    "completion_tokens": result.get("completion_tokens"),
+                    "total_tokens": result.get("total_tokens"),
+                    "response_silent": False,
+                    "deliver_target": job.get("deliver"),
+                    "model": model or None,
+                    "duration_ms": _audit_duration_ms,
+                    "error": error_msg,
+                })
+                return False, output, "", error_msg
         
         output = f"""# Cron Job: {job_name}
 
@@ -6798,12 +7020,35 @@ def run_job(
 
 {logged_response}
 """
+        if raw_delivery_source == "script":
+            _audited_delivery_output = (
+                _delivery_output if _delivery_output else "(empty stdout)"
+            )
+            output += f"""
+
+## Delivery Script Output
+
+**Script:** {delivery_script_identity[0]}
+**SHA-256:** `{delivery_script_identity[1]}`
+
+{_audited_delivery_output}
+"""
         
         logger.info("Job '%s' completed successfully", job_name)
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
-        _audit_response_silent = _is_cron_silence_response(final_response or "")
+        _audit_delivery_response = (
+            _delivery_output if raw_delivery_source == "script" else final_response
+        )
+        if raw_delivery_source == "script":
+            _audit_response_silent = _is_script_delivery_silent(
+                _audit_delivery_response or ""
+            )
+        else:
+            _audit_response_silent = _is_cron_silence_response(
+                _audit_delivery_response or ""
+            )
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
@@ -7037,6 +7282,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     job_id = str(job.get("id") or "")
     stop = threading.Event()
     lost_ownership = threading.Event()
+    side_effect_fence_active = threading.Event()
+    lost_ownership._hermes_side_effect_fence_active = side_effect_fence_active
     heartbeat_context = contextvars.copy_context()
 
     def _finish_unstarted(error: str) -> None:
@@ -7076,6 +7323,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
+            if side_effect_fence_active.is_set():
+                continue
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
                     lost_ownership.set()
@@ -7190,6 +7439,9 @@ def run_one_job(
                     if cancel_event is not None
                     else lost_ownership
                 ),
+                fire_claim_fence_active=getattr(
+                    lost_ownership, "_hermes_side_effect_fence_active", None
+                ),
                 execution_token=execution_token,
             ),
         )
@@ -7210,6 +7462,7 @@ def _run_one_job_body(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
+    fire_claim_fence_active: Optional[threading.Event] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
     claim = job.get("fire_claim")
@@ -7301,23 +7554,59 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         _script_delivery_capture: list = []
+
+        def _run_fenced_delivery_script(
+            script_job: dict,
+            script_identity: tuple[str, str, bytes],
+            workdir: Optional[str],
+            script_cancel_event: Optional[_CancelEventLike],
+        ) -> tuple[bool, str]:
+            if fire_claim_fence_active is not None:
+                fire_claim_fence_active.set()
+            try:
+                with _side_effect_fence() as owns_script:
+                    if not owns_script:
+                        return (
+                            False,
+                            "Fire claim ownership lost before post-run delivery script.",
+                        )
+                    result = _run_delivery_script_snapshot(
+                        script_job,
+                        script_identity,
+                        workdir,
+                        script_cancel_event,
+                    )
+                    if fire_owner is not None and not heartbeat_fire_claim(
+                        script_job["id"], expected_owner=fire_owner
+                    ):
+                        return (
+                            False,
+                            "Fire claim ownership lost after post-run delivery script.",
+                        )
+                    return result
+            finally:
+                if fire_claim_fence_active is not None:
+                    fire_claim_fence_active.clear()
+
         try:
+            _run_kwargs = {
+                "defer_agent_teardown": _deferred_agents,
+                "extra_prompt": extra_prompt,
+                "execution_id": execution_id,
+            }
+            if job.get("delivery_source") == "script":
+                _run_kwargs["script_delivery_capture"] = _script_delivery_capture
+                _run_kwargs["delivery_script_runner"] = _run_fenced_delivery_script
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
-                    defer_agent_teardown=_deferred_agents,
-                    script_delivery_capture=_script_delivery_capture,
-                    extra_prompt=extra_prompt,
-                    execution_id=execution_id,
+                    **_run_kwargs,
                 )
             else:
+                _run_kwargs["cancel_event"] = fire_claim_lost
                 success, output, final_response, error = run_job(
                     job,
-                    defer_agent_teardown=_deferred_agents,
-                    script_delivery_capture=_script_delivery_capture,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                    execution_id=execution_id,
+                    **_run_kwargs,
                 )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -7419,12 +7708,12 @@ def _run_one_job_body(
                 success
                 and job.get("delivery_source") == "script"
                 and not _script_delivery_capture
-                and not _is_cron_silence_response(final_response)
             ):
                 success = False
                 error = (
                     "Script delivery source completed without a captured "
-                    "pre-run script result; refusing agent-response fallback."
+                    "post-run delivery script result; refusing agent-response "
+                    "fallback."
                 )
             if (
                 success
@@ -7434,7 +7723,7 @@ def _run_one_job_body(
             ):
                 success = False
                 error = (
-                    "Pre-run delivery script failed; refusing agent-response "
+                    "Post-run delivery script failed; refusing agent-response "
                     "fallback."
                 )
 
@@ -7457,10 +7746,7 @@ def _run_one_job_body(
                 if success:
                     if job.get("delivery_source") == "script" and _script_delivery_capture:
                         _script_stdout = _script_delivery_capture[-1][1]
-                        if not _parse_wake_gate(_script_stdout):
-                            deliver_content = SILENT_MARKER
-                        else:
-                            deliver_content = _script_stdout
+                        deliver_content = _script_stdout
                     else:
                         deliver_content = final_response
                 else:
@@ -7510,7 +7796,19 @@ def _run_one_job_body(
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            if (
+                should_deliver
+                and success
+                and job.get("delivery_source") == "script"
+                and _is_script_delivery_silent(deliver_content)
+            ):
+                logger.info(
+                    "Job '%s': post-run delivery script returned %s — skipping delivery",
+                    job["id"],
+                    SILENT_MARKER,
+                )
+                should_deliver = False
+            elif should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 

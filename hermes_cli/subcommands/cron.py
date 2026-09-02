@@ -76,9 +76,18 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         default=None,
         help=(
             "Select successful delivery content. 'agent' (default) delivers "
-            "the agent's final response. 'script' requires --script, still "
-            "runs the agent, saves its transcript, and delivers the pre-run "
-            "script stdout as the delivery body; script failure fails closed."
+            "the agent's final response. 'script' requires --delivery-script, "
+            "still runs the agent, saves its transcript, and then delivers "
+            "the post-run script stdout; script failure fails closed."
+        ),
+    )
+    cron_create.add_argument(
+        "--delivery-script",
+        dest="delivery_script",
+        help=(
+            "Operator-owned script under ~/.hermes/scripts/ that runs exactly "
+            "once after a successful agent turn when --delivery-source=script. "
+            "Its stdout is authoritative for delivery; empty output is silent."
         ),
     )
     cron_create.add_argument(
@@ -208,9 +217,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         choices=("agent", "script"),
         default=None,
         help=(
-            "Set successful delivery content. 'script' requires a pre-run "
-            "script and never falls back to agent text; 'agent' restores the "
-            "default final-response delivery."
+            "Set successful delivery content. 'script' requires a post-run "
+            "delivery script and never falls back to agent text; 'agent' "
+            "restores the default final-response delivery."
+        ),
+    )
+    cron_edit.add_argument(
+        "--delivery-script",
+        dest="delivery_script",
+        help=(
+            "Set the post-run authoritative delivery script. Pass empty "
+            "string to clear."
         ),
     )
     cron_edit.add_argument(

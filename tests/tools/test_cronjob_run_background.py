@@ -129,8 +129,8 @@ class TestBackgroundDispatch:
 
         script_job = {
             **_job("job-bg-script-source"),
-            "script": "report.py",
             "delivery_source": "script",
+            "delivery_script": "report.py",
         }
         with _bound_session_key("agent:main:telegram:dm:779"):
             with patch(
