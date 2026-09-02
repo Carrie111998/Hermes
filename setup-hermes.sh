@@ -451,6 +451,33 @@ else
     fi
 fi
 
+
+# ============================================================================
+# Quick credential setup — offer `hermes auth add` for common providers
+# ============================================================================
+# The full setup wizard (offered next) handles everything, but a direct
+# "do you want to add provider credentials?" prompt saves a round-trip
+# through the wizard for the most common case: pasting API keys or
+# triggering OAuth login for Anthropic, OpenRouter, or OpenAI Codex.
+# Each provider gets its own yes/no — skip the ones you don't use.
+
+_QUICK_PROVIDERS=("anthropic" "openrouter" "openai-codex")
+echo ""
+read -p "Add provider credentials (Anthropic, OpenRouter, OpenAI Codex) now? [y/N] " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    for _p in "${_QUICK_PROVIDERS[@]}"; do
+        echo ""
+        read -p "  Add $_p now? [y/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            "$SCRIPT_DIR/venv/bin/hermes" auth add "$_p" || true
+        fi
+    done
+    echo ""
+    echo -e "${GREEN}✓${NC} Credential setup done. Run 'hermes auth list' to see all pooled keys."
+fi
+
 # ============================================================================
 # Done
 # ============================================================================
