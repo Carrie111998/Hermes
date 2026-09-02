@@ -52,6 +52,15 @@ def _classify_responses_issuer(
     return "other"
 
 
+# Issuers whose reasoning continuity is carried only by ``encrypted_content``.
+# Plaintext reasoning items (visible ``content``/``summary`` text with no
+# blob) are never captured for, or replayed to, these endpoints; they are the
+# third-party-gateway shape (issuer ``other[:base_url]``).
+_ENCRYPTED_REASONING_ISSUERS = frozenset(
+    {"codex_backend", "xai_responses", "github_responses"}
+)
+
+
 # Throttle the per-process cross-issuer skip warning so we don't flood logs
 # when a long history contains many stale-issuer reasoning blocks.
 _CROSS_ISSUER_WARN_EMITTED = False
@@ -591,7 +600,22 @@ def _chat_messages_to_responses_input(
                 has_codex_reasoning = False
                 if isinstance(codex_reasoning, list):
                     for ri in codex_reasoning:
-                        if isinstance(ri, dict) and ri.get("encrypted_content"):
+                        if not isinstance(ri, dict):
+                            continue
+                        encrypted = ri.get("encrypted_content")
+                        # Plaintext reasoning (third-party gateway): no
+                        # encrypted_content blob, but visible chain-of-thought
+                        # in content reasoning_text parts and/or summary parts.
+                        # First-party backends seal their continuity in
+                        # encrypted_content, so plaintext items are never
+                        # replayed to them — even unstamped legacy items.
+                        is_plaintext_reasoning = _is_plaintext_reasoning_item(ri)
+                        if (
+                            is_plaintext_reasoning
+                            and current_issuer_kind in _ENCRYPTED_REASONING_ISSUERS
+                        ):
+                            continue
+                        if encrypted or is_plaintext_reasoning:
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
                                 continue
@@ -704,6 +728,17 @@ def _chat_messages_to_responses_input(
                         item_sources.append(msg)
                         replayed_message_items += 1
 
+                tool_calls = msg.get("tool_calls")
+                has_tool_calls = False
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        _fn_name = (tc.get("function") or {}).get("name")
+                        if isinstance(_fn_name, str) and _fn_name.strip():
+                            has_tool_calls = True
+                            break
+
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
@@ -712,16 +747,22 @@ def _chat_messages_to_responses_input(
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
                     item_sources.append(msg)
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not has_tool_calls:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
+                    # content AND no tool calls, emit an empty assistant message
+                    # as the required following item.
+                    #
+                    # When tool calls exist, the function_call items emitted
+                    # below already satisfy the following-item rule, so the
+                    # empty stub is skipped. Gateways that translate Responses
+                    # input to the Anthropic Messages API reject the stub with
+                    # HTTP 400 "messages: text content blocks must be non-empty"
+                    # (observed on ai.corp.ts.net with claude-* models).
                     items.append({"role": "assistant", "content": ""})
                     item_sources.append(msg)
 
-                tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
                     for tc in tool_calls:
                         if not isinstance(tc, dict):
@@ -1082,6 +1123,30 @@ def _preflight_codex_input_items(
                     )
                 else:
                     reasoning_item["summary"] = []
+                normalized.append(reasoning_item)
+                continue
+            # Plaintext reasoning (third-party gateway): no encrypted blob,
+            # but visible chain-of-thought in content reasoning_text parts
+            # and/or summary parts. Forward it so the model keeps its
+            # thinking chain across turns. Same id handling as the encrypted
+            # branch: dedup locally, never send the id on the wire.
+            if _is_plaintext_reasoning_item(item):
+                item_id = item.get("id")
+                if isinstance(item_id, str) and item_id:
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
+                summary = item.get("summary")
+                content = item.get("content")
+                if not isinstance(summary, list):
+                    summary = []
+                if sanitize_harmony_tokens:
+                    summary = _neutralize_harmony_structure(summary)
+                    if isinstance(content, list):
+                        content = _neutralize_harmony_structure(content)
+                reasoning_item = {"type": "reasoning", "summary": summary}
+                if isinstance(content, list):
+                    reasoning_item["content"] = content
                 normalized.append(reasoning_item)
             continue
 
@@ -1455,17 +1520,66 @@ def _extract_responses_message_text(item: Any) -> str:
     return "".join(chunks).strip()
 
 
-def _extract_responses_reasoning_text(item: Any) -> str:
-    """Extract a compact reasoning text from a Responses reasoning item."""
-    summary = getattr(item, "summary", None)
-    if isinstance(summary, list):
-        chunks: List[str] = []
-        for part in summary:
-            text = getattr(part, "text", None)
+def _responses_part_attr(part: Any, key: str) -> Any:
+    """Read a field off a Responses content part (pydantic object or raw dict)."""
+    if isinstance(part, dict):
+        return part.get(key)
+    return getattr(part, key, None)
+
+
+def _reasoning_item_plaintext_texts(item: Any) -> tuple[List[str], List[str]]:
+    """Return ``(content reasoning_text texts, summary texts)`` of a reasoning item.
+
+    Third-party Responses gateways return the model's chain-of-thought as
+    visible text (``content`` parts typed ``reasoning_text`` and/or
+    ``summary`` parts typed ``summary_text``) with no ``encrypted_content``
+    blob. Parts may be pydantic objects or raw dicts (JSON streams).
+    """
+    content_texts: List[str] = []
+    content = _responses_part_attr(item, "content")
+    if isinstance(content, list):
+        for part in content:
+            if _responses_part_attr(part, "type") != "reasoning_text":
+                continue
+            text = _responses_part_attr(part, "text")
             if isinstance(text, str) and text:
-                chunks.append(text)
-        if chunks:
-            return "\n".join(chunks).strip()
+                content_texts.append(text)
+    summary_texts: List[str] = []
+    summary = _responses_part_attr(item, "summary")
+    if isinstance(summary, list):
+        for part in summary:
+            text = _responses_part_attr(part, "text")
+            if isinstance(text, str) and text:
+                summary_texts.append(text)
+    return content_texts, summary_texts
+
+
+def _is_plaintext_reasoning_item(item: Any) -> bool:
+    """True when a reasoning item carries visible text but no ``encrypted_content``.
+
+    This is the shape third-party Responses gateways emit for models whose
+    thinking is not sealed (e.g. Kimi behind a translating gateway). Works on
+    both persisted dicts and SDK objects.
+    """
+    encrypted = _responses_part_attr(item, "encrypted_content")
+    if isinstance(encrypted, str) and encrypted:
+        return False
+    content_texts, summary_texts = _reasoning_item_plaintext_texts(item)
+    return bool(content_texts or summary_texts)
+
+
+def _extract_responses_reasoning_text(item: Any) -> str:
+    """Extract a compact reasoning text from a Responses reasoning item.
+
+    Prefers the full ``content`` reasoning_text text when the gateway returns
+    the chain-of-thought there, falls back to ``summary`` text, then
+    ``item.text``.
+    """
+    content_texts, summary_texts = _reasoning_item_plaintext_texts(item)
+    if content_texts:
+        return "\n".join(content_texts).strip()
+    if summary_texts:
+        return "\n".join(summary_texts).strip()
     text = getattr(item, "text", None)
     if isinstance(text, str) and text:
         return text.strip()
@@ -1705,6 +1819,41 @@ def _normalize_codex_response(
                             raw_summary.append({"type": "summary_text", "text": text})
                     raw_item["summary"] = raw_summary
                 reasoning_items_raw.append(raw_item)
+            elif issuer_kind not in _ENCRYPTED_REASONING_ISSUERS:
+                # Plaintext reasoning (no encrypted_content): some third-party
+                # Responses gateways return the chain-of-thought as visible
+                # text (content reasoning_text parts and/or summary parts).
+                # Capturing and replaying it preserves the model's thinking
+                # chain across turns — without this, models like Kimi on such
+                # gateways stop reasoning after the first tool call and end
+                # the turn early. Never capture for the first-party backends
+                # (encrypted reasoning is their continuity contract) so their
+                # behavior is unchanged.
+                content_texts, summary_texts = _reasoning_item_plaintext_texts(item)
+                if content_texts or summary_texts:
+                    raw_item = {"type": "reasoning", "summary": []}
+                    if summary_texts:
+                        raw_item["summary"] = [
+                            {"type": "summary_text", "text": text}
+                            for text in summary_texts
+                        ]
+                    if content_texts:
+                        raw_item["content"] = [
+                            {"type": "reasoning_text", "text": text}
+                            for text in content_texts
+                        ]
+                    if issuer_kind:
+                        raw_item["_issuer_kind"] = issuer_kind
+                    item_id = getattr(item, "id", None)
+                    if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
+                        logger.debug(
+                            "Skipping transient Codex reasoning item during normalization: %s",
+                            item_id,
+                        )
+                        continue
+                    if isinstance(item_id, str) and item_id:
+                        raw_item["id"] = item_id
+                    reasoning_items_raw.append(raw_item)
         elif item_type == "compaction":
             # Native server-side compaction checkpoint (gpt-5.6 on direct
             # OpenAI/Codex routes). The encrypted blob stands in for the
@@ -1883,11 +2032,7 @@ def _normalize_codex_response(
         # state — forcing "incomplete" causes multi-minute stalls as the
         # continuation path re-issues calls (3 retries × up to 240s each).
         # See https://github.com/NousResearch/hermes-agent/issues/64434
-        if response_status == "completed" and issuer_kind not in (
-            "codex_backend",
-            "xai_responses",
-            "github_responses",
-        ):
+        if response_status == "completed" and issuer_kind not in _ENCRYPTED_REASONING_ISSUERS:
             finish_reason = "stop"
         else:
             finish_reason = "incomplete"
