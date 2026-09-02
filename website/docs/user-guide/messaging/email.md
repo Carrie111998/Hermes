@@ -145,11 +145,10 @@ subject, session, and delivery kind. It does not log the body or credentials.
 display verbosity does not override Email's minimal defaults. This avoids a
 global progress setting causing a permanent-email flood.
 
-Cron and report deliveries are different. They use the standalone Email sender,
-which remains an explicit proactive-send route and is not suppressed by
-`read_only`. Configure a cron Email target only when you intentionally want
-proactive mail. This preserves existing cron workflows and keeps inbound-only
-focused on replies from Email-originated sessions.
+Cron, report, and retry deliveries use the same Email SMTP boundary. Inbound-only
+mode suppresses them too. Do not configure an Email cron target while
+`platforms.email.extra.read_only: true` is enabled. Disable inbound-only mode
+only when you intentionally want Hermes to send Email again.
 
 ### File Attachments
 

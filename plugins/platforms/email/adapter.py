@@ -238,6 +238,13 @@ def check_email_requirements() -> bool:
     return all([addr, pwd, imap, smtp])
 
 
+def _is_read_only_email(extra: Any) -> bool:
+    """Return whether config.yaml disables all Email SMTP delivery."""
+    return isinstance(extra, dict) and is_truthy_value(
+        extra.get("read_only"), default=False
+    )
+
+
 _CHARSET_ALIASES = {
     # Aliases seen in the wild that Python's codec registry doesn't know.
     # "unknown-8bit" / "x-unknown" are RFC 1428 placeholders some MTAs (QQ
@@ -568,18 +575,14 @@ class EmailAdapter(BasePlatformAdapter):
         #   platforms:
         #     email:
         #       read_only: true
-        # or the EMAIL_READ_ONLY=true env mirror (parity with the other EMAIL_*
-        # vars). When enabled the adapter still polls IMAP and dispatches
-        # incoming mail normally, but every outgoing send is suppressed (no SMTP)
-        # so a mailbox can be used purely as a read feed without ever replying to
-        # the sender (#99876). Suppressed sends return success so the gateway's
-        # delivery ledger treats them as delivered rather than retrying — the
-        # failure loop that disabling the SMTP credential would cause. Default
-        # OFF (behaviour unchanged unless explicitly enabled).
-        if "read_only" in extra:
-            self._read_only = is_truthy_value(extra["read_only"], default=False)
-        else:
-            self._read_only = _esecret_bool("EMAIL_READ_ONLY", False)
+        # When enabled the adapter still polls IMAP and dispatches incoming mail
+        # normally, but every outgoing send is suppressed (no SMTP) so a mailbox
+        # can be used purely as a read feed without ever replying to the sender
+        # (#99876). Suppressed sends return success so the gateway's delivery
+        # ledger treats them as delivered rather than retrying — the failure loop
+        # that disabling the SMTP credential would cause. Default OFF (behaviour
+        # unchanged unless explicitly enabled).
+        self._read_only = _is_read_only_email(extra)
 
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
@@ -1193,8 +1196,8 @@ class EmailAdapter(BasePlatformAdapter):
         Read-only mode is enforced here as well as at public adapter entry
         points. Therefore, an overlooked future helper cannot reach SMTP merely
         because it missed a caller-side display or silence convention. The
-        standalone sender remains separate for explicitly configured proactive
-        cron/report workflows.
+        standalone cron/report delivery uses the same config gate in
+        ``_standalone_send``.
         """
         if self._read_only:
             return self._read_only_suppress(
@@ -1512,12 +1515,27 @@ async def _standalone_send(
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
+    extra = getattr(pconfig, "extra", {}) or {}
+    if _is_read_only_email(extra):
+        # This is the shared cron/report transport boundary. Check before
+        # resolving credentials or creating an SMTP object so no Email route
+        # can escape inbound-only mode.
+        logger.info(
+            "[Email] read-only SMTP suppression recipient=%s kind=standalone",
+            chat_id,
+        )
+        return {
+            "success": True,
+            "platform": "email",
+            "chat_id": chat_id,
+            "message_id": "read-only-suppressed",
+        }
+
     import smtplib
     import ssl as _ssl
     from email.mime.text import MIMEText
     from email.utils import formatdate
 
-    extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or _get_secret("EMAIL_ADDRESS", "")
     password = _get_secret("EMAIL_PASSWORD", "")
     smtp_host = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", "")

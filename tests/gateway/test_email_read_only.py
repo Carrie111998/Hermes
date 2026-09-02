@@ -1,7 +1,7 @@
 """Email read-only / no-auto-reply mode (#99876).
 
-``platforms.email.extra.read_only: true`` (or ``EMAIL_READ_ONLY=1``) lets a
-mailbox be used purely as an inbound feed: IMAP polling / dispatch is
+``platforms.email.extra.read_only: true`` lets a mailbox be used purely as an
+inbound feed: IMAP polling / dispatch is
 unchanged, but every outgoing send is suppressed before it reaches SMTP. A
 suppressed send returns ``success=True`` so the gateway's delivery ledger
 marks it delivered rather than retrying — the failure loop that disabling the
@@ -49,14 +49,10 @@ class TestEmailReadOnly(unittest.TestCase):
         self.assertEqual(result.message_id, "read-only-suppressed")
         adapter._send_email.assert_not_called()
 
-    def test_read_only_via_env_suppresses_send(self):
+    def test_read_only_is_not_enabled_by_a_non_secret_env_var(self):
         adapter = _make_adapter(env={"EMAIL_READ_ONLY": "true"})
-        adapter._send_email = MagicMock(name="_send_email")
 
-        result = asyncio.run(adapter.send("user@example.com", "hi"))
-
-        self.assertTrue(result.success)
-        adapter._send_email.assert_not_called()
+        self.assertFalse(adapter._read_only)
 
     def test_read_only_connects_with_imap_only_and_never_tests_smtp(self):
         """Inbound-only mode must not need a working SMTP endpoint to receive."""
@@ -88,13 +84,8 @@ class TestEmailReadOnly(unittest.TestCase):
         self.assertEqual(result.message_id, "<mid@localhost>")
         adapter._send_email.assert_called_once()
 
-    def test_extra_overrides_env(self):
-        # Explicit config.yaml value wins over the env mirror.
-        adapter = _make_adapter(extra={"read_only": False}, env={"EMAIL_READ_ONLY": "true"})
-        self.assertFalse(adapter._read_only)
-
-    def test_proactive_standalone_send_remains_an_explicit_opt_in_route(self):
-        """Cron/report delivery is intentionally not an Email-session reply."""
+    def test_read_only_blocks_standalone_cron_and_shared_transport_smtp(self):
+        """Every Email transport, including cron, stops before SMTP."""
         from gateway.config import PlatformConfig
         from plugins.platforms.email.adapter import _standalone_send
 
@@ -113,7 +104,7 @@ class TestEmailReadOnly(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
-        smtp.return_value.send_message.assert_called_once()
+        smtp.assert_not_called()
 
     def test_read_only_suppresses_document_and_image_batch(self):
         adapter = _make_adapter(extra={"read_only": True})
