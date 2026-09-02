@@ -569,6 +569,8 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        skip_tool_search_assembly: bool = False,
+        exclude_mcp_tools: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -595,6 +597,8 @@ class AIAgent:
             max_iterations=max_iterations,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            skip_tool_search_assembly=skip_tool_search_assembly,
+            exclude_mcp_tools=exclude_mcp_tools,
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,

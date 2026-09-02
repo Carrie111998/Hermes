@@ -132,6 +132,40 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--policy-id",
+        help="Registered immutable cron isolation policy.",
+    )
+    cron_create.add_argument(
+        "--enabled-toolset",
+        dest="enabled_toolsets",
+        action="append",
+        help="Exact allowed toolset for a strict job. Repeatable.",
+    )
+    cron_create.add_argument(
+        "--strict-toolsets",
+        action="store_true",
+        default=False,
+        help="Treat --enabled-toolset values as the complete allowlist.",
+    )
+    cron_create.add_argument(
+        "--no-mcp",
+        action="store_true",
+        default=False,
+        help="Do not discover, connect, or expose MCP servers for this job.",
+    )
+    cron_create.add_argument(
+        "--no-fallback",
+        action="store_true",
+        default=False,
+        help="Disable provider and model fallback for this job.",
+    )
+    cron_create.add_argument(
+        "--start-paused",
+        action="store_true",
+        default=False,
+        help="Persist the new job paused and without a next trigger.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(

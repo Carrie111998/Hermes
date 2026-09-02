@@ -1428,6 +1428,7 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
+    from cron.policy import CronPolicyError as _CronPolicyError
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create,
@@ -1444,6 +1445,9 @@ except ImportError:
     _cron_trigger = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
+        pass
+
+    class _CronPolicyError(ValueError):
         pass
 
 
@@ -6875,6 +6879,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except _CronPolicyError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=403
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6895,6 +6903,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"ok": True})
+        except _CronPolicyError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=403
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6935,6 +6947,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except _CronPolicyError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=403
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6979,6 +6995,10 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except _CronPolicyError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=403
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

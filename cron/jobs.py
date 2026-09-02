@@ -478,7 +478,16 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset(
+    {
+        "id",
+        "policy_id",
+        "strict_toolsets",
+        "no_mcp",
+        "no_fallback",
+        "created_paused",
+    }
+)
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2350,6 +2359,12 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    strict_toolsets: bool = False,
+    no_mcp: bool = False,
+    no_fallback: bool = False,
+    start_paused: bool = False,
+    _operator_capability: object = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2421,6 +2436,16 @@ def create_job(
     Returns:
         The created job dict
     """
+    from cron.policy import CronPolicyError, require_trusted_policy_operator
+
+    if policy_id is None and (strict_toolsets or no_mcp or no_fallback):
+        raise CronPolicyError(
+            "strict_toolsets, no_mcp, and no_fallback require a registered policy_id"
+        )
+    require_trusted_policy_operator(
+        {"policy_id": policy_id}, _operator_capability, "creation"
+    )
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite).
@@ -2446,8 +2471,14 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
-    normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
-    normalized_toolsets = normalized_toolsets or None
+    normalized_strict_toolsets = bool(strict_toolsets)
+    normalized_toolsets = (
+        [str(t).strip() for t in enabled_toolsets if str(t).strip()]
+        if enabled_toolsets is not None
+        else None
+    )
+    if not normalized_strict_toolsets:
+        normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -2500,8 +2531,9 @@ def create_job(
         no_agent=normalized_no_agent,
     )
 
-    next_run_at = compute_next_run(parsed_schedule)
-    if parsed_schedule.get("kind") == "once" and next_run_at is None:
+    normalized_start_paused = bool(start_paused)
+    next_run_at = None if normalized_start_paused else compute_next_run(parsed_schedule)
+    if parsed_schedule.get("kind") == "once" and next_run_at is None and not normalized_start_paused:
         run_at = parsed_schedule.get("run_at") or schedule
         logger.warning(
             "Rejecting one-shot cron job '%s': run_at %s is outside the %ss grace window",
@@ -2542,10 +2574,10 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+        "enabled": not normalized_start_paused,
+        "state": "paused" if normalized_start_paused else "scheduled",
+        "paused_at": now if normalized_start_paused else None,
+        "paused_reason": "created paused" if normalized_start_paused else None,
         "created_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,
@@ -2562,6 +2594,16 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if policy_id is not None:
+        job["policy_id"] = str(policy_id).strip()
+    if normalized_strict_toolsets:
+        job["strict_toolsets"] = True
+    if no_mcp:
+        job["no_mcp"] = True
+    if no_fallback:
+        job["no_fallback"] = True
+    if normalized_start_paused:
+        job["created_paused"] = True
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2571,6 +2613,10 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+
+    from cron.policy import validate_job_policy
+
+    validate_job_policy(job)
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2643,7 +2689,12 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    _operator_capability: object = None,
+) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
@@ -2659,6 +2710,25 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            if job.get("policy_id") is not None:
+                containment_fields = {
+                    "enabled",
+                    "state",
+                    "paused_at",
+                    "paused_reason",
+                }
+                containment_pause = (
+                    set(updates or {}).issubset(containment_fields)
+                    and updates.get("enabled") is False
+                    and updates.get("state") == "paused"
+                )
+                if not containment_pause:
+                    from cron.policy import require_trusted_policy_operator
+
+                    require_trusted_policy_operator(
+                        job, _operator_capability, "update"
+                    )
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -2823,6 +2893,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     "through update_job; use cron resume --run-now or --at."
                 )
 
+            from cron.policy import validate_policy_update
+
+            validate_policy_update(job, updated)
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -2845,11 +2919,49 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     )
 
 
-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
+def quarantine_invalid_policy_job(
+    job_id: str, reason: str
+) -> Optional[Dict[str, Any]]:
+    """Disable an invalid policy record without allowing general mutation."""
+    from cron.policy import CronPolicyError, validate_job_policy
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for index, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            try:
+                validate_job_policy(job)
+            except CronPolicyError:
+                quarantined = dict(job)
+                quarantined.update(
+                    {
+                        "enabled": False,
+                        "state": "paused",
+                        "paused_at": _hermes_now().isoformat(),
+                        "paused_reason": reason,
+                        "next_run_at": None,
+                    }
+                )
+                jobs[index] = quarantined
+                save_jobs(jobs)
+                return _normalize_job_record(quarantined)
+            raise ValueError("refusing to quarantine a valid cron policy job")
+    return None
+
+
+def resume_job(
+    job_id: str, *, _operator_capability: object = None
+) -> Optional[Dict[str, Any]]:
     """Resume a paused job and compute the next future run from now. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
         return None
+
+    from cron.policy import require_trusted_policy_operator, validate_job_policy
+
+    require_trusted_policy_operator(job, _operator_capability, "resume")
+    validate_job_policy(job)
 
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -2867,11 +2979,15 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_reason": None,
             "next_run_at": next_run_at,
         },
+        _operator_capability=_operator_capability,
     )
 
 
 def trigger_job(
-    job_id: str, extra_prompt: Optional[str] = None
+    job_id: str,
+    extra_prompt: Optional[str] = None,
+    *,
+    _operator_capability: object = None,
 ) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name.
 
@@ -2885,6 +3001,9 @@ def trigger_job(
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    from cron.policy import require_trusted_policy_operator
+
+    require_trusted_policy_operator(job, _operator_capability, "trigger")
     if is_terminal_job(job):
         state = job.get("state")
         name = job.get("name", job_id)
@@ -2909,6 +3028,7 @@ def trigger_job(
             # clears any stale prompt from a previous trigger).
             "manual_run_prompt": (extra_prompt or None),
         },
+        _operator_capability=_operator_capability,
     )
 
 
@@ -2922,11 +3042,17 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     return 0 <= age < ttl_seconds
 
 
-def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
+def rearm_oneshot(
+    job_id: str, run_at: Any, *, _operator_capability: object = None
+) -> Optional[Dict[str, Any]]:
     """Re-arm a completed one-shot as an explicit new occurrence."""
     job_ref = resolve_job_ref(job_id)
     if not job_ref:
         return None
+    from cron.policy import require_trusted_policy_operator, validate_job_policy
+
+    require_trusted_policy_operator(job_ref, _operator_capability, "re-arm")
+    validate_job_policy(job_ref)
     if isinstance(run_at, datetime):
         run_at = run_at.isoformat()
     parsed_schedule = parse_schedule(str(run_at))
@@ -2948,6 +3074,8 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
         for index, job in enumerate(jobs):
             if job.get("id") != job_ref["id"]:
                 continue
+            require_trusted_policy_operator(job, _operator_capability, "re-arm")
+            validate_job_policy(job)
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -2976,14 +3104,21 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def remove_job(job_id: str) -> bool:
+def remove_job(job_id: str, *, _operator_capability: object = None) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
         return False
+    from cron.policy import require_trusted_policy_operator
+
+    require_trusted_policy_operator(job, _operator_capability, "removal")
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()
+        current = next((item for item in jobs if item.get("id") == canonical_id), None)
+        if current is None:
+            return False
+        require_trusted_policy_operator(current, _operator_capability, "removal")
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
@@ -3585,22 +3720,50 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _notify_policy_quarantine() -> None:
+    """Best-effort reconciliation after a protected job is auto-paused."""
+    try:
+        from cron.scheduler import _notify_provider_jobs_changed
+
+        _notify_provider_jobs_changed()
+    except Exception:
+        logger.exception("Failed to notify cron provider after policy quarantine")
+
+
+def _is_policy_quarantined(job: Optional[Dict[str, Any]]) -> bool:
+    return bool(
+        job
+        and job.get("policy_id") is not None
+        and job.get("enabled") is False
+        and job.get("state") == "paused"
+        and str(job.get("paused_reason") or "").startswith(
+            "Auto-paused by scheduler:"
+        )
+    )
+
+
 def claim_job_for_fire(
     job_id: str,
     *,
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    _operator_capability: object = None,
 ) -> Union[bool, Dict[str, Any]]:
+    was_quarantined = _is_policy_quarantined(get_job(job_id))
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
-        return _claim_job_for_fire_locked(
+        result = _claim_job_for_fire_locked(
             job_id,
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            _operator_capability=_operator_capability,
         )
+    if not was_quarantined and _is_policy_quarantined(get_job(job_id)):
+        _notify_policy_quarantine()
+    return result
 
 
 def _claim_job_for_fire_locked(
@@ -3609,6 +3772,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    _operator_capability: object = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3638,6 +3802,45 @@ def _claim_job_for_fire_locked(
         for job in jobs:
             if job["id"] != job_id:
                 continue
+            from cron.policy import (
+                CronPolicyError,
+                require_trusted_policy_operator,
+                validate_job_policy,
+            )
+
+            try:
+                validate_job_policy(job)
+            except CronPolicyError as exc:
+                logger.error(
+                    "Job '%s': quarantining invalid cron policy before fire claim — %s",
+                    job_id,
+                    exc,
+                )
+                job.update(
+                    {
+                        "enabled": False,
+                        "state": "paused",
+                        "paused_at": _hermes_now().isoformat(),
+                        "paused_reason": f"Auto-paused by scheduler: {exc}",
+                        "next_run_at": None,
+                    }
+                )
+                save_jobs(jobs)
+                return False
+            if force and job.get("policy_id") is not None:
+                require_trusted_policy_operator(
+                    job, _operator_capability, "manual fire"
+                )
+            if (
+                force
+                and job.get("policy_id") is not None
+                and not is_job_runnable(job)
+            ):
+                logger.error(
+                    "Job '%s': refusing forced activation of paused policy job",
+                    job_id,
+                )
+                return False
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 return False
             # enabled + pause markers must both clear — a half-paused record
@@ -3815,11 +4018,17 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
+    quarantined_policy_ids: List[str] = []
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        due = _get_due_jobs_locked(quarantined_policy_ids)
+    if quarantined_policy_ids:
+        _notify_policy_quarantine()
+    return due
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked(
+    quarantined_policy_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     now = _hermes_now()
     raw_jobs = load_jobs()
@@ -3938,6 +4147,36 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # job this tick" so healthy siblings still run and their recovered
         # state still reaches save_jobs() below.
         try:
+            from cron.policy import validate_job_policy
+
+            try:
+                validate_job_policy(job)
+            except ValueError as exc:
+                logger.error(
+                    "Job '%s': quarantining invalid cron policy — %s",
+                    job.get("id", "?"),
+                    exc,
+                )
+                job_id = job.get("id")
+                for raw_job in raw_jobs:
+                    if raw_job.get("id") != job_id:
+                        continue
+                    raw_job.update(
+                        {
+                            "enabled": False,
+                            "state": "paused",
+                            "paused_at": now.isoformat(),
+                            "paused_reason": (
+                                f"Auto-paused by scheduler: {exc}"
+                            ),
+                            "next_run_at": None,
+                        }
+                    )
+                    needs_save = True
+                    if quarantined_policy_ids is not None and job_id:
+                        quarantined_policy_ids.append(job_id)
+                    break
+                continue
             if is_terminal_job(job) and not _is_recoverable_error_job(job):
                 continue
             if not job.get("enabled", True):

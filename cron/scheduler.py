@@ -618,7 +618,15 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     surprise $4.63 run).
     """
     per_job = job.get("enabled_toolsets")
+    if job.get("strict_toolsets"):
+        if not isinstance(per_job, list):
+            from cron.policy import CronPolicyError
+
+            raise CronPolicyError("strict_toolsets requires an explicit enabled_toolsets list")
+        return [str(name) for name in per_job if str(name) != "no_mcp"]
     if per_job:
+        if job.get("no_mcp"):
+            return [str(name) for name in per_job if str(name) != "no_mcp"]
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
@@ -5109,7 +5117,11 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def _block_and_pause_job(
-    job_id: str, job_name: str, reason: str
+    job_id: str,
+    job_name: str,
+    reason: str,
+    *,
+    invalid_policy: bool = False,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Fail a run closed and pause the job so it stops being scheduled.
 
@@ -5118,11 +5130,17 @@ def _block_and_pause_job(
     every tick forever. Pausing writes ``paused_at``/``paused_reason``, giving
     an auditable record of why the scheduler stopped it.
     """
-    from cron.jobs import pause_job
+    from cron.jobs import pause_job, quarantine_invalid_policy_job
 
     logger.error("Job '%s': %s", job_id, reason)
     try:
-        pause_job(job_id, f"Auto-paused by scheduler: {reason}")
+        if invalid_policy:
+            quarantine_invalid_policy_job(
+                job_id, f"Auto-paused by scheduler: {reason}"
+            )
+        else:
+            pause_job(job_id, f"Auto-paused by scheduler: {reason}")
+        _notify_provider_jobs_changed()
     except Exception:
         logger.exception("Job '%s': failed to auto-pause unrunnable job", job_id)
 
@@ -5727,6 +5745,20 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    from cron.policy import (
+        CronPolicyError,
+        STRICT_UNATTENDED_POLICY_ID,
+        validate_job_policy,
+    )
+
+    try:
+        validate_job_policy(job)
+    except CronPolicyError as exc:
+        logger.error("Job '%s': refusing invalid cron policy — %s", job_id, exc)
+        return _block_and_pause_job(
+            job_id, job_name, str(exc), invalid_policy=True
+        )
 
     # Fail closed on a corrupt config.yaml before any agent-driven work
     # (issue #81952): a cron fire is fully non-interactive, and continuing
@@ -6416,6 +6448,8 @@ def run_job(
             is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
             if not (is_auth or is_transient_net):
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+            if job.get("no_fallback"):
+                raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
             primary_provider_for_drift = (
                 str(getattr(resolve_exc, "provider", "") or "").strip().lower()
@@ -6563,7 +6597,7 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = None if job.get("no_fallback") else (get_fallback_chain(_cfg) or None)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -6588,19 +6622,20 @@ def run_job(
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        if not job.get("no_mcp"):
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         # Initialize the SQLite session store so cron job messages are
         # persisted and discoverable via session_search (same pattern as
@@ -6683,6 +6718,8 @@ def run_job(
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            skip_tool_search_assembly=bool(job.get("strict_toolsets")),
+            exclude_mcp_tools=bool(job.get("no_mcp")),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -6690,17 +6727,25 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            # Memory is enabled for cron agents like any other agent run:
-            # MEMORY.md / USER.md load into the system prompt and the memory
-            # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            # Strict unattended policy jobs do not load or initialize the
+            # persistent memory/profile subsystem, preventing unrelated durable
+            # profile facts from entering the unattended model context.
+            skip_memory=(
+                job.get("policy_id") == STRICT_UNATTENDED_POLICY_ID
+            ),
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+        # Keep the strict tool boundary as runtime state, not merely constructor
+        # arguments. This prevents between-turn MCP refresh or bridge scope
+        # rebuilding from widening the initial snapshot.
+        if job.get("policy_id") == STRICT_UNATTENDED_POLICY_ID:
+            agent._skip_mcp_refresh = True
+            agent._exclude_mcp_tools = True
+            agent._skip_tool_search_assembly = True
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -7973,6 +8018,8 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
     from cron.scheduler_provider import resolve_cron_scheduler
 
     job = create_job(**kwargs)
+    if not job.get("enabled") or job.get("next_run_at") is None:
+        return job
     try:
         resolve_cron_scheduler().register_job(job)
     except Exception as exc:

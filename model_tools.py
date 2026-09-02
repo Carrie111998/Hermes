@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    exclude_mcp_tools: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -337,9 +338,10 @@ def get_tool_definitions(
         quiet_mode: Suppress status prints.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
-            tool_search / tool_describe bridge handlers so they can read the
-            real catalog, not the already-collapsed one. Public callers should
-            leave this False.
+            tool_search / tool_describe bridge handlers and strict cron jobs so
+            they can use the real catalog, not the already-collapsed one.
+        exclude_mcp_tools: Remove every MCP-prefixed schema even when a
+            previously registered MCP tool shares an allowed toolset name.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -371,6 +373,7 @@ def get_tool_definitions(
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
+                bool(exclude_mcp_tools),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
@@ -386,8 +389,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        exclude_mcp_tools=exclude_mcp_tools,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -419,6 +427,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    exclude_mcp_tools: bool = False,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -506,8 +515,22 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    # Remove MCP names before registry availability checks: an MCP check_fn may
+    # perform discovery or connection work, so post-schema filtering alone is
+    # too late for a no-MCP caller.
+    if exclude_mcp_tools:
+        tools_to_include = {
+            name for name in tools_to_include if not str(name).startswith("mcp__")
+        }
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    if exclude_mcp_tools:
+        filtered_tools = [
+            tool
+            for tool in filtered_tools
+            if not str(tool.get("function", {}).get("name", "")).startswith("mcp__")
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -1264,6 +1287,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    exclude_mcp_tools: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1285,6 +1309,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        exclude_mcp_tools: Exclude MCP tools from bridge catalog reconstruction
+                       and recursive dispatch. Strict no-MCP sessions set this
+                       for every direct dispatcher call.
 
     Returns:
         Function result as a JSON string.
@@ -1301,6 +1328,11 @@ def handle_function_call(
     # the dispatch seam so every replay keeps working; new schemas only
     # advertise the new names, so fresh sessions never see the old ones.
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+
+    if exclude_mcp_tools and str(function_name).startswith("mcp__"):
+        return tool_error(
+            f"'{function_name}' is not available in this session because MCP tools are disabled."
+        )
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1348,7 +1380,9 @@ def handle_function_call(
             current_defs = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                quiet_mode=True, skip_tool_search_assembly=True,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+                exclude_mcp_tools=exclude_mcp_tools,
             ) or []
         except Exception:
             current_defs = []
@@ -1410,6 +1444,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                exclude_mcp_tools=exclude_mcp_tools,
             )
 
     _tool_original_args = dict(function_args)

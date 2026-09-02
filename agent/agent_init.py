@@ -614,6 +614,8 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    skip_tool_search_assembly: bool = False,
+    exclude_mcp_tools: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -1047,9 +1049,11 @@ def init_agent(
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
-    # Set on internal forks (e.g. background_review) that must keep ``tools[]``
-    # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    # Internal forks use this for cache parity; strict no-MCP agents use it as
+    # a capability boundary that must survive beyond the initial tool snapshot.
+    agent._skip_mcp_refresh = bool(exclude_mcp_tools)
+    agent._exclude_mcp_tools = bool(exclude_mcp_tools)
+    agent._skip_tool_search_assembly = bool(skip_tool_search_assembly)
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -1626,6 +1630,8 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        exclude_mcp_tools=exclude_mcp_tools,
     )
     
     # Show tool configuration and store valid tool names for validation

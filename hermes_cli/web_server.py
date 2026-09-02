@@ -13346,6 +13346,8 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
 
 
 def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[str] = None):
+    from cron.policy import CronPolicyError
+
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -13372,6 +13374,8 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
         job = _mutate_cron_for_profile(profile_name, "update_job", job_id, updates)
     except HTTPException:
         raise
+    except CronPolicyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not job:
@@ -13394,10 +13398,15 @@ def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
+    from cron.policy import CronPolicyError
+
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _mutate_cron_for_profile(selected, "resume_job", job_id)
+    try:
+        job = _mutate_cron_for_profile(selected, "resume_job", job_id)
+    except CronPolicyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -13412,6 +13421,12 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    from cron.policy import CronPolicyError, require_trusted_policy_operator
+
+    try:
+        require_trusted_policy_operator(job, None, "manual run")
+    except CronPolicyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     # Do not expose the job as due before claiming it: the built-in ticker and
     # external/manual fire paths share the same durable claim, so only one can
     # execute this selected run even if they race across processes. Active jobs
@@ -13442,11 +13457,15 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
+    from cron.policy import CronPolicyError
+
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
         removed = _mutate_cron_for_profile(selected, "remove_job", job_id)
+    except CronPolicyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:

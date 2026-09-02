@@ -398,6 +398,40 @@ class TestRunJob:
                 mock_trigger.assert_not_called()
 
 
+class TestProtectedPolicyLifecycle:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "path", "target", "body"),
+        [
+            ("patch", f"/api/jobs/{VALID_JOB_ID}", "_cron_update", {"name": "x"}),
+            ("delete", f"/api/jobs/{VALID_JOB_ID}", "_cron_remove", None),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/resume", "_cron_resume", None),
+            ("post", f"/api/jobs/{VALID_JOB_ID}/run", "_cron_trigger", {}),
+        ],
+    )
+    async def test_policy_rejection_is_forbidden_not_server_error(
+        self, adapter, method, path, target, body
+    ):
+        from cron.policy import CronPolicyError
+
+        app = _create_app(adapter)
+        rejecting = MagicMock(
+            side_effect=CronPolicyError(
+                "policy job lifecycle requires trusted operator authority"
+            )
+        )
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}.{target}", rejecting
+            ):
+                response = await getattr(cli, method)(path, json=body)
+                payload = await response.json()
+
+        assert response.status == 403
+        assert "trusted operator" in payload["error"]
+        rejecting.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # 17. test_auth_required
 # ---------------------------------------------------------------------------

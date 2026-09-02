@@ -767,6 +767,65 @@ class TestDeferredCallSchemaProbe:
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
 
+    def test_direct_bridge_dispatch_excludes_mcp_when_requested(self):
+        import model_tools
+        from tools.registry import registry
+
+        name = "mcp__strict_direct_probe__read"
+        toolset = "mcp-strict-direct-probe"
+        calls = []
+
+        def _handler(args, task_id=None, **kw):
+            calls.append(args)
+            return "DIRECT_MCP_REACHED"
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema={
+                "name": name,
+                "description": "Unique strict direct MCP probe capability.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            toolset=toolset,
+        )
+
+        search_result = model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"queries": ["unique strict direct MCP probe"]},
+            enabled_toolsets=[toolset],
+            exclude_mcp_tools=True,
+        )
+        describe_result = model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"names": [name]},
+            enabled_toolsets=[toolset],
+            exclude_mcp_tools=True,
+        )
+        call_result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": name, "arguments": {}},
+            enabled_toolsets=[toolset],
+            exclude_mcp_tools=True,
+        )
+        direct_result = model_tools.handle_function_call(
+            function_name=name,
+            function_args={},
+            enabled_toolsets=[toolset],
+            exclude_mcp_tools=True,
+        )
+
+        search_payload = json.loads(search_result)
+        describe_payload = json.loads(describe_result)
+        call_payload = json.loads(call_result)
+
+        assert all(name not in str(item) for item in search_payload.get("web", []))
+        assert describe_payload["tools"] == {}
+        assert describe_payload["not_found"] == [name]
+        assert "not available in this session" in call_payload["error"]
+        assert "DIRECT_MCP_REACHED" not in direct_result
+        assert calls == []
+
     def test_invalid_enum_is_blocked_before_dispatch(self):
         import model_tools
 

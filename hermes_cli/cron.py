@@ -44,8 +44,10 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
 
 
 def _cron_api(**kwargs):
+    from cron.policy import cron_operator_capability
     from tools.cronjob_tools import cronjob as cronjob_tool
 
+    kwargs["_operator_capability"] = cron_operator_capability()
     return json.loads(cronjob_tool(**kwargs))
 
 
@@ -803,6 +805,12 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        policy_id=getattr(args, "policy_id", None),
+        enabled_toolsets=getattr(args, "enabled_toolsets", None),
+        strict_toolsets=getattr(args, "strict_toolsets", False),
+        no_mcp=getattr(args, "no_mcp", False),
+        no_fallback=getattr(args, "no_fallback", False),
+        start_paused=getattr(args, "start_paused", False),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -974,16 +982,23 @@ def cron_resume(args) -> int:
             return 1
         return _job_action("resume", args.job_id, "Resumed")
     from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot
+    from cron.policy import cron_operator_capability
+    from cron.scheduler import _notify_provider_jobs_changed
 
     run_at = _hermes_now().isoformat() if args.run_now else args.run_at
     try:
-        job = rearm_oneshot(args.job_id, run_at)
+        job = rearm_oneshot(
+            args.job_id,
+            run_at,
+            _operator_capability=cron_operator_capability(),
+        )
     except (AmbiguousJobReference, ValueError) as exc:
         print(color(f"Failed to re-arm job: {exc}", Colors.RED))
         return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
+    _notify_provider_jobs_changed()
     print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN))
     print(f"  Next run: {job.get('next_run_at')}")
     return 0

@@ -612,6 +612,82 @@ async def test_trigger_cron_job_reports_lost_claim_as_conflict(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "state"),
+    [(True, "scheduled"), (False, "paused")],
+)
+async def test_dashboard_rejects_manual_run_of_policy_jobs(
+    isolated_profiles,
+    monkeypatch,
+    enabled,
+    state,
+):
+    from hermes_cli import web_server
+
+    policy_job = {
+        "id": "strict-job",
+        "policy_id": "strict-unattended-v1",
+        "enabled": enabled,
+        "state": state,
+    }
+    monkeypatch.setattr(
+        web_server,
+        "_call_cron_for_profile",
+        lambda *_args, **_kwargs: policy_job,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_fire_cron_job_for_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dashboard must not fire protected policy jobs")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await web_server.trigger_cron_job(
+            policy_job["id"],
+            profile="worker_alpha",
+        )
+
+    assert exc.value.status_code == 403
+    assert "trusted operator" in exc.value.detail
+
+
+@pytest.mark.parametrize("operation", ["update", "resume", "delete"])
+def test_dashboard_policy_mutations_return_forbidden(monkeypatch, operation):
+    from cron.policy import CronPolicyError
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server, "_find_cron_job_profile", lambda _job_id: "default")
+    monkeypatch.setattr(
+        web_server,
+        "_call_cron_for_profile",
+        lambda *_args, **_kwargs: {"id": "strict-job", "policy_id": "strict-unattended-v1"},
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_mutate_cron_for_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            CronPolicyError("policy cron job mutation requires a trusted operator CLI")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        if operation == "update":
+            web_server._update_cron_job_sync(
+                "strict-job",
+                web_server.CronJobUpdate(updates={"name": "blocked"}),
+            )
+        elif operation == "resume":
+            web_server._resume_cron_job_sync("strict-job")
+        else:
+            web_server._delete_cron_job_sync("strict-job")
+
+    assert exc.value.status_code == 403
+    assert "trusted operator" in exc.value.detail
+
+
+@pytest.mark.asyncio
 async def test_trigger_cron_job_forces_paused_job_atomically(
     isolated_profiles,
     monkeypatch,

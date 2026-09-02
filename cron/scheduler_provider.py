@@ -180,6 +180,7 @@ class CronScheduler(ABC):
         adapters: Any = None,
         loop: Any = None,
         force: bool = False,
+        _operator_capability: object = None,
     ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -193,12 +194,22 @@ class CronScheduler(ABC):
         the job itself failed. Returns False only if the claim was lost
         (another machine/retry won it) or the job no longer exists.
         """
-        claimed_job = self.claim_fire(job_id, force=force)
+        claimed_job = self.claim_fire(
+            job_id,
+            force=force,
+            _operator_capability=_operator_capability,
+        )
         if claimed_job is None:
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+    def claim_fire(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        _operator_capability: object = None,
+    ) -> dict | None:
         """Durably claim one fire and create its audit attempt before dispatch.
 
         Webhook transports call this synchronously before acknowledging the
@@ -212,6 +223,8 @@ class CronScheduler(ABC):
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
+        if _operator_capability is not None:
+            claim_kwargs["_operator_capability"] = _operator_capability
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:

@@ -790,8 +790,14 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_state"] = job["monitor_state"]
     if job.get("no_agent"):
         result["no_agent"] = True
-    if job.get("enabled_toolsets"):
-        result["enabled_toolsets"] = job["enabled_toolsets"]
+    if job.get("policy_id") is not None:
+        result["policy_id"] = job["policy_id"]
+        result["strict_toolsets"] = job.get("strict_toolsets") is True
+        result["no_mcp"] = job.get("no_mcp") is True
+        result["no_fallback"] = job.get("no_fallback") is True
+        result["created_paused"] = job.get("created_paused") is True
+    if job.get("enabled_toolsets") or job.get("policy_id") is not None:
+        result["enabled_toolsets"] = job.get("enabled_toolsets") or []
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     stored_refs = job.get("context_from") or []
@@ -1522,12 +1528,50 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    policy_id: Optional[str] = None,
+    strict_toolsets: bool = False,
+    no_mcp: bool = False,
+    no_fallback: bool = False,
+    start_paused: bool = False,
+    _operator_capability: object = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
 
     try:
         normalized = (action or "").strip().lower()
+
+        from cron.policy import is_trusted_cron_operator
+
+        trusted_operator = is_trusted_cron_operator(_operator_capability)
+        protected_policy_request = bool(
+            policy_id or strict_toolsets or no_mcp or no_fallback or start_paused
+        )
+        if protected_policy_request and not trusted_operator:
+            return tool_error(
+                "Registered cron isolation policies may only be created by a trusted operator CLI.",
+                success=False,
+            )
+
+        protected_lifecycle_actions = {
+            "update",
+            "resume",
+            "run",
+            "run_now",
+            "trigger",
+            "remove",
+        }
+        if (
+            normalized in protected_lifecycle_actions
+            and job_id
+            and not trusted_operator
+        ):
+            target = resolve_job_ref(job_id)
+            if target and target.get("policy_id") is not None:
+                return tool_error(
+                    "Policy cron jobs may only be changed or activated by a trusted operator CLI.",
+                    success=False,
+                )
 
         if normalized == "create":
             if not schedule:
@@ -1624,7 +1668,7 @@ def cronjob(
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
-                    enabled_toolsets=enabled_toolsets or None,
+                    enabled_toolsets=enabled_toolsets,
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
@@ -1636,6 +1680,12 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    policy_id=policy_id,
+                    strict_toolsets=bool(strict_toolsets),
+                    no_mcp=bool(no_mcp),
+                    no_fallback=bool(no_fallback),
+                    start_paused=bool(start_paused),
+                    _operator_capability=_operator_capability,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1713,7 +1763,9 @@ def cronjob(
         job_id = job["id"]
 
         if normalized == "remove":
-            removed = remove_job(job_id)
+            removed = remove_job(
+                job_id, _operator_capability=_operator_capability
+            )
             if not removed:
                 return tool_error(f"Failed to remove job '{job_id}'", success=False)
             _notify_provider_jobs_changed_safe()
@@ -1736,7 +1788,9 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
-            updated = resume_job(job_id)
+            updated = resume_job(
+                job_id, _operator_capability=_operator_capability
+            )
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
@@ -1973,7 +2027,11 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
-            updated = update_job(job_id, updates)
+            updated = update_job(
+                job_id,
+                updates,
+                _operator_capability=_operator_capability,
+            )
             _notify_provider_jobs_changed_safe()
             _upd_result: Dict[str, Any] = {"success": True, "job": _format_job(updated)}
             # An update can switch a job into monitor / no_agent mode or

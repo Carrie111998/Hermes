@@ -162,6 +162,27 @@ def test_force_fire_capability_detects_legacy_override():
     assert KeywordSink().supports_force_fire is True
 
 
+def test_force_fire_threads_operator_capability(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    provider = InProcessCronScheduler()
+    capability = object()
+    captured = {}
+
+    def claim(job_id, **kwargs):
+        captured.update(kwargs)
+        return {"id": job_id}
+
+    monkeypatch.setattr(provider, "claim_fire", claim)
+    monkeypatch.setattr(provider, "fire_claimed", lambda job, **kwargs: True)
+
+    assert provider.fire_due(
+        "job-id", force=True, _operator_capability=capability
+    )
+    assert captured["force"] is True
+    assert captured["_operator_capability"] is capability
+
+
 def test_inprocess_provider_ticks_and_stops():
     """The built-in provider drives cron.scheduler.tick(sync=False) on a loop
     and exits promptly when stop_event is set — same contract as the raw
