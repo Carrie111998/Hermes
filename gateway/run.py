@@ -7837,10 +7837,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # for unattended gateways.
         try:
             from hermes_cli.config import load_config as _load_full_config
+            from tools.approval import _normalize_approval_mode
             _appr_cfg = _load_full_config()
-            _appr_mode = str(
-                cfg_get(_appr_cfg, "approvals", "mode", default="manual") or "manual"
-            ).strip().lower()
+            # Route through the canonical resolver so YAML 1.1's bare `off`
+            # (parsed as False) is treated as "off" here just like the runtime
+            # approval gate does — otherwise `False or "manual"` collapses to
+            # "manual" and this warning contradicts the effective policy.
+            _appr_mode = _normalize_approval_mode(
+                cfg_get(_appr_cfg, "approvals", "mode", default="manual")
+            )
             _tirith_on = bool(cfg_get(_appr_cfg, "security", "tirith_enabled", default=True))
             _aux_approval = cfg_get(_appr_cfg, "auxiliary", "approval", default=None)
             if _appr_mode == "manual" and not _tirith_on and not _aux_approval:
