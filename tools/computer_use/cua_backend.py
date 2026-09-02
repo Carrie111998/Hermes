@@ -353,14 +353,19 @@ def _computer_use_max_image_dimension() -> Optional[int]:
     return dim if dim > 0 else None
 
 
-def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def cua_driver_child_env(
+    base_env: Optional[Dict[str, str]] = None,
+    driver_cmd: Optional[str] = None,
+) -> Dict[str, str]:
     """Return the environment dict for spawning cua-driver.
 
     Starts from ``base_env`` (defaults to ``os.environ``) and, when telemetry
     is disabled (the default), injects ``CUA_DRIVER_RS_TELEMETRY_ENABLED=0``.
     When the user has opted in, the var is left untouched so cua-driver uses
     its own default. Used by every cua-driver spawn site (MCP backend, status,
-    doctor, install) so the policy is applied consistently.
+    doctor, install) so the policy is applied consistently. ``driver_cmd`` is
+    accepted so runtime policy wrappers can evaluate the exact binary a caller
+    already resolved instead of resolving a potentially different executable.
     """
     env = dict(base_env if base_env is not None else os.environ)
     if _cua_telemetry_disabled():
