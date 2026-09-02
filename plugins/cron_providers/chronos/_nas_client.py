@@ -41,9 +41,22 @@ class NasCronClient:
     # -- auth -------------------------------------------------------------
 
     def _access_token(self) -> str:
-        """The agent's existing Nous Portal access token (refresh-aware)."""
-        from hermes_cli.auth import resolve_nous_access_token
-        return resolve_nous_access_token()
+        """Resolve the agent-scoped Nous credential used by managed services.
+
+        ``resolve_nous_access_token`` exposes the refreshable user session,
+        while hosted gateways may need the runtime ``agent_key`` (the
+        bootstrap/invoke JWT seeded for that gateway). The runtime resolver
+        refreshes and selects that credential consistently with inference, and
+        prevents Chronos from presenting a generic user token to
+        ``agent-cron`` (#97494).
+        """
+        from hermes_cli.auth import resolve_nous_runtime_credentials
+
+        credentials = resolve_nous_runtime_credentials()
+        token = credentials.get("api_key")
+        if not isinstance(token, str) or not token.strip():
+            raise NasCronClientError("Nous runtime credentials did not contain an access token")
+        return token.strip()
 
     def _headers(self) -> Dict[str, str]:
         return {
