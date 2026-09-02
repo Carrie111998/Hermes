@@ -264,7 +264,7 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    return _handle_send(args, messages=kw.get("messages"))
 
 
 def _handle_list():
@@ -366,7 +366,7 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
-def _handle_send(args):
+def _handle_send(args, messages=None):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
@@ -440,6 +440,15 @@ def _handle_send(args):
     # instead of send_photo so the original bytes survive (e.g. info-graph
     # JPGs where Telegram's sendPhoto recompresses to 1280px).
     force_document_attachments = "[[as_document]]" in message
+
+    if messages:
+        # A model that just ran computer_use and now forwards that
+        # screenshot via send_message can mangle the absolute path the same
+        # way it can in a final turn response — recover it before media
+        # extraction/validation, mirroring the repair every other delivery
+        # surface (gateway/run.py, cron/scheduler.py) already applies.
+        from gateway.media_repair import repair_explicit_computer_use_media_paths
+        message = repair_explicit_computer_use_media_paths(message, messages)
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)

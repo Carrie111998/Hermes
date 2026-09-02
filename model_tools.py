@@ -1248,6 +1248,14 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+# Tools that can forward an already-emitted computer_use screenshot path
+# mid-turn (via a MEDIA: tag in a message/text argument) and therefore need
+# `messages` to run gateway/media_repair.py's model-mangled-path repair
+# before their own media extraction runs — see tools/send_message_tool.py
+# and tools/yuanbao_tools.py::_handle_yb_send_dm.
+_MEDIA_REPAIR_ELIGIBLE_TOOL_NAMES = frozenset({"send_message", "yb_send_dm"})
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1264,6 +1272,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    messages: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1285,6 +1294,12 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        messages: Current conversation messages, forwarded only to tools in
+                       ``_MEDIA_REPAIR_ELIGIBLE_TOOL_NAMES`` so they can
+                       recover a model-mangled computer_use screenshot path
+                       before extracting media. ``None`` for callers that
+                       don't have a live conversation (CLI one-shot send,
+                       MCP server) — those tools just skip the repair.
 
     Returns:
         Function result as a JSON string.
@@ -1566,6 +1581,21 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                    )
+            elif function_name in _MEDIA_REPAIR_ELIGIBLE_TOOL_NAMES:
+                # These tools can forward an already-emitted computer_use
+                # screenshot mid-turn (a MEDIA: tag in their message/text
+                # argument). They need conversation `messages` to run the
+                # same model-mangled-path repair the turn-completion delivery
+                # surfaces apply (gateway/media_repair.py) before the model's
+                # path gets validated and possibly dropped.
+                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    return registry.dispatch(
+                        function_name, next_args,
+                        task_id=task_id,
+                        session_id=session_id,
+                        user_task=user_task,
+                        messages=messages,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
