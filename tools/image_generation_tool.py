@@ -701,6 +701,39 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         },
         "max_reference_images": 3,
     },
+    "fal-ai/kling-image/v3/text-to-image": {
+        "display": "Kling Image v3",
+        "speed": "~10s",
+        "strengths": "Kuaishou. Realistic detail, cheap native 2K, wide AR set",
+        "price": "$0.028/image",
+        "size_style": "aspect_ratio",
+        "sizes": {
+            "landscape": "16:9",
+            "square": "1:1",
+            "portrait": "9:16",
+        },
+        "defaults": {
+            "num_images": 1,
+            "output_format": "png",
+            # 1K and 2K are the same price — default to the high-res tier.
+            "resolution": "2K",
+        },
+        "supports": {
+            "prompt", "aspect_ratio", "num_images", "output_format",
+            "resolution", "negative_prompt", "sync_mode",
+        },
+        # Native 2K (16:9 ≈ 3.7MP) — no auto-upscale needed.
+        "upscale": False,
+        # The i2i endpoint takes a SINGULAR `image_url` (one reference image),
+        # unlike every other FAL edit endpoint's `image_urls` list.
+        "edit_endpoint": "fal-ai/kling-image/v3/image-to-image",
+        "edit_image_param": "image_url",
+        "edit_supports": {
+            "prompt", "image_url", "aspect_ratio", "num_images",
+            "output_format", "resolution", "sync_mode",
+        },
+        "max_reference_images": 1,
+    },
 }
 
 # Default model is the fastest reasonable option. Kept cheap and sub-1s.
@@ -997,7 +1030,15 @@ def _build_fal_edit_payload(
 
     payload: Dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
-    payload["image_urls"] = list(image_urls)
+    # Most FAL edit endpoints take an ``image_urls`` list; a few (Kling Image
+    # v3) take a SINGULAR ``image_url`` string instead. The catalog entry can
+    # declare ``edit_image_param: "image_url"`` to opt into the singular form
+    # (only the first source/reference image is sent).
+    image_param = meta.get("edit_image_param") or "image_urls"
+    if image_param == "image_urls":
+        payload["image_urls"] = list(image_urls)
+    else:
+        payload[image_param] = list(image_urls)[0]
 
     # Only express output size when the edit endpoint advertises the key.
     # gpt-image-2 edit auto-infers size from the input, so `image_size` is
@@ -1015,11 +1056,11 @@ def _build_fal_edit_payload(
             if v is not None:
                 payload[k] = v
 
-    # ``prompt`` and ``image_urls`` are required by every FAL edit endpoint;
-    # keep them even if a model's ``edit_supports`` whitelist omits them, so a
-    # missing whitelist entry can't silently drop the prompt or the source
-    # images and send a broken edit request.
-    _required = {"prompt", "image_urls"}
+    # ``prompt`` and the image-source key are required by every FAL edit
+    # endpoint; keep them even if a model's ``edit_supports`` whitelist omits
+    # them, so a missing whitelist entry can't silently drop the prompt or the
+    # source images and send a broken edit request.
+    _required = {"prompt", image_param}
     return {
         k: v for k, v in payload.items()
         if k in edit_supports or k in _required
