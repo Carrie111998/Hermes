@@ -496,6 +496,7 @@ class TestExtractMedia:
         )
         assert media == []
 
+    @pytest.mark.windows_only
     @pytest.mark.parametrize(
         "tag,expected",
         [
