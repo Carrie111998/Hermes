@@ -311,6 +311,24 @@ def _safe_decode(payload: bytes, charset: "Optional[str]") -> str:
     return payload.decode("latin-1", errors="replace")
 
 
+def _header_as_str(value) -> str:
+    """Coerce a compat32 header value to a plain string.
+
+    Raw unencoded non-ASCII bytes in a header (e.g. mojibake UTF-8
+    surrogates from old Sendgrid/Udemy deliveries) make the compat32 parser
+    return an ``email.header.Header`` object instead of ``str``; downstream
+    regex/string operations then raise ``TypeError`` and the per-message
+    guard silently drops a legitimate message instead of delivering it
+    (#94236). ``str(Header)`` re-encodes it as RFC 2047 encoded-words,
+    which ``_decode_header_value`` can decode normally.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
 def _decode_header_value(raw: str) -> str:
     """Decode an RFC 2047 encoded email header into a plain string.
 
@@ -1014,18 +1032,22 @@ class EmailAdapter(BasePlatformAdapter):
         """
         msg = email_lib.message_from_bytes(raw_email)
 
-        sender_raw = msg.get("From", "")
+        # compat32 can hand back email.header.Header objects for headers
+        # with raw non-ASCII bytes — coerce every value to str before any
+        # regex/string use so such messages parse instead of being dropped
+        # by the per-message guard (#94236).
+        sender_raw = _header_as_str(msg.get("From", ""))
         sender_addr = _extract_email_address(sender_raw)
         sender_name = _decode_header_value(sender_raw)
         # Remove email from name if present
         if "<" in sender_name:
             sender_name = sender_name.split("<")[0].strip().strip('"')
 
-        subject = _decode_header_value(msg.get("Subject", "(no subject)"))
-        message_id = msg.get("Message-ID", "")
-        in_reply_to = msg.get("In-Reply-To", "")
+        subject = _decode_header_value(_header_as_str(msg.get("Subject", "(no subject)")))
+        message_id = _header_as_str(msg.get("Message-ID", ""))
+        in_reply_to = _header_as_str(msg.get("In-Reply-To", ""))
         # Skip automated/noreply senders before any processing
-        msg_headers = dict(msg.items())
+        msg_headers = {k: _header_as_str(v) for k, v in msg.items()}
         if _is_automated_sender(sender_addr, msg_headers):
             logger.debug("[Email] Skipping automated sender: %s", sender_addr)
             return None
@@ -1052,7 +1074,7 @@ class EmailAdapter(BasePlatformAdapter):
             "in_reply_to": in_reply_to,
             "body": body,
             "attachments": attachments,
-            "date": msg.get("Date", ""),
+            "date": _header_as_str(msg.get("Date", "")),
             "sender_authenticated": sender_authenticated,
             "auth_reason": auth_reason,
         }
