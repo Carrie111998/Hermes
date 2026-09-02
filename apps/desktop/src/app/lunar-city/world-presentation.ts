@@ -92,16 +92,19 @@ const SCENES: Record<string, SceneSpec> = {
   },
   'task.running': {
     animationTags: ['task.running', 'travel', 'task.work'],
+    intensity: 0,
     npcState: 'working',
     sceneTag: 'activity.task.running'
   },
   'task.ready': {
     animationTags: ['task.ready', 'prepare.tools'],
+    intensity: 0,
     npcState: 'walking',
     sceneTag: 'activity.task.ready'
   },
   'task.waiting': {
     animationTags: ['task.waiting', 'queue.waiting'],
+    intensity: 0,
     npcState: 'waiting',
     sceneTag: 'activity.task.waiting'
   },
