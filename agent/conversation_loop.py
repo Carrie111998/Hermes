@@ -6927,7 +6927,7 @@ def run_conversation(
                 # (10s → 30s → 60s → 120s → 180s → 300s) instead of the
                 # default 2s/60s cap — the error is explicitly transient.
                 if _is_upstream_capacity and not _retry_after:
-                    wait_time = upstream_capacity_backoff(retry_count)
+                    wait_time = upstream_capacity_backoff(retry_count + 1)
                     _backoff_policy = "upstream_capacity"
                 if is_rate_limited or _is_zai_coding_overload or _is_upstream_capacity:
                     _policy_note = ""

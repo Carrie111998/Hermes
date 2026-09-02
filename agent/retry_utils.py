@@ -234,12 +234,11 @@ def is_upstream_capacity_error(*, error: Any) -> bool:
     """Return True for provider 429s reporting upstream model capacity.
 
     Matches the verbatim "temporarily at capacity upstream" phrasing used by
-    Nous Portal and the narrower "at capacity" / "over capacity" subset of
-    ``_OVERLOADED_PATTERNS``.  Does NOT match generic per-credential rate
-    limits ("rate limit exceeded", quota exhaustion, billing).  Only
-    capacity-type 429s that are explicitly transient qualify — those are the
-    ones that benefit from a patient retry posture instead of an immediate
-    fallback.
+    Nous Portal. This is intentionally narrow: generic 429 bodies that happen
+    to contain "at capacity" or "over capacity" (e.g. account-level quota
+    exhaustion, credential-pool rate limits) are excluded, because those
+    benefit from an immediate provider failover rather than a patient
+    multi-minute retry against the same saturated endpoint.
     """
     status = getattr(error, "status_code", None)
     if status != 429:
@@ -248,12 +247,7 @@ def is_upstream_capacity_error(*, error: Any) -> bool:
     if not text:
         return False
     # "temporarily at capacity upstream" — Nous Portal's exact wording.
-    if "temporarily at capacity upstream" in text:
-        return True
-    # Generic "at capacity" / "over capacity" on a 429 — same class.
-    if any(p in text for p in ("at capacity", "over capacity")):
-        return True
-    return False
+    return "temporarily at capacity upstream" in text
 
 
 def upstream_capacity_retry_ceiling(
@@ -287,7 +281,7 @@ def upstream_capacity_backoff(attempt: int) -> float:
             attempt, base_delay=2.0, max_delay=60.0, jitter_ratio=0.5
         )
     idx = min(
-        attempt - _UPSTREAM_CAPACITY_SHORT_ATTEMPTS - 1,
+        max(0, attempt - _UPSTREAM_CAPACITY_SHORT_ATTEMPTS - 1),
         len(_UPSTREAM_CAPACITY_LONG_BACKOFF) - 1,
     )
     base_delay = _UPSTREAM_CAPACITY_LONG_BACKOFF[idx]

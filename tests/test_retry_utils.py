@@ -234,12 +234,16 @@ class TestIsUpstreamCapacityError:
     def test_nous_capacity_message_is_detected(self):
         assert is_upstream_capacity_error(error=_capacity_error()) is True
 
-    def test_generic_at_capacity_429_is_detected(self):
+    def test_generic_at_capacity_429_is_not_detected(self):
+        # Generic "at capacity" / "over capacity" on a 429 without the exact
+        # Nous Portal phrasing must NOT trigger the patient upstream-capacity
+        # backoff — those are likely account-level quota/credential limits
+        # that need a failover, not a multi-minute retry.
         err = SimpleNamespace(
             status_code=429,
             body={"error": {"message": "The server is at capacity"}},
         )
-        assert is_upstream_capacity_error(error=err) is True
+        assert is_upstream_capacity_error(error=err) is False
 
     def test_plain_rate_limit_is_not_detected(self):
         err = SimpleNamespace(
@@ -340,3 +344,37 @@ class TestUpstreamCapacityBackoff:
         last_delay = upstream_capacity_backoff(ceiling - 1)
         # 300s base with 0.2 jitter → [300, 360]
         assert 295 < last_delay <= 360, f"last delay {last_delay:.1f} should be ~300s"
+
+    def test_call_site_retry_count_is_zero_based(self):
+        # The retry loop in conversation_loop.py passes retry_count (0-based)
+        # to upstream_capacity_backoff as retry_count + 1 (1-based).  Verify
+        # that the mapping produces the intended schedule: the first call-site
+        # retry (retry_count=0) maps to attempt 1 (short tier), and the fourth
+        # call-site retry (retry_count=3) maps to attempt 4 (first long tier
+        # entry, 10s base) — NOT a silent negative-index 300s stall.
+        from agent.retry_utils import (
+            _UPSTREAM_CAPACITY_SHORT_ATTEMPTS,
+            _UPSTREAM_CAPACITY_LONG_BACKOFF,
+        )
+        # retry_count=0 → attempt=1 (short tier, attempt <= SHORT_ATTEMPTS)
+        assert upstream_capacity_backoff(0 + 1) <= 60.0 * 1.2
+        # retry_count=3 → attempt=4 (first long-tier entry: 10s base)
+        delay = upstream_capacity_backoff(3 + 1)
+        assert 10.0 <= delay <= 10.0 * 1.2, (
+            f"retry_count=3 should map to long-tier base 10s, got {delay:.1f}s"
+        )
+        # retry_count=_SHORT_ATTEMPTS+len(long)-1 → attempt=ceiling-1 (300s)
+        ceiling = upstream_capacity_retry_ceiling()
+        last = upstream_capacity_backoff(ceiling - 1 + 1)
+        assert 295 < last <= 360, f"final long-tier delay {last:.1f} should be ~300s"
+
+    def test_negative_index_guard_prevents_silent_300s_stall(self):
+        # Defense-in-depth: if upstream_capacity_backoff receives an attempt
+        # below _UPSTREAM_CAPACITY_SHORT_ATTEMPTS (e.g. attempt=0 from a
+        # caller that forgets the +1), the index into the long table must not
+        # go negative and silently resolve to the last entry (300s).  It should
+        # fall into the short tier instead.
+        delay = upstream_capacity_backoff(0)
+        assert delay <= 60.0 * 1.2, (
+            f"attempt=0 should hit short tier, not 300s long tier; got {delay:.1f}s"
+        )
