@@ -1564,14 +1564,16 @@ def run_doctor(args):
                 except Exception:
                     custom_providers = []
 
+            user_provider_ids: set[str] = set()
             user_providers = cfg.get("providers")
             if isinstance(user_providers, dict):
                 from hermes_cli.config import is_provider_enabled
-                known_providers.update(
+                user_provider_ids = {
                     str(name).strip().lower()
                     for name, prov_cfg in user_providers.items()
                     if str(name).strip() and is_provider_enabled(prov_cfg)
-                )
+                }
+                known_providers.update(user_provider_ids)
             for entry in custom_providers:
                 if not isinstance(entry, dict):
                     continue
@@ -1660,6 +1662,7 @@ def run_doctor(args):
                 provider_policy_id in providers_accepting_vendor_slugs
                 or provider_policy_id == "custom"
                 or provider_policy_id.startswith("custom:")
+                or provider in user_provider_ids
             )
             if (
                 default_model
