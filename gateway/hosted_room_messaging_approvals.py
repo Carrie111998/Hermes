@@ -175,6 +175,12 @@ def _initialize(conn: sqlite3.Connection) -> None:
                     "ALTER TABLE hosted_room_messaging_approval_commands "
                     "ADD COLUMN application_started_at REAL"
                 )
+                # Old pending receipts may represent an applied decision whose
+                # reply was lost; absence of tracking is not proof of no action.
+                conn.execute(
+                    "UPDATE hosted_room_messaging_approval_commands "
+                    "SET application_started_at=updated_at WHERE state='pending'"
+                )
             conn.commit()
         except Exception:
             conn.rollback()

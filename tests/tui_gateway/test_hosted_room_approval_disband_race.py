@@ -57,6 +57,42 @@ def test_existing_command_table_adds_application_boundary_column(tmp_path):
     assert row == (None,)
 
 
+@pytest.mark.parametrize("completed", [False, True])
+def test_migration_preserves_existing_approval_outcome_uncertainty(tmp_path, completed):
+    db = tmp_path / "state.db"
+    pending = approvals.persist_pending_approval(
+        db, room_id="room-1", member_id="member-1", action=_action()
+    )
+    approvals.begin_approval_command(
+        db, command_id="legacy-command", pending=pending, choice="once"
+    )
+    if completed:
+        approvals.complete_approval_command(
+            db, command_id="legacy-command", result="Approved once."
+        )
+    # Old commands exist before migration and carry no application evidence.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "ALTER TABLE hosted_room_messaging_approval_commands "
+            "DROP COLUMN application_started_at"
+        )
+    assert not approvals.expire_unstarted_approval_command(
+        db, command_id="legacy-command", result="Expired"
+    )
+    receipt = approvals.approval_command(db, command_id="legacy-command")
+    replay = approvals.submit_approval(
+        db, service=None, command_id="legacy-command", pending=pending, choice="once"
+    )
+    if completed:
+        assert receipt["result_text"] == "Approved once."
+        assert replay["applied"] is True
+    else:
+        assert receipt["application_started_at"] is not None
+        assert receipt["state"] == "pending"
+        assert replay["queued"] is True
+        assert "applied" not in replay
+
+
 @pytest.mark.parametrize("response_lost", [False, True])
 def test_disband_cleanup_preserves_an_inflight_success_receipt(tmp_path, response_lost):
     entered = threading.Event()
