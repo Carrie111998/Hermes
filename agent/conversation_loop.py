@@ -99,7 +99,7 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
-from agent.repetition_guard import is_repetition_dominated
+from agent.repetition_guard import is_repetition_dominated, StreamDegenerationError
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -4913,6 +4913,71 @@ def run_conversation(
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
+
+            except StreamDegenerationError:
+                # ── Mid-stream repetition-degeneration abort (#94224) ──
+                # The streaming layer detected the response turning
+                # repetition-dominated (same heuristic as the #86581
+                # post-truncation guard) and killed the live stream. The
+                # degenerate draft must NOT reach history: it was never a
+                # real answer, and appending it would break role alternation
+                # on the next turn. Discard it, clear the streamed-text
+                # tracking so the poisoned deltas can't leak into the
+                # interim-visible-text comparison, settle the Relay logical
+                # call as cancelled, and exit with the same user-facing
+                # notice shape as the post-truncation repetition guard.
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                try:
+                    agent._reset_stream_delivery_tracking()
+                except Exception:
+                    logger.debug(
+                        "stream delivery tracking reset failed after "
+                        "degeneration abort",
+                        exc_info=True,
+                    )
+                try:
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="cancelled",
+                    )
+                except Exception:
+                    logger.debug(
+                        "relay logical-call completion failed after "
+                        "degeneration abort",
+                        exc_info=True,
+                    )
+                agent._vprint(
+                    f"{agent.log_prefix}🔁 Response dominated by repeated "
+                    f"text — stream stopped before the repetition loop "
+                    f"flooded the response.",
+                    force=True,
+                )
+                _deg_response = (
+                    "⚠️ **Response Stopped — Repetition Detected**\n\n"
+                    "The model fell into a repetition loop while writing "
+                    "this response, so the partial response was discarded "
+                    "before it could flood the conversation.\n\n"
+                    "→ Switch to a different model with `/model`\n"
+                    "→ Or resend your message (your conversation history "
+                    "is preserved)"
+                )
+                agent._cleanup_task_resources(effective_task_id)
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": _deg_response,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "partial": True,
+                    "error": (
+                        "Model output entered a repetition loop mid-stream; "
+                        "the live stream was aborted."
+                    ),
+                }
 
             except InterruptedError:
                 if thinking_spinner:

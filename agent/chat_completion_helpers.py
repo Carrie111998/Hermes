@@ -44,6 +44,13 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
+# Mid-stream repetition-degeneration guard (#94224): reuses the #86581
+# post-truncation heuristic so there is exactly one repetition detector.
+from agent.repetition_guard import (
+    MIN_FRAGMENT_LENGTH as _REPETITION_GUARD_MIN_FRAGMENT,
+    StreamDegenerationError,
+    is_repetition_dominated,
+)
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -54,6 +61,13 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+
+# Mid-stream repetition-degeneration guard (#94224).  The accumulated
+# visible stream text is re-checked only after it has grown by this many
+# characters since the previous check — ``is_repetition_dominated`` scans
+# the whole accumulated fragment, so running it on every delta would make
+# the hottest loop in the agent quadratic.
+_REPETITION_GUARD_CHECK_INTERVAL = max(_REPETITION_GUARD_MIN_FRAGMENT // 2, 1)
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -4223,6 +4237,56 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         content_parts: list = []
         tool_calls_acc: dict = {}
         tool_gen_notified: set = set()
+        # ── Mid-stream repetition-degeneration guard state (#94224) ──
+        # ``content_parts`` is the authoritative accumulated visible text;
+        # these track when the guard last ran so the (whole-fragment)
+        # heuristic only executes every _REPETITION_GUARD_CHECK_INTERVAL
+        # characters of growth instead of on every delta.
+        repetition_guard_checked_at = 0
+
+        def _repetition_guard_check() -> None:
+            """Abort a stream whose visible text turned repetition-dominated.
+
+            Runs :func:`is_repetition_dominated` over the accumulated
+            visible text — the same conservative heuristic the
+            post-truncation guard applies to ``finish_reason=length``
+            responses (#86581), just earlier: while deltas are still
+            arriving, so the model cannot spend minutes of wall-clock and
+            its entire output budget echoing one fragment (#94224).
+
+            Fail-open by design: below MIN_FRAGMENT_LENGTH chars there is
+            nothing to judge, and any heuristic error is swallowed — an
+            evaluation bug must never abort a healthy stream.
+            """
+            nonlocal repetition_guard_checked_at
+            visible_len = sum(len(part) for part in content_parts)
+            if visible_len - repetition_guard_checked_at < _REPETITION_GUARD_CHECK_INTERVAL:
+                return
+            repetition_guard_checked_at = visible_len
+            try:
+                degenerate = is_repetition_dominated("".join(content_parts))
+            except Exception:
+                logger.warning(
+                    "Repetition guard evaluation failed; continuing stream.",
+                    exc_info=True,
+                )
+                return
+            if not degenerate:
+                return
+            logger.warning(
+                "Mid-stream repetition detected after ~%s visible chars "
+                "(model=%s) — aborting stream before the loop floods the "
+                "response.",
+                visible_len,
+                api_kwargs.get("model", "unknown"),
+            )
+            # Raising unwinds the chunk-consumption loop; Relay's managed
+            # stream scope is closed by the worker's cleanup paths.
+            raise StreamDegenerationError(
+                "Model output entered a repetition loop mid-stream; "
+                "stream aborted."
+            )
+
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
         # the last seen id per raw index so we can detect a new tool
@@ -4533,6 +4597,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             delta_content = flatten_message_text(getattr(delta, "content", None), sep="")
             if delta_content:
                 content_parts.append(delta_content)
+                # Mid-stream repetition-degeneration guard (#94224). Only
+                # visible response text is judged — reasoning blocks are
+                # separate scratchpad output, and once real tool calls
+                # exist this stream is an action turn whose suppressed
+                # narration is not the final answer.
+                if not tool_calls_acc:
+                    _repetition_guard_check()
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta_content):
                         pending_text_parts.append(delta_content)
@@ -5117,6 +5188,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 except Exception as e:
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
+                    # ── Mid-stream repetition-degeneration abort (#94224) ──
+                    # The guard tripped while deltas were still arriving:
+                    # the same provider/model would re-enter the identical
+                    # loop on a retry or fallback, and the partial text must
+                    # NOT be rescued into a finish_reason=length stub (the
+                    # continuation machinery would stitch the degenerate
+                    # draft back into the response). Fail fast so the
+                    # conversation loop can discard the draft and surface
+                    # the user-facing repetition notice.
+                    if isinstance(e, StreamDegenerationError):
+                        result["error"] = e
+                        return
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient
@@ -5723,6 +5806,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        # ── Mid-stream repetition-degeneration abort (#94224) ──
+        # Must precede the partial-delivery stub below: the degenerate
+        # draft is exactly what that length-stub would preserve and feed
+        # to the continuation machinery. Re-raise so the conversation loop
+        # sees StreamDegenerationError and discards the aborted draft.
+        if isinstance(result["error"], StreamDegenerationError):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
