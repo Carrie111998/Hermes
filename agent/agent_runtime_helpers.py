@@ -1635,7 +1635,28 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
-    if not agent._fallback_activated:
+    # ── Per-turn routing-override revert (dedicated, scoped) ──
+    # A routed turn (see agent/routing_override.py) swaps model/provider via a
+    # DEDICATED flag, keeping _primary_runtime == the routed runtime during the
+    # turn so in-turn recovery paths do not jump tiers. This block reverts it
+    # FIRST — before the _fallback_activated gate, the rate-limit cooldown gate,
+    # and the reset-aware pool gate below — so a routed turn ALWAYS reverts to the
+    # configured primary next turn. It must not be gated on _fallback_activated
+    # (the override never sets it) or on any cooldown a 429 from the routed model
+    # may have armed; either would leak the routed model past its turn.
+    # Falls through to the shared rebuild body below.
+    _override_revert = bool(getattr(agent, "_routing_override_active", False))
+    if _override_revert:
+        _saved = getattr(agent, "_routing_override_saved_primary", None)
+        if isinstance(_saved, dict):
+            agent._primary_runtime = _saved
+        # Clear the scoping state so this runs exactly once.
+        agent._routing_override_active = False
+        agent._routing_override_saved_primary = None
+        # Do NOT return here — proceed to rebuild the runtime from the restored
+        # _primary_runtime via the shared body below.
+
+    if not _override_revert and not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
         # called but returned False (chain exhausted or provider not
@@ -1646,7 +1667,7 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    if not _override_revert and getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     # ── Reset-aware gate ──
@@ -1705,7 +1726,7 @@ def restore_primary_runtime(agent) -> bool:
                 prefetched_primary_pool = None
                 pool = None
         next_at = getattr(pool, "next_available_at", lambda: None)()
-        if next_at is not None and next_at > time.time():
+        if not _override_revert and next_at is not None and next_at > time.time():
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(

@@ -1480,6 +1480,24 @@ def build_turn_context(
             _ctx_parts.append(_piece)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
+
+        # Routing override: a pre_llm_call result may carry a ``route`` dict that
+        # proactively swaps model/provider for THIS turn, before the first API
+        # call is assembled. The hook can already inject context; this lets it
+        # also act on a routing decision. Turn-scoped and fail-safe — see
+        # agent/routing_override.py. Core provides only the actuation path; the
+        # policy that produces the decision lives entirely in the plugin.
+        try:
+            from agent.routing_override import (
+                apply_routing_override,
+                extract_routing_override,
+            )
+
+            _override = extract_routing_override(_pre_results)
+            if _override:
+                apply_routing_override(agent, _override)
+        except Exception as _route_exc:
+            logger.warning("pre_llm_call routing override failed: %s", _route_exc)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
