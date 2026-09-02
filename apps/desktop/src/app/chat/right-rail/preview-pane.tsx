@@ -1205,6 +1205,27 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       )
     }
 
+    // Links with target="_blank" fire 'new-window' on the webview tag — without a
+    // handler Electron drops them silently (#101190). Navigate in place so the
+    // click actually goes somewhere; a dedicated tab is the strip's "+" job.
+    const onNewWindow = (event: Event & { url?: string }) => {
+      try {
+        ;(event as Event & { preventDefault?: () => void }).preventDefault?.()
+      } catch {
+        // preventDefault can throw if the event is not cancelable — ignore.
+      }
+      const next = event.url?.trim()
+      if (!next) {
+        return
+      }
+      setCurrentUrl(next)
+      if (typeof webview.loadURL === 'function') {
+        void webview.loadURL(next)
+      } else {
+        webview.setAttribute('src', next)
+      }
+    }
+
     webview.addEventListener('console-message', onConsole)
     webview.addEventListener('context-menu', onGuestContextMenu)
     webview.addEventListener('devtools-closed', onDevToolsClosed)
@@ -1214,6 +1235,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     webview.addEventListener('did-navigate-in-page', onNavigate)
     webview.addEventListener('did-start-loading', onStart)
     webview.addEventListener('did-stop-loading', onStop)
+    webview.addEventListener('new-window', onNewWindow as unknown as EventListener)
     // SPAs title themselves long after the load settles, and a route change
     // renames the page without navigating at all.
     webview.addEventListener('page-title-updated', notePage)
@@ -1231,6 +1253,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.removeEventListener('did-navigate-in-page', onNavigate)
       webview.removeEventListener('did-start-loading', onStart)
       webview.removeEventListener('did-stop-loading', onStop)
+      webview.removeEventListener('new-window', onNewWindow as unknown as EventListener)
       webview.removeEventListener('page-title-updated', notePage)
       webview.remove()
       setAnnotate(session => (session.mode ? { ...endAnnotateMode(session), stack: emptyAnnotateStack() } : session))
