@@ -12492,6 +12492,20 @@ def _collect_kanban_notifications(session: dict) -> list:
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
         return []
+
+    # Include session_key and any ancestral keys from the compression lineage
+    # so continuation sessions receive terminal events for tasks subscribed
+    # under an earlier session_key.
+    active_keys: set[str] = {session_key}
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        chain = db._session_lineage_root_to_tip(session_key) if hasattr(db, "_session_lineage_root_to_tip") else []
+        for k in chain:
+            if k:
+                active_keys.add(str(k))
+    except Exception:
+        pass
     try:
         from hermes_cli import kanban_db as _kb
     except Exception:
@@ -12522,14 +12536,19 @@ def _collect_kanban_notifications(session: dict) -> list:
             continue
         seen_db_paths.add(resolved)
         # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
+        # writable unless it has a subscription owned by this exact session lineage;
         # subscriptions for gateways or other sessions are not actionable here.
         try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
+            has_matching_sub = False
+            for k in active_keys:
+                if _kb.count_notify_subs(
+                    board=slug,
+                    platform="tui",
+                    chat_id=k,
+                ) > 0:
+                    has_matching_sub = True
+                    break
+            if not has_matching_sub:
                 continue
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
@@ -12547,7 +12566,7 @@ def _collect_kanban_notifications(session: dict) -> list:
             for sub in subs:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
-                if sub.get("chat_id") != session_key:
+                if sub.get("chat_id") not in active_keys:
                     continue
                 _old, _new, events = _kb.claim_unseen_events_for_sub(
                     conn,
