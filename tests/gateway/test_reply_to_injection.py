@@ -99,3 +99,23 @@ async def test_reply_prefix_still_injected_when_text_in_history():
     assert result.endswith("What's the best time to go?")
 
 
+@pytest.mark.asyncio
+async def test_reply_prefix_is_nonempty_payload_when_current_text_is_empty():
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text="quoted parent text",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == '[Replying to: "quoted parent text"]\n\n'
+
+

@@ -305,6 +305,7 @@ FALLBACK_SHARE_CHAT_TEXT = "[Shared chat]"
 FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
 FALLBACK_IMAGE_TEXT = "[Image]"
 FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
+FALLBACK_QUOTED_MESSAGE_TEXT = "[Quoted message unavailable]"
 # ---------------------------------------------------------------------------
 # Post/card parsing helpers
 # ---------------------------------------------------------------------------
@@ -399,6 +400,13 @@ class FeishuNormalizedMessage:
     mentions: List[FeishuMentionRef] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeishuQuotedMessageContext:
+    text: Optional[str] = None
+    media_urls: tuple[str, ...] = ()
+    media_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1629,7 +1637,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        self._message_text_cache: "OrderedDict[str, FeishuQuotedMessageContext]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -3462,8 +3470,28 @@ class FeishuAdapter(BasePlatformAdapter):
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
-        # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
-        if inbound_type == MessageType.TEXT and not text and not media_urls:
+        thread_id = getattr(message, "thread_id", None) or None
+        reply_to_message_id = (
+            getattr(message, "parent_id", None)
+            or getattr(message, "upper_message_id", None)
+            or getattr(message, "root_id", None)
+            or None
+        )
+        quoted_context = (
+            await self._fetch_message_context(reply_to_message_id)
+            if reply_to_message_id
+            else FeishuQuotedMessageContext()
+        )
+        reply_to_text = quoted_context.text
+        media_urls.extend(quoted_context.media_urls)
+        media_types.extend(quoted_context.media_types)
+        if reply_to_message_id and not reply_to_text and not quoted_context.media_urls:
+            reply_to_text = FALLBACK_QUOTED_MESSAGE_TEXT
+
+        # Guard runs post-strip and post-quote lookup. A pure "@Bot" message
+        # without any semantic payload is still ignored, while a mention-only
+        # reply is admitted when the quoted parent contributes text or media.
+        if inbound_type == MessageType.TEXT and not text and not media_urls and not reply_to_text:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
             return
 
@@ -3471,15 +3499,6 @@ class FeishuAdapter(BasePlatformAdapter):
             hint = _build_mention_hint(mentions)
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
-
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
-        reply_to_message_id = (
-            getattr(message, "parent_id", None)
-            or getattr(message, "upper_message_id", None)
-            or getattr(message, "root_id", None)
-            or None
-        )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -3510,6 +3529,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
+            message_id=message_id,
             is_bot=is_bot,
         )
         normalized = MessageEvent(
@@ -4402,12 +4422,15 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to fetch bot names for %s", bot_ids, exc_info=True)
             return None
 
-    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+    async def _fetch_message_context(self, message_id: str) -> FeishuQuotedMessageContext:
         if not self._client or not message_id:
-            return None
+            return FeishuQuotedMessageContext()
         if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
+            cached_context = self._message_text_cache[message_id]
+            if all(os.path.exists(path) for path in cached_context.media_urls):
+                self._message_text_cache.move_to_end(message_id)
+                return cached_context
+            self._message_text_cache.pop(message_id, None)
         try:
             request = self._build_get_message_request(message_id)
             response = await self._run_blocking(self._client.im.v1.message.get, request)
@@ -4415,25 +4438,51 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
                 logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
+                return FeishuQuotedMessageContext()
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
             body = getattr(parent, "body", None)
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
+                bot=self._bot_identity(),
             )
-            self._message_text_cache[message_id] = text
+            text = self._quoted_text_from_normalized(normalized)
+            media_urls, media_types = await self._download_feishu_message_resources(
+                message_id=message_id,
+                normalized=normalized,
+            )
+            context = FeishuQuotedMessageContext(
+                text=text,
+                media_urls=tuple(media_urls),
+                media_types=tuple(media_types),
+            )
+            self._message_text_cache[message_id] = context
             while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
                 self._message_text_cache.popitem(last=False)
-            return text
+            return context
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
+            return FeishuQuotedMessageContext()
+
+    async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+        """Compatibility wrapper for callers that only need quoted text."""
+        return (await self._fetch_message_context(message_id)).text
+
+    @staticmethod
+    def _quoted_text_from_normalized(normalized: FeishuNormalizedMessage) -> Optional[str]:
+        if normalized.text_content:
+            return normalized.text_content
+        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
+        if placeholder is not None:
+            return str(placeholder).strip() or None
+        if normalized.relation_kind == "image":
+            return FALLBACK_IMAGE_TEXT
+        return None
 
     def _extract_text_from_raw_content(
         self,
@@ -4448,10 +4497,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mentions=mentions,
             bot=self._bot_identity(),
         )
-        if normalized.text_content:
-            return normalized.text_content
-        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
-        return str(placeholder).strip() or None
+        return self._quoted_text_from_normalized(normalized)
 
     @staticmethod
     def _default_image_media_type(ext: str) -> str:

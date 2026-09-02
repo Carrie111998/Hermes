@@ -190,6 +190,72 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_feishu_top_level_busy_ack_is_not_a_reply(self):
+        """A busy ack in a Feishu group main channel must stay top-level."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="feishu")
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="Are you working?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_current",
+        )
+        sk = build_session_key(source)
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "max_iterations": 10,
+            "current_tool": "terminal",
+        }
+        runner._running_agents[sk] = agent
+        runner.adapters[source.platform] = adapter
+
+        with patch("agent.onboarding.is_seen", return_value=True):
+            await runner._handle_active_session_busy_message(event, sk)
+
+        assert adapter._send_with_retry.call_args.kwargs["reply_to"] is None
+        assert adapter._send_with_retry.call_args.kwargs["metadata"] is None
+
+    @pytest.mark.asyncio
+    async def test_feishu_top_level_drain_ack_is_not_a_reply(self):
+        """A restart/drain ack in a Feishu group main channel stays top-level."""
+        runner, _sentinel = _make_runner()
+        runner._draining = True
+        runner._restart_requested = True
+        runner._busy_input_mode = "interrupt"
+        runner._queue_during_drain_enabled = MagicMock(return_value=False)
+        adapter = _make_adapter(platform_val="feishu")
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            user_id="user1",
+        )
+        event = MessageEvent(
+            text="Can you hear me?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_current",
+        )
+        runner.adapters[source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(
+            event,
+            build_session_key(source),
+        )
+
+        assert adapter._send_with_retry.call_args.kwargs["reply_to"] is None
+        assert adapter._send_with_retry.call_args.kwargs["metadata"] is None
+
+    @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         import gateway.run as _gr
