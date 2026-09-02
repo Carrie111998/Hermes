@@ -14,6 +14,7 @@ ordering invariant that ``_hoist_tool_results_to_front`` enforces.
 import pytest
 
 from agent.anthropic_adapter import (
+    convert_messages_to_anthropic,
     _hoist_tool_results_to_front,
     _merge_consecutive_roles,
     _strip_orphaned_tool_blocks,
@@ -287,3 +288,50 @@ class TestPipelineOrdering:
 
         _hoist_tool_results_to_front(messages)
         assert _tool_result_messages_are_wellformed(messages)
+
+
+def test_conversion_pipeline_invokes_the_hoist():
+    """Pin the wiring: the hoist must run inside convert_messages_to_anthropic.
+
+    The unit tests above call ``_hoist_tool_results_to_front`` directly, so all
+    of them keep passing if the call is dropped from the pipeline -- which is
+    exactly what a refactor of this module could do. Upstream's earlier
+    normalisation steps mean no plain OpenAI-shaped input reaches the adapter
+    with a stranded tool_result, so assert on the call itself rather than
+    constructing an input that cannot occur.
+    """
+    import agent.anthropic_message_convert as conv
+
+    calls = []
+    original = conv._hoist_tool_results_to_front
+
+    def spy(result):
+        calls.append(result)
+        return original(result)
+
+    conv._hoist_tool_results_to_front = spy
+    try:
+        conv.convert_messages_to_anthropic(
+            [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "12:00"},
+            ]
+        )
+    finally:
+        conv._hoist_tool_results_to_front = original
+
+    assert calls, (
+        "convert_messages_to_anthropic did not call _hoist_tool_results_to_front "
+        "-- the sanitizer is dead code and #79147 can recur"
+    )
