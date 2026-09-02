@@ -29,6 +29,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Strong refs to fire-and-forget reaction tasks: the event loop keeps only
+# weak references to tasks/futures, so an unreferenced one can be GC-reaped
+# before the reaction is sent.
+_BACKGROUND_TASKS: set = set()
+
+
+def _BACKGROUND_REACTION_DISCARD(task) -> None:
+    _BACKGROUND_TASKS.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+    if exc is not None:
+        logger.debug("[Feishu-Comment] background reaction failed: %s", exc)
+
 # ---------------------------------------------------------------------------
 # Lark SDK helpers (lazy-imported)
 # ---------------------------------------------------------------------------
@@ -1184,7 +1201,9 @@ async def handle_drive_comment_event(
 
     logger.info("[Feishu-Comment] Access granted: user=%s policy=%s rule=%s", from_open_id, rule.policy, rule.match_source)
     if reply_id:
-        asyncio.ensure_future(
+        # Track the task: the loop keeps only weak references, so an
+        # unreferenced reaction future can be GC-reaped before sending.
+        _reaction_task = asyncio.ensure_future(
             add_comment_reaction(
                 client,
                 file_token=file_token,
@@ -1193,6 +1212,9 @@ async def handle_drive_comment_event(
                 reaction_type="OK",
             )
         )
+        _BACKGROUND_TASKS.add(_reaction_task)
+        if hasattr(_reaction_task, "add_done_callback"):
+            _BACKGROUND_REACTION_DISCARD(_reaction_task)
 
     # Step 2: Parallel fetch -- doc meta + comment details
     logger.info("[Feishu-Comment] [Step 2/5] Parallel fetch: doc meta + comment batch_query")
