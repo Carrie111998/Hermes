@@ -91,8 +91,34 @@ class RunBinding:
         return isinstance(other, RunBinding) and not self.differences(other)
 
 
+@dataclass(frozen=True)
+class GatewayRunAuthority:
+    """Live, process-local owner captured by the ordinary gateway turn.
+
+    The objects are intentionally not serializable.  ``validate`` is supplied
+    by the gateway runner so a delegate can re-check its live session registry
+    immediately before constructing a child rather than trusting copied
+    ContextVars.
+    """
+
+    validator: Any
+    session_key: str
+    cwd: str
+    profile: str
+    record: Any
+    transport: Any
+    owner_generation: str
+    transport_generation: str
+
+    def validate(self) -> bool:
+        return bool(self.validator(self))
+
+
 _CURRENT_RUN_BINDING: ContextVar[RunBinding | None] = ContextVar(
     "HERMES_CURRENT_RUN_BINDING", default=None
+)
+_CURRENT_GATEWAY_RUN_AUTHORITY: ContextVar[GatewayRunAuthority | None] = ContextVar(
+    "HERMES_CURRENT_GATEWAY_RUN_AUTHORITY", default=None
 )
 
 # Process-level flag: has any code in this process bound a session via
@@ -271,6 +297,16 @@ def current_run_binding() -> RunBinding | None:
     return _CURRENT_RUN_BINDING.get()
 
 
+def set_gateway_run_authority(authority: GatewayRunAuthority) -> object:
+    if not isinstance(authority, GatewayRunAuthority):
+        raise TypeError("authority must be a GatewayRunAuthority")
+    return _CURRENT_GATEWAY_RUN_AUTHORITY.set(authority)
+
+
+def current_gateway_run_authority() -> GatewayRunAuthority | None:
+    return _CURRENT_GATEWAY_RUN_AUTHORITY.get()
+
+
 @contextmanager
 def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
     """Bind a task-local session id and restore the prior value on exit.
@@ -402,6 +438,7 @@ def clear_session_vars(tokens: list) -> None:
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _CURRENT_RUN_BINDING.set(None)
+    _CURRENT_GATEWAY_RUN_AUTHORITY.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -451,6 +488,7 @@ def reset_session_vars() -> None:
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _CURRENT_RUN_BINDING.set(None)
+    _CURRENT_GATEWAY_RUN_AUTHORITY.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

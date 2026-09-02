@@ -4845,6 +4845,29 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Delegation identity is server-derived metadata, not model text. Keep
+        # the compact repo/branch/SHA on the same gateway progress rail so a
+        # messaging user can tell which checkout the child is using.
+        _run_binding = kwargs.get("run_binding")
+        if (
+            _run_binding
+            and event_type in {"subagent.start", "subagent.complete"}
+            and ctx.progress_queue is not None
+            and ctx._run_still_current()
+        ):
+            try:
+                from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES
+            except Exception:
+                SUBAGENT_FAILURE_STATUSES = frozenset()
+            _repo = str(_run_binding.get("repo") or "")
+            _branch = str(_run_binding.get("branch") or "HEAD")
+            _sha = str(_run_binding.get("sha") or "")
+            _label = "delegation started" if event_type == "subagent.start" else "delegation complete"
+            if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
+                _label = "delegation failed"
+            ctx.progress_queue.put(
+                f"🔀 {_label} · repo={_repo} branch={_branch} sha={_sha}"
+            )
         # Failed subagent → one clean user-facing notice. Handled FIRST,
         # before every progress-queue gate: platforms that keep
         # tool_progress off (Telegram, Slack, ...) must still hear about a
@@ -27527,7 +27550,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
-        from gateway.session_context import set_session_vars
+        from gateway.session_context import (
+            GatewayRunAuthority,
+            set_gateway_run_authority,
+            set_session_vars,
+        )
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -27537,8 +27564,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
+        try:
+            _adapter = self._adapter_for_source(context.source) or _adapter
+        except Exception:
+            pass
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        try:
+            from agent.runtime_cwd import resolve_agent_cwd
+            from tools.terminal_tool import get_session_cwd
+
+            _cwd = get_session_cwd(context.session_key) or str(resolve_agent_cwd())
+        except Exception:
+            _cwd = os.environ.get("TERMINAL_CWD", "") or os.getcwd()
+
+        _store = getattr(self, "session_store", None)
+        _record = None
+        if _store is not None and context.session_key:
+            try:
+                with _store._lock:
+                    _store._ensure_loaded_locked()
+                    _record = _store._entries.get(context.session_key)
+            except Exception:
+                logger.debug("gateway run authority capture failed", exc_info=True)
+
+        def _authority_is_current(authority: GatewayRunAuthority) -> bool:
+            if _store is None or _record is None:
+                return False
+            try:
+                with _store._lock:
+                    _store._ensure_loaded_locked()
+                    live_record = _store._entries.get(authority.session_key)
+                if live_record is not authority.record:
+                    return False
+                try:
+                    live_adapter = self._adapter_for_source(context.source)
+                except Exception:
+                    live_adapter = _adapter
+                return live_adapter is authority.transport
+            except Exception:
+                logger.debug("gateway run authority validation failed", exc_info=True)
+                return False
+
+        _tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_type=(
@@ -27553,9 +27620,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=_cwd,
             async_delivery=_async_delivery,
             cron_session="",
         )
+        if _record is not None:
+            set_gateway_run_authority(
+                GatewayRunAuthority(
+                    validator=_authority_is_current,
+                    session_key=context.session_key,
+                    cwd=_cwd,
+                    profile=getattr(context.source, "profile", "") or "",
+                    record=_record,
+                    transport=_adapter,
+                    owner_generation=str(id(_record)),
+                    transport_generation=str(id(_adapter)),
+                )
+            )
+        return _tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

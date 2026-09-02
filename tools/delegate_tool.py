@@ -4168,9 +4168,13 @@ def delegate_task(
     # constructing even one child, read the live session record and transport
     # generation, then reprobe the exact session-owned checkout. Legacy CLI
     # callers have no live record and retain their existing behavior.
-    from gateway.session_context import current_run_binding
+    from gateway.session_context import (
+        current_gateway_run_authority,
+        current_run_binding,
+    )
 
     _bound_run_binding = current_run_binding()
+    _gateway_run_authority = current_gateway_run_authority()
     _gateway_server = None
     try:
         from tui_gateway import server as _gateway_server
@@ -4188,25 +4192,41 @@ def delegate_task(
         # The ContextVar is only the turn's captured expectation. Resolve the
         # public UI id against the live registry under its existing authority
         # helper so a replaced or rebound row cannot pass on stale context.
-        if _gateway_server is None:
+        if not _bound_run_binding.ui_session_id and _gateway_run_authority is not None:
+            if not _gateway_run_authority.validate():
+                return tool_error(
+                    "Delegation refused: the originating live gateway session was "
+                    "replaced or rebound after this turn was bound. Start a new "
+                    "conversation turn."
+                )
+            _live_session_record = {
+                "session_key": _gateway_run_authority.session_key,
+                "cwd": _gateway_run_authority.cwd,
+                "profile": _gateway_run_authority.profile,
+                "transport": _gateway_run_authority.transport,
+                "_record_identity": _gateway_run_authority.record,
+            }
+            _live_transport = _gateway_run_authority.transport
+        elif _gateway_server is None:
             return tool_error(
                 "Delegation refused: the live UI session authority is unavailable."
             )
-        _authority = _gateway_server._current_session_steer_authority(
-            _bound_run_binding.ui_session_id
-        )
-        _authority_transport, _authority_record = _authority
-        if (
-            _authority_record is None
-            or _authority_record is not _context_session_record
-            or _authority_transport is not _context_transport
-        ):
-            return tool_error(
-                "Delegation refused: the live UI session was replaced or "
-                "rebound after this turn was bound. Start a new conversation turn."
+        else:
+            _authority = _gateway_server._current_session_steer_authority(
+                _bound_run_binding.ui_session_id
             )
-        _live_session_record = _authority_record
-        _live_transport = _authority_transport
+            _authority_transport, _authority_record = _authority
+            if (
+                _authority_record is None
+                or _authority_record is not _context_session_record
+                or _authority_transport is not _context_transport
+            ):
+                return tool_error(
+                    "Delegation refused: the live UI session was replaced or "
+                    "rebound after this turn was bound. Start a new conversation turn."
+                )
+            _live_session_record = _authority_record
+            _live_transport = _authority_transport
     elif _context_session_record is not None and _gateway_server is not None:
         # Lazy capture still needs registry admission. There is no UI id in the
         # ContextVar before the first delegation, so resolve the exact record
@@ -4222,6 +4242,23 @@ def delegate_task(
                 "Delegation refused: the originating live UI session is no "
                 "longer registered. Start a new conversation turn."
             )
+    elif _gateway_run_authority is not None:
+        # Ordinary messaging has no TUI session registry. Its existing
+        # SessionStore/adapter authority is the live owner registry instead;
+        # validate it now, while still keeping Git capture lazy.
+        if not _gateway_run_authority.validate():
+            return tool_error(
+                "Delegation refused: the originating live gateway session is no "
+                "longer current. Start a new conversation turn."
+            )
+        _live_session_record = {
+            "session_key": _gateway_run_authority.session_key,
+            "cwd": _gateway_run_authority.cwd,
+            "profile": _gateway_run_authority.profile,
+            "transport": _gateway_run_authority.transport,
+            "_record_identity": _gateway_run_authority.record,
+        }
+        _live_transport = _gateway_run_authority.transport
 
     if _bound_run_binding is not None or _live_session_record is not None:
         if _live_session_record is None:
@@ -4230,10 +4267,17 @@ def delegate_task(
             )
         _parent_task_id = getattr(parent_agent, "_current_task_id", None)
         _binding_drift: list[str] = []
+        _record_identity = (
+            _live_session_record.get("_record_identity")
+            if isinstance(_live_session_record, dict)
+            else _live_session_record
+        )
+        if _record_identity is None:
+            _record_identity = _live_session_record
         if (
             _bound_run_binding is not None
             and _bound_run_binding.owner_generation
-            and _bound_run_binding.owner_generation != str(id(_live_session_record))
+            and _bound_run_binding.owner_generation != str(id(_record_identity))
         ):
             _binding_drift.append("owner_session")
         if (
@@ -4247,9 +4291,14 @@ def delegate_task(
         _live_key = str(_live_session_record.get("session_key") or "")
         _live_profile_home = _live_session_record.get("profile_home")
         _live_profile = (
-            Path(str(_live_profile_home)).name
-            if _live_profile_home
-            else str(_gateway_server._current_profile_name())
+            _live_session_record.get("profile", "")
+            if _gateway_run_authority is not None
+            and (_bound_run_binding is None or not _bound_run_binding.ui_session_id)
+            else (
+                Path(str(_live_profile_home)).name
+                if _live_profile_home
+                else str(_gateway_server._current_profile_name())
+            )
         )
         if _bound_run_binding is not None:
             if _bound_run_binding.session_key != _live_key:
@@ -4282,8 +4331,18 @@ def delegate_task(
                     else ""
                 ),
                 profile=_live_profile,
-                owner_generation=str(id(_live_session_record)),
-                transport_generation=str(id(_live_transport)),
+                owner_generation=(
+                    _gateway_run_authority.owner_generation
+                    if _gateway_run_authority is not None
+                    and not (_bound_run_binding and _bound_run_binding.ui_session_id)
+                    else str(id(_live_session_record))
+                ),
+                transport_generation=(
+                    _gateway_run_authority.transport_generation
+                    if _gateway_run_authority is not None
+                    and not (_bound_run_binding and _bound_run_binding.ui_session_id)
+                    else str(id(_live_transport))
+                ),
             )
         except ValueError as exc:
             return tool_error(
