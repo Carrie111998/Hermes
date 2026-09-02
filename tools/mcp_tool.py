@@ -282,6 +282,7 @@ if not _MCP_AVAILABLE:
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
 ClientSession: Any = None
+StdioServerParameters: Any = None
 _MCP_SDK_IMPORT_ATTEMPTED = False
 _MCP_SDK_IMPORT_LOCK = threading.Lock()
 
@@ -334,10 +335,10 @@ def _ensure_mcp_sdk() -> bool:
 
     if not _MCP_AVAILABLE:
         return False
-    if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+    if _MCP_SDK_IMPORT_ATTEMPTED or (ClientSession is not None and StdioServerParameters is not None):
         return _MCP_AVAILABLE
     with _MCP_SDK_IMPORT_LOCK:
-        if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+        if _MCP_SDK_IMPORT_ATTEMPTED or (ClientSession is not None and StdioServerParameters is not None):
             return _MCP_AVAILABLE
         try:
             from mcp import ClientSession, StdioServerParameters
