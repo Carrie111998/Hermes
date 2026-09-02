@@ -3452,6 +3452,73 @@ def _deliver_result(
         delivered = False
         target_errors = []
 
+        # Named Telegram private-DM topic target (``telegram:<positive_chat_id>:<topic_name>``):
+        # the topic name is a non-numeric label that must be resolved to a real
+        # thread id through the live adapter (ensure_dm_topic) before text or
+        # media delivery. This is the cron sibling of the live DeliveryRouter
+        # path in gateway/delivery.py. Fail closed when no live adapter is
+        # available — silently delivering into General would be worse than a
+        # visible error.
+        from gateway.delivery import (
+            _looks_like_int,
+            looks_like_telegram_private_chat_id,
+        )
+
+        if (
+            platform == Platform.TELEGRAM
+            and thread_id is not None
+            and not _looks_like_int(str(thread_id))
+            and looks_like_telegram_private_chat_id(str(chat_id))
+        ):
+            if not live_adapter_ready:
+                msg = (
+                    f"named Telegram private-DM topic target {platform_name}:{chat_id}:{thread_id} "
+                    "requires a live gateway adapter to resolve the topic name; "
+                    "no live adapter is available"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            ensure_dm_topic = getattr(runtime_adapter, "ensure_dm_topic", None)
+            if ensure_dm_topic is None:
+                msg = (
+                    f"named Telegram private-DM topic target {platform_name}:{chat_id}:{thread_id} "
+                    "cannot be resolved: the live adapter has no ensure_dm_topic"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            try:
+                from agent.async_utils import safe_schedule_threadsafe
+
+                future = safe_schedule_threadsafe(
+                    ensure_dm_topic(str(chat_id), str(thread_id)), loop,
+                )
+                if future is None:
+                    raise RuntimeError("gateway event loop scheduling failed")
+                resolved_thread_id = future.result(timeout=30)
+            except Exception as ex:
+                msg = (
+                    f"failed to resolve named Telegram private-DM topic "
+                    f"{platform_name}:{chat_id}:{thread_id}: {ex}"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            if not resolved_thread_id:
+                msg = (
+                    f"failed to resolve named Telegram private-DM topic "
+                    f"{platform_name}:{chat_id}:{thread_id} (adapter returned no thread id)"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            logger.info(
+                "Job '%s': resolved named Telegram private-DM topic %s:%s:%s -> thread_id=%s",
+                job["id"], platform_name, chat_id, thread_id, resolved_thread_id,
+            )
+            thread_id = str(resolved_thread_id)
+
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
         # (today's behaviour, byte-identical). "in_channel" delivers the brief

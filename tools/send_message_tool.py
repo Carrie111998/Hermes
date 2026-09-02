@@ -19,6 +19,13 @@ from agent.secret_scope import get_secret
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+# Named Telegram private-DM topic targets: ``<positive_chat_id>:<topic_name>``.
+# Telegram private chats use positive chat IDs; the topic name is a non-numeric
+# label the live adapter resolves to a thread id (ensure_dm_topic). Kept
+# separate from _TELEGRAM_TOPIC_TARGET_RE (which Discord reuses via
+# _NUMERIC_TOPIC_RE) so a named topic is only recognized for Telegram, never
+# for Discord threads (which are always numeric snowflakes).
+_TELEGRAM_NAMED_TOPIC_TARGET_RE = re.compile(r"^\s*(\d+):([^:\s][^:]*)\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
 # Must be uppercase alphanumeric, 9+ chars. User IDs (U...) are parsed as
@@ -540,6 +547,13 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
     if platform_name == "telegram":
         match = _TELEGRAM_TOPIC_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), match.group(2), True
+        # Named private-DM topic: ``<positive_chat_id>:<topic_name>``. The
+        # topic name is a non-numeric label the live adapter resolves to a
+        # thread id (ensure_dm_topic); it is NOT a numeric thread id, so it
+        # must not be confused with a forum topic or a channel DM topic.
+        match = _TELEGRAM_NAMED_TOPIC_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
         from plugins.platforms.telegram.telegram_ids import (
