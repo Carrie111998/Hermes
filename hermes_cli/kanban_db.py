@@ -9729,6 +9729,52 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def resolve_configured_dispatch_limits() -> dict[str, Any]:
+    """Return the operator-configured caps for one dispatcher tick.
+
+    Mirrors what ``hermes kanban dispatch`` resolves before calling
+    :func:`dispatch_once` — ``kanban.default_assignee``, ``max_spawn``,
+    ``max_in_progress`` (through :func:`resolve_max_in_progress`, so an unset
+    value still lands on the memory-derived default) and
+    ``max_in_progress_per_profile``. Kept here so every surface that can
+    trigger a tick agrees on the bounds instead of each re-parsing config:
+    a durable worker's ``kanban_child_dispatch`` must be capped exactly like
+    the gateway-embedded dispatcher, never more permissively.
+
+    Read-only and fail-soft: a missing or malformed value degrades to
+    "unset" rather than raising, because a tick must never be blocked by a
+    config parse error.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw_cfg = (load_config_readonly() or {}).get("kanban", {})
+    except Exception:
+        raw_cfg = {}
+    kanban_cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
+
+    def _positive_int(value):
+        if value is None:
+            return None
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ival if ival >= 1 else None
+
+    return {
+        "default_assignee": (
+            str(kanban_cfg.get("default_assignee") or "").strip() or None
+        ),
+        "max_spawn": _positive_int(kanban_cfg.get("max_spawn")),
+        "max_in_progress": resolve_max_in_progress(
+            _positive_int(kanban_cfg.get("max_in_progress"))
+        ),
+        "max_in_progress_per_profile": _positive_int(
+            kanban_cfg.get("max_in_progress_per_profile")
+        ),
+    }
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Return the number of tasks currently in ``status='running'``.
 

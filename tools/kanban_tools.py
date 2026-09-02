@@ -28,9 +28,11 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -47,6 +49,21 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+KANBAN_CHILDREN_DEFAULT_LIMIT = 50
+KANBAN_CHILDREN_MAX_LIMIT = 200
+
+KANBAN_CHILD_LOG_DEFAULT_TAIL = 8_000
+KANBAN_CHILD_LOG_MAX_TAIL = 200_000
+
+# Durable ownership marker stamped on every card a dispatcher-owned worker
+# creates. Kanban has no "created by task" column, and the dependency graph
+# cannot carry the relation: a child linked under its still-``running`` parent
+# would sit in ``todo`` forever instead of being dispatchable. So the edge
+# lives in the append-only event log, where it survives worker restarts and
+# is what scopes ``kanban_children`` / ``kanban_child_log`` /
+# ``kanban_child_dispatch`` to the caller's own work.
+WORKER_CHILD_EVENT_KIND = "worker_child_created"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -135,6 +152,37 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _worker_self_task_id() -> Optional[str]:
+    """The task this process is the dispatcher's run owner for, else None.
+
+    Stricter than reading ``HERMES_KANBAN_TASK``: a delegate_task child and an
+    in-process cron job both inherit the worker's env without owning its run,
+    so both resolve to ``None`` here.
+    """
+    if _is_delegated_child_context() or not _is_dispatcher_owned_worker():
+        return None
+    return os.environ.get("HERMES_KANBAN_TASK") or None
+
+
+def _check_kanban_child_orchestration_mode() -> bool:
+    """Gate for the durable parent → child orchestration tools.
+
+    A dispatcher-spawned worker can already fan work out with
+    ``kanban_create``, but it had no way to follow what it created:
+    ``kanban_list`` / ``kanban_unblock`` are orchestrator-only, and the
+    ``hermes kanban`` CLI is not part of a worker's tool surface (it would
+    also break on container/SSH terminal backends — see this module's
+    header). ``kanban_children`` / ``kanban_child_log`` /
+    ``kanban_child_dispatch`` are the native substitute, and every one of
+    them is hard-scoped to the caller's own board and its own child cards.
+
+    Only dispatcher-owned workers qualify. Interactive sessions (Slack,
+    plain ``hermes chat``) and delegate_task children never see the surface,
+    so their runtime restrictions are unchanged.
+    """
+    return _worker_self_task_id() is not None
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -210,6 +258,110 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"tasks, or kanban_create to spawn follow-up work."
         )
     return None
+
+
+def _worker_child_marker(parent_task_id: str) -> str:
+    """Serialized ``WORKER_CHILD_EVENT_KIND`` payload for ``parent_task_id``.
+
+    Matches ``kanban_db._append_event``'s encoding byte-for-byte so the scope
+    lookup can compare payloads in SQL instead of parsing every event row.
+    """
+    return json.dumps({"parent_task_id": parent_task_id}, ensure_ascii=False)
+
+
+def _record_worker_child(kb, conn, parent_task_id: str, child_id: str) -> None:
+    """Stamp the durable parent→child ownership marker on ``child_id``.
+
+    Idempotent: ``kanban_create`` returns the existing card when an
+    idempotency key matches, and a retried parent re-creating the same child
+    must not append a duplicate marker.
+    """
+    marker = _worker_child_marker(parent_task_id)
+    existing = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = ? AND payload = ? LIMIT 1",
+        (child_id, WORKER_CHILD_EVENT_KIND, marker),
+    ).fetchone()
+    if existing:
+        return
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, child_id, WORKER_CHILD_EVENT_KIND,
+            {"parent_task_id": parent_task_id},
+        )
+
+
+def _worker_child_ids(kb, conn, parent_task_id: str) -> list[str]:
+    """Task ids inside ``parent_task_id``'s child scope, oldest first.
+
+    Two sources, unioned:
+
+    * cards the worker created (the ``WORKER_CHILD_EVENT_KIND`` marker).
+      This is what covers a staged chain — child 2's dependency parent is
+      child 1, not the worker, so the link graph alone would lose it;
+    * direct ``task_links`` children of the worker's own card, which covers
+      the root/blackboard idiom where the graph was built *for* the worker
+      (see ``hermes_cli.kanban_swarm``).
+
+    The worker's own task is never in scope: the lifecycle tools
+    (``kanban_complete`` / ``kanban_block`` / ``kanban_heartbeat``) own that
+    card, and these tools must not become a second path to it.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT task_id FROM task_events WHERE kind = ? AND payload = ?",
+        (WORKER_CHILD_EVENT_KIND, _worker_child_marker(parent_task_id)),
+    ).fetchall()
+    scope = {row["task_id"] for row in rows}
+    scope.update(kb.child_ids(conn, parent_task_id))
+    scope.discard(parent_task_id)
+    if not scope:
+        return []
+    ordered = conn.execute(
+        "SELECT id FROM tasks WHERE id IN ("
+        + ",".join("?" * len(scope))
+        + ") ORDER BY created_at ASC, id ASC",
+        tuple(sorted(scope)),
+    ).fetchall()
+    return [row["id"] for row in ordered]
+
+
+def _derive_child_idempotency_key(
+    parent_task_id: str, title: str, assignee: str, parents,
+) -> str:
+    """Deterministic dedupe key for a child created by a durable worker.
+
+    A parent worker is respawned after a crash, timeout, or reclaim with the
+    same ``HERMES_KANBAN_TASK``. Without a key it re-creates the children it
+    already fanned out, and the dispatcher happily claims both copies.
+    Digesting the parent id together with the child's identity (title,
+    assignee, dependency parents) makes the retry resolve to the original
+    card instead. A caller that genuinely wants two identical siblings can
+    still pass its own ``idempotency_key``.
+    """
+    digest = hashlib.sha256(
+        "\x1f".join(
+            [parent_task_id, str(title).strip(), str(assignee)]
+            + sorted(str(p) for p in parents)
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"kanban-child:{parent_task_id}:{digest}"
+
+
+def _require_child_scope(tool_name: str):
+    """Resolve the caller's own task id or return a structured refusal.
+
+    Returns ``(self_task_id, None)`` when the caller is a dispatcher-owned
+    worker, else ``(None, tool_error_json)``.
+    """
+    self_tid = _worker_self_task_id()
+    if self_tid:
+        return self_tid, None
+    return None, tool_error(
+        f"{tool_name} is available only to a dispatcher-spawned worker "
+        "orchestrating its own child tasks. delegate_task children must "
+        "return findings to their parent; orchestrator profiles use "
+        "kanban_list and the kanban CLI."
+    )
 
 
 def _connect(board: Optional[str] = None):
@@ -1372,11 +1524,18 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
-    assignee = args.get("assignee")
+    # The assignee must be an explicit, deterministic profile. ``_normalize_profile``
+    # folds the CLI's "unassigned" sentinels (``none`` / ``-`` / ``null`` /
+    # blank) to None so they are refused here rather than persisted as a
+    # literal profile name the dispatcher would later try to spawn as
+    # ``hermes -p none`` — a card that can only fail, retry, and trip the
+    # circuit breaker.
+    assignee = _normalize_profile(args.get("assignee"))
     if not assignee:
         return tool_error(
             "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
+            "task (the dispatcher will only spawn tasks with an explicit "
+            "assignee; 'none', '-', 'null' and blanks are not assignees)"
         )
     body = args.get("body")
     parents = args.get("parents") or []
@@ -1439,6 +1598,14 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    # Retry-safe fan-out for durable workers: derive a deterministic key when
+    # the caller didn't supply one, so a respawned parent re-creating the same
+    # child resolves to the original card instead of duplicating it.
+    self_task_id = _worker_self_task_id()
+    if self_task_id and not idempotency_key:
+        idempotency_key = _derive_child_idempotency_key(
+            self_task_id, title, assignee, parents,
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1457,7 +1624,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=assignee,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1483,6 +1650,10 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            if self_task_id and new_tid != self_task_id:
+                # Durable ownership edge, so the worker can later observe and
+                # dispatch exactly this card via the child-orchestration tools.
+                _record_worker_child(kb, conn, self_task_id, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1684,6 +1855,227 @@ def _handle_link(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Durable parent → child orchestration
+#
+# All three handlers resolve the board through ``_connect()`` with no
+# ``board`` argument, so they are pinned to the board the dispatcher spawned
+# this worker on (HERMES_KANBAN_DB / HERMES_KANBAN_BOARD). A worker cannot
+# reach across boards here, and within its board it can only see the children
+# ``_worker_child_ids`` attributes to it.
+# ---------------------------------------------------------------------------
+
+def _child_run_dict(run) -> Optional[dict[str, Any]]:
+    """Compact attempt record for a child, or None when it never ran."""
+    if run is None:
+        return None
+    return {
+        "id": run.id,
+        "profile": run.profile,
+        "status": run.status,
+        "outcome": run.outcome,
+        "summary": run.summary,
+        "error": run.error,
+        "worker_pid": run.worker_pid,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+    }
+
+
+def _handle_children(args: dict, **kw) -> str:
+    """Report status / heartbeat / last outcome for this worker's children."""
+    self_tid, refusal = _require_child_scope("kanban_children")
+    if refusal:
+        return refusal
+    status_filter = args.get("status")
+    limit = args.get("limit")
+    if limit is None:
+        limit = KANBAN_CHILDREN_DEFAULT_LIMIT
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return tool_error("limit must be an integer")
+    if limit < 1:
+        return tool_error("limit must be >= 1")
+    if limit > KANBAN_CHILDREN_MAX_LIMIT:
+        return tool_error(f"limit must be <= {KANBAN_CHILDREN_MAX_LIMIT}")
+    try:
+        kb, conn = _connect()
+        try:
+            scope = _worker_child_ids(kb, conn, self_tid)
+            now = int(time.time())
+            children: list[dict[str, Any]] = []
+            counts: dict[str, int] = {}
+            truncated = False
+            for tid in scope:
+                task = kb.get_task(conn, tid)
+                if task is None:
+                    continue
+                if status_filter and task.status != status_filter:
+                    continue
+                counts[task.status] = counts.get(task.status, 0) + 1
+                if len(children) >= limit:
+                    truncated = True
+                    continue
+                heartbeat = task.last_heartbeat_at
+                children.append({
+                    "id": task.id,
+                    "title": task.title,
+                    "assignee": task.assignee,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "parents": kb.parent_ids(conn, tid),
+                    "created_at": task.created_at,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                    "last_heartbeat_at": heartbeat,
+                    "heartbeat_age_seconds": (
+                        max(0, now - int(heartbeat))
+                        if heartbeat is not None else None
+                    ),
+                    "worker_pid": task.worker_pid,
+                    "consecutive_failures": task.consecutive_failures,
+                    "last_failure_error": task.last_failure_error,
+                    "current_run_id": task.current_run_id,
+                    "result": task.result,
+                    "latest_run": _child_run_dict(kb.latest_run(conn, tid)),
+                    "has_log": kb.worker_log_path(tid).exists(),
+                })
+            return _ok(
+                parent_task_id=self_tid,
+                children=children,
+                counts=counts,
+                count=len(children),
+                limit=limit,
+                truncated=truncated,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_children: {e}")
+    except Exception as e:
+        logger.exception("kanban_children failed")
+        return tool_error(f"kanban_children: {e}")
+
+
+def _handle_child_log(args: dict, **kw) -> str:
+    """Tail one child's worker log — the native ``hermes kanban log``."""
+    self_tid, refusal = _require_child_scope("kanban_child_log")
+    if refusal:
+        return refusal
+    child_id = str(args.get("child_id") or "").strip()
+    if not child_id:
+        return tool_error("child_id is required")
+    tail_bytes = args.get("tail_bytes")
+    if tail_bytes is None:
+        tail_bytes = KANBAN_CHILD_LOG_DEFAULT_TAIL
+    try:
+        tail_bytes = int(tail_bytes)
+    except (TypeError, ValueError):
+        return tool_error("tail_bytes must be an integer")
+    if tail_bytes < 1:
+        return tool_error("tail_bytes must be >= 1")
+    if tail_bytes > KANBAN_CHILD_LOG_MAX_TAIL:
+        return tool_error(f"tail_bytes must be <= {KANBAN_CHILD_LOG_MAX_TAIL}")
+    try:
+        kb, conn = _connect()
+        try:
+            scope = set(_worker_child_ids(kb, conn, self_tid))
+        finally:
+            conn.close()
+        if child_id not in scope:
+            # Deliberately says nothing about the foreign task beyond the id
+            # the caller already supplied — no title, status, or log bytes.
+            return tool_error(
+                f"{child_id} is not one of this worker's child tasks. "
+                f"kanban_child_log is scoped to children created by "
+                f"{self_tid} on this board."
+            )
+        content = kb.read_worker_log(child_id, tail_bytes=tail_bytes)
+        if content is None:
+            return _ok(
+                child_id=child_id, exists=False, log="",
+                note="no worker log yet — the child may not have spawned",
+            )
+        return _ok(
+            child_id=child_id,
+            exists=True,
+            # Worker logs are raw subprocess stdout/stderr and can carry
+            # credentials the child echoed; mask before it reaches the model,
+            # exactly as the other kanban handlers do for model-supplied text.
+            log=redact_sensitive_text(content, force=True),
+            tail_bytes=tail_bytes,
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_child_log: {e}")
+    except Exception as e:
+        logger.exception("kanban_child_log failed")
+        return tool_error(f"kanban_child_log: {e}")
+
+
+def _handle_child_dispatch(args: dict, **kw) -> str:
+    """Run one capped dispatcher tick so staged children start promptly.
+
+    This does not grant a worker any authority the gateway-embedded
+    dispatcher doesn't already exercise on its own timer — it advances the
+    same tick, under the same board lock, bounded by the same operator
+    config (``resolve_configured_dispatch_limits``). What it buys a durable
+    parent is latency: stage N+1 starts when stage N finishes instead of on
+    the next interval. Only spawns for the caller's own children are
+    reported back; board-wide activity is returned as counts only.
+    """
+    self_tid, refusal = _require_child_scope("kanban_child_dispatch")
+    if refusal:
+        return refusal
+    dry_run, bool_error = _parse_bool_arg(args, "dry_run")
+    if bool_error:
+        return tool_error(bool_error)
+    try:
+        kb, conn = _connect()
+        try:
+            scope = set(_worker_child_ids(kb, conn, self_tid))
+            if not scope:
+                return tool_error(
+                    "kanban_child_dispatch needs at least one child task — "
+                    "create work with kanban_create first. A worker never "
+                    "dispatches on behalf of cards it does not own."
+                )
+            limits = kb.resolve_configured_dispatch_limits()
+            result = kb.dispatch_once(
+                conn,
+                dry_run=dry_run,
+                max_spawn=limits["max_spawn"],
+                max_in_progress=limits["max_in_progress"],
+                max_in_progress_per_profile=limits["max_in_progress_per_profile"],
+                default_assignee=limits["default_assignee"],
+            )
+            return _ok(
+                parent_task_id=self_tid,
+                dry_run=dry_run,
+                spawned_children=[
+                    {"task_id": tid, "assignee": who, "workspace": ws}
+                    for (tid, who, ws) in result.spawned if tid in scope
+                ],
+                crashed_children=[t for t in result.crashed if t in scope],
+                timed_out_children=[t for t in result.timed_out if t in scope],
+                auto_blocked_children=[
+                    t for t in result.auto_blocked if t in scope
+                ],
+                promoted=result.promoted,
+                spawned_total=len(result.spawned),
+                skipped_locked=result.skipped_locked,
+                memory_pressure=result.memory_pressure,
+                limits=limits,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_child_dispatch: {e}")
+    except Exception as e:
+        logger.exception("kanban_child_dispatch failed")
+        return tool_error(f"kanban_child_dispatch: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2350,6 +2742,98 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_CHILDREN_SCHEMA = {
+    "name": "kanban_children",
+    "description": (
+        "List the child tasks YOU created (plus any tasks linked directly "
+        "under your own card) with their live status, heartbeat age, worker "
+        "pid, failure counter, and last attempt outcome. This is how a "
+        "durable worker follows the work it fanned out with kanban_create: "
+        "poll it between stages to see which children are still running, "
+        "which finished, and which failed. Scoped to your own board and your "
+        "own children — it can never enumerate the rest of the board."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": [
+                    "triage", "todo", "ready", "running",
+                    "review", "blocked", "done", "archived",
+                ],
+                "description": "Optional status filter.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    f"Maximum rows to return (default "
+                    f"{KANBAN_CHILDREN_DEFAULT_LIMIT}, max "
+                    f"{KANBAN_CHILDREN_MAX_LIMIT}). ``counts`` always "
+                    f"reflects every child, even when rows are truncated."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
+KANBAN_CHILD_LOG_SCHEMA = {
+    "name": "kanban_child_log",
+    "description": (
+        "Read the tail of one of your child tasks' worker logs — the raw "
+        "stdout/stderr of the subprocess the dispatcher spawned for it. Use "
+        "this to diagnose a child that failed or is making no progress, "
+        "after kanban_children showed you its status. Only your own "
+        "children are readable, and secrets in the log are masked."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "child_id": {
+                "type": "string",
+                "description": "Task id of one of your own child tasks.",
+            },
+            "tail_bytes": {
+                "type": "integer",
+                "description": (
+                    f"How many trailing bytes to read (default "
+                    f"{KANBAN_CHILD_LOG_DEFAULT_TAIL}, max "
+                    f"{KANBAN_CHILD_LOG_MAX_TAIL})."
+                ),
+            },
+        },
+        "required": ["child_id"],
+    },
+}
+
+KANBAN_CHILD_DISPATCH_SCHEMA = {
+    "name": "kanban_child_dispatch",
+    "description": (
+        "Run one dispatcher tick on your board so children that just became "
+        "ready start now instead of waiting for the next scheduled tick. "
+        "Use it after kanban_create to launch stage 1, and after a stage "
+        "completes to launch the next one. The tick is bounded by the "
+        "operator's configured concurrency caps exactly like the "
+        "gateway-embedded dispatcher — it cannot exceed them, so a fan-out "
+        "wider than the cap simply starts in waves. Requires that you own at "
+        "least one child task; only your own children are reported back."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Report which children would spawn without launching "
+                    "any worker. Reclaim / promotion bookkeeping still runs."
+                ),
+            },
+        },
+        "required": [],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2488,6 +2972,33 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_children",
+    toolset="kanban",
+    schema=KANBAN_CHILDREN_SCHEMA,
+    handler=_handle_children,
+    check_fn=_check_kanban_child_orchestration_mode,
+    emoji="🌿",
+)
+
+registry.register(
+    name="kanban_child_log",
+    toolset="kanban",
+    schema=KANBAN_CHILD_LOG_SCHEMA,
+    handler=_handle_child_log,
+    check_fn=_check_kanban_child_orchestration_mode,
+    emoji="📜",
+)
+
+registry.register(
+    name="kanban_child_dispatch",
+    toolset="kanban",
+    schema=KANBAN_CHILD_DISPATCH_SCHEMA,
+    handler=_handle_child_dispatch,
+    check_fn=_check_kanban_child_orchestration_mode,
+    emoji="🚀",
 )
 
 registry.register(

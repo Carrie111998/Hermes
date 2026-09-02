@@ -82,6 +82,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    "kanban_children", "kanban_child_log", "kanban_child_dispatch",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
@@ -302,7 +303,8 @@ TOOLSETS = {
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
             "tasks done with structured handoffs, enter first-class review "
             "(request_review — not a block), return review changes, block for human input, "
-            "heartbeat during long ops, comment on threads, attach files, and "
+            "heartbeat during long ops, comment on threads, attach files, "
+            "follow and dispatch the child tasks they fanned out, and "
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
@@ -311,6 +313,7 @@ TOOLSETS = {
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
+            "kanban_children", "kanban_child_log", "kanban_child_dispatch",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
         "includes": [],
