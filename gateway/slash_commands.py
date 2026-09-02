@@ -313,6 +313,43 @@ class GatewaySlashCommandsMixin:
             elif not _title_note:
                 # sanitize_title returned empty (whitespace-only / unprintable)
                 _title_note = t("gateway.reset.title_empty_untitled")
+        # Public/customer-facing chats can keep the reset confirmation while
+        # omitting operator-only model/provider/context metadata and the random
+        # tip. Resolution is profile-scoped, so multiplex routes honor the
+        # serving profile's config rather than the gateway root.
+        _show_reset_details = True
+        try:
+            from gateway.run import (
+                _gateway_display_setting,
+                _profile_runtime_scope,
+                _sanitize_gateway_configured_reply,
+            )
+
+            def _resolve_reset_display_settings():
+                return (
+                    _gateway_display_setting(source.platform, "session_reset_reply"),
+                    bool(
+                        _gateway_display_setting(
+                            source.platform, "session_reset_details", True
+                        )
+                    ),
+                )
+
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                with _profile_runtime_scope(
+                    getattr(self, "_resolve_profile_home_for_source")(source)
+                ):
+                    _custom_reset_reply, _show_reset_details = (
+                        _resolve_reset_display_settings()
+                    )
+            else:
+                _custom_reset_reply, _show_reset_details = (
+                    _resolve_reset_display_settings()
+                )
+            if _custom_reset_reply is not None:
+                header = _sanitize_gateway_configured_reply(_custom_reset_reply)
+        except Exception:
+            pass
         header = header + _title_note
 
         # When /new runs inside a Telegram DM topic lane, rewrite the
@@ -342,10 +379,14 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
+        if _show_reset_details:
+            try:
+                from hermes_cli.tips import get_random_tip
+                _tip_line = t("gateway.reset.tip", tip=get_random_tip())
+            except Exception:
+                _tip_line = ""
+        else:
+            session_info = ""
             _tip_line = ""
 
         if session_info:

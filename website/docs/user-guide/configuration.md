@@ -2109,6 +2109,35 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
+### Public-facing gateway replies
+
+Gateways used in customer, student, or community chats can replace
+operator-oriented provider failure text and simplify `/new` / `/reset`
+confirmations without patching Hermes source code:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      provider_error_reply: "I couldn't answer just now. Please try again in a minute."
+      session_reset_reply: "New session started."
+      session_reset_details: false
+```
+
+`provider_error_reply` is used only after Hermes has classified and redacted a
+provider failure; normal assistant answers are unchanged. Configured reply text is
+also surrogate-sanitized and passed through Hermes' existing secret redactor before
+delivery. Empty or whitespace-only
+values fall back to Hermes' safe built-in provider error message.
+
+`session_reset_reply` replaces the standard reset header and passes through the same
+surrogate sanitizer and URL-aware secret redactor. For a silent reset, set it to an
+empty string **and** set `session_reset_details: false`; title-validation warnings
+can still produce a reply. `session_reset_details: false` hides the model,
+provider, context information, and random tip while preserving those warnings.
+All three settings may also be placed directly under `display` as global defaults;
+`display.platforms.<platform>` overrides them per platform.
+
 ## Privacy
 
 ```yaml

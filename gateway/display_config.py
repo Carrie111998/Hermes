@@ -58,6 +58,13 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Customer-facing gateways can replace operator-oriented provider failure
+    # copy and keep /new confirmations free of runtime metadata. None preserves
+    # the built-in reply; details=True preserves model/provider/
+    # context information and the random tip.
+    "provider_error_reply": None,
+    "session_reset_reply": None,
+    "session_reset_details": True,
     # Live working-state status on platforms whose typing indicator renders
     # text (Slack's assistant status line). Values:
     #   "full" / true  -> verb + argument preview ("is running pytest…")
@@ -285,6 +292,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "busy_ack_detail",
         "busy_steer_ack_enabled",
         "thinking_progress",
+        "session_reset_details",
     }:
         if isinstance(value, str):
             val = value.strip().lower()

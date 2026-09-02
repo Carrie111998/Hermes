@@ -919,8 +919,36 @@ def _format_exec_approval_fallback(
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
     )
 
-def _gateway_provider_error_reply(text: str) -> str:
-    """Map raw provider/API errors to a short user-safe Telegram reply."""
+def _sanitize_gateway_configured_reply(value: Any) -> str:
+    """Make configured user-facing copy safe for gateway delivery."""
+    normalized = str(value).strip()
+    if not normalized:
+        return ""
+    try:
+        from agent.message_sanitization import _sanitize_surrogates
+
+        normalized = _sanitize_surrogates(normalized)
+    except Exception:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        normalized = redact_sensitive_text(
+            normalized,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return ""
+    return _redact_gateway_user_facing_secrets(normalized)
+
+
+def _gateway_provider_error_reply(text: str, custom_reply: Any = None) -> str:
+    """Map raw provider/API errors to a short user-safe gateway reply."""
+    if custom_reply is not None:
+        normalized = _sanitize_gateway_configured_reply(custom_reply)
+        if normalized:
+            return normalized
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
@@ -984,6 +1012,11 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if not text:
         return False
     body = str(text).strip()
+    # _normalize_empty_agent_response wraps provider failures with this
+    # user-facing prefix. Classify the wrapped inner envelope rather than
+    # letting the wrapper bypass the provider-error sanitizer.
+    if body.lower().startswith("the request failed:"):
+        body = body.partition(":")[2].lstrip()
     # Provider failure envelopes are short. Assistant answers that happen
     # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
     if len(body) > 400 or body.count("\n") > 4:
@@ -1026,7 +1059,10 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
+        return _gateway_provider_error_reply(
+            redacted,
+            _gateway_display_setting(platform, "provider_error_reply"),
+        )
     return redacted
 
 
@@ -1056,7 +1092,10 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         ):
             return None
     if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
+        return _gateway_provider_error_reply(
+            text,
+            _gateway_display_setting(platform, "provider_error_reply"),
+        )
     return text
 
 
@@ -4158,6 +4197,25 @@ def _check_unavailable_skill(command_name: str) -> str | None:
 def _platform_config_key(platform: "Platform") -> str:
     """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
     return "cli" if platform == Platform.LOCAL else platform.value
+
+
+def _gateway_display_setting(platform: Any, setting: str, fallback: Any = None) -> Any:
+    """Resolve a profile-scoped display setting for a gateway surface."""
+    try:
+        from gateway.display_config import resolve_display_setting
+
+        if isinstance(platform, str):
+            platform_key = platform.strip().lower()
+        else:
+            platform_key = _platform_config_key(platform)
+        return resolve_display_setting(
+            _load_gateway_config(),
+            platform_key,
+            setting,
+            fallback,
+        )
+    except Exception:
+        return fallback
 
 
 def _teams_pipeline_plugin_enabled() -> bool:
