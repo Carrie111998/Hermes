@@ -482,7 +482,13 @@ class GatewaySlashCommandsMixin:
         if text.startswith("kanban"):
             text = text[len("kanban"):].lstrip()
 
-        tokens = shlex.split(text) if text else []
+        try:
+            tokens = shlex.split(text) if text else []
+        except ValueError:
+            # Unbalanced quote in user-typed args ("/kanban deploy "v2)
+            # must not raise out of the handler — /resume guards its own
+            # shlex.split the same way. Fall back to whitespace splitting.
+            tokens = text.split()
         requested_board = None
         action = None
         i = 0
