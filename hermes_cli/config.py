@@ -2131,12 +2131,22 @@ def get_custom_provider_context_length(
     base_url: str,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
     config: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
 ) -> Optional[int]:
     """Look up a per-model ``context_length`` override from ``custom_providers``.
 
     Matches any entry whose normalized route identity equals ``base_url`` and
     returns ``custom_providers[i].models.<model>.context_length`` if present and
     valid.  Returns ``None`` when no override applies.
+
+    When ``provider`` is supplied, matching is scoped to entries whose provider
+    identity equals it (case-insensitive).  Provider identity precedence is
+    ``provider_key`` > ``name`` > ``slug``; entries carrying none of those are
+    treated as identity-less legacy entries and only match as a fallback after
+    no identified entry did.  This keeps multiple providers sharing one
+    base_url (an OpenAI-compatible aggregator such as new-api/one-api) with
+    identically named but differently sized models from resolving to whichever
+    entry appears first in config order.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -2167,26 +2177,62 @@ def get_custom_provider_context_length(
     if not target_url:
         return None
 
-    for entry in custom_providers:
+    provider_lower = (provider or "").strip().lower()
+
+    def _entry_identity(entry: Any) -> str:
         if not isinstance(entry, dict):
-            continue
+            return ""
+        return str(
+            entry.get("provider_key") or entry.get("name") or entry.get("slug") or ""
+        ).strip().lower()
+
+    def _match_ctx(entry: Any) -> Optional[int]:
+        """Return the per-model context override for one entry, or ``None``."""
+        if not isinstance(entry, dict):
+            return None
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if not entry_url or entry_url != target_url:
-            continue
+            return None
         models = entry.get("models")
         if not isinstance(models, dict):
-            continue
+            return None
         model_cfg = models.get(model)
         if not isinstance(model_cfg, dict):
-            continue
+            return None
         raw_ctx = model_cfg.get("context_length")
         if raw_ctx is None:
-            continue
+            return None
         try:
             ctx = int(raw_ctx)
         except (TypeError, ValueError):
+            return None
+        return ctx if ctx > 0 else None
+
+    if not provider_lower:
+        # Legacy callers without a provider keep the historical
+        # first-match-in-config-order behaviour.
+        for entry in custom_providers:
+            ctx = _match_ctx(entry)
+            if ctx:
+                return ctx
+        return None
+
+    # Provider-scoped lookup. First pass: only entries whose identity equals the
+    # requested provider. An identity-less legacy entry must NOT win over a
+    # correctly named one purely by appearing earlier in config order.
+    for entry in custom_providers:
+        if _entry_identity(entry) != provider_lower:
             continue
-        if ctx > 0:
+        ctx = _match_ctx(entry)
+        if ctx:
+            return ctx
+    # Second pass: identity-less legacy entries are the fallback once no
+    # identified entry matched.
+    for entry in custom_providers:
+        if _entry_identity(entry):
+            continue
+        ctx = _match_ctx(entry)
+        if ctx:
             return ctx
     return None
 

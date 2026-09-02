@@ -3223,6 +3223,7 @@ def switch_model(
             model=agent.model,
             base_url=agent.base_url,
             custom_providers=_sm_custom_providers,
+            provider=getattr(agent, "provider", None),
         )
     except Exception:
         _destination_context_intent = None

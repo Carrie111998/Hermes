@@ -3468,6 +3468,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
                 model=resolved_model,
                 base_url=base_url,
                 custom_providers=custom_providers,
+                provider=provider,
             )
             if custom_ctx:
                 config_context_length = custom_ctx
@@ -20759,6 +20760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             model=_msg_model,
                             base_url=_msg_base_url,
                             custom_providers=_msg_custom_providers,
+                            provider=_msg_model_cfg.get("provider"),
                         )
                         if _msg_custom_ctx:
                             _msg_config_ctx = _msg_custom_ctx
@@ -21683,6 +21685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             model=_hyg_model,
                             base_url=_hyg_base_url,
                             custom_providers=_hyg_custom_providers,
+                            provider=_hyg_provider,
                         )
                         if _hyg_custom_ctx:
                             _hyg_config_context_length = int(_hyg_custom_ctx)

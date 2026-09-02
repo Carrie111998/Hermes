@@ -121,6 +121,126 @@ class TestGetCustomProviderModelCapability:
 
 
 
+class TestProviderScopedContextLength:
+    """Multiple providers may share one base_url (e.g. an OpenAI-compatible
+    aggregator such as new-api/one-api) while serving identically named models
+    with different context windows. The lookup must scope by provider when one
+    is supplied instead of resolving whichever entry appears first in config
+    order.
+    """
+
+    CUSTOM = [
+        {
+            "provider_key": "coding-plan-gpt",
+            "name": "coding-plan-gpt",
+            "base_url": "http://127.0.0.1:3000/v1",
+            "models": {"gpt-5.6-terra": {"context_length": 500_000}},
+        },
+        {
+            "provider_key": "market-aigw",
+            "name": "market-aigw",
+            "base_url": "http://127.0.0.1:3000/v1",
+            "models": {"gpt-5.6-terra": {"context_length": 1_050_000}},
+        },
+    ]
+
+    def test_same_model_on_shared_base_url_resolves_per_provider(self):
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra",
+                "http://127.0.0.1:3000/v1",
+                self.CUSTOM,
+                provider="market-aigw",
+            )
+            == 1_050_000
+        )
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra",
+                "http://127.0.0.1:3000/v1",
+                self.CUSTOM,
+                provider="coding-plan-gpt",
+            )
+            == 500_000
+        )
+
+    def test_provider_lookup_is_case_insensitive(self):
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra",
+                "http://127.0.0.1:3000/v1",
+                self.CUSTOM,
+                provider="Market-AIGW",
+            )
+            == 1_050_000
+        )
+
+    def test_unknown_provider_does_not_match_any_entry(self):
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra",
+                "http://127.0.0.1:3000/v1",
+                self.CUSTOM,
+                provider="no-such-provider",
+            )
+            is None
+        )
+
+    def test_no_provider_keeps_first_match_order(self):
+        """Backward compatibility: legacy callers without a provider keep the
+        historical first-match-in-config-order behaviour."""
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra", "http://127.0.0.1:3000/v1", self.CUSTOM
+            )
+            == 500_000
+        )
+
+    def test_identityless_entry_is_fallback_when_no_identified_entry_matches(self):
+        """Legacy custom_providers entries carry no name/provider_key; under a
+        scoped lookup they remain reachable, but only as a fallback after no
+        identified entry matched."""
+        legacy_only = [
+            {
+                "base_url": "http://127.0.0.1:3000/v1",
+                "models": {"m": {"context_length": 128_000}},
+            }
+        ]
+        assert (
+            get_custom_provider_context_length(
+                "m", "http://127.0.0.1:3000/v1", legacy_only, provider="anything"
+            )
+            == 128_000
+        )
+
+    def test_identityless_entry_does_not_shadow_named_entry(self):
+        """An identity-less legacy entry placed before a correctly named one
+        must NOT win the scoped lookup just because it appears first in config
+        order — that is exactly the misresolution provider scoping exists to
+        prevent."""
+        mixed = [
+            {
+                "base_url": "http://127.0.0.1:3000/v1",
+                "models": {"gpt-5.6-terra": {"context_length": 128_000}},
+            },
+            {
+                "provider_key": "market-aigw",
+                "name": "market-aigw",
+                "base_url": "http://127.0.0.1:3000/v1",
+                "models": {"gpt-5.6-terra": {"context_length": 1_050_000}},
+            },
+        ]
+        assert (
+            get_custom_provider_context_length(
+                "gpt-5.6-terra",
+                "http://127.0.0.1:3000/v1",
+                mixed,
+                provider="market-aigw",
+            )
+            == 1_050_000
+        )
+
+
 class TestGetModelContextLengthHonorsOverride:
     """agent.model_metadata.get_model_context_length must honor the
     custom_providers override at step 0b — before any probe, cache hit,
