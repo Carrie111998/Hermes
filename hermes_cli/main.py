@@ -5187,6 +5187,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_invalidate_update_cache",
         "_is_android_python",
         "_is_fork",
+        "_kill_hermes_python_processes",
         "_leftover_pausable_gateway_pids",
         "_ledger_manual_serve_holders",
         "_relaunch_stopped_serves",
