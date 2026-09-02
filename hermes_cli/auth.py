@@ -423,6 +423,20 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"),
         base_url_env_var="ALIBABA_CODING_PLAN_BASE_URL",
     ),
+    # China endpoint (#101122): a dedicated, non-overlapping key var --
+    # mirroring kimi-coding / kimi-coding-cn (#10526) -- so setting the intl
+    # key above doesn't also light up this entry in the provider picker.
+    # Without an explicit registry entry here, this slug used to fall back to
+    # the plugin's ProviderProfile.env_vars, which shared both
+    # ALIBABA_CODING_PLAN_API_KEY and DASHSCOPE_API_KEY with the intl entry.
+    "alibaba-coding-plan-cn": ProviderConfig(
+        id="alibaba-coding-plan-cn",
+        name="Alibaba Cloud (Coding Plan, China)",
+        auth_type="api_key",
+        inference_base_url="https://coding.dashscope.aliyuncs.com/v1",
+        api_key_env_vars=("ALIBABA_CODING_PLAN_CN_API_KEY",),
+        base_url_env_var="ALIBABA_CODING_PLAN_CN_BASE_URL",
+    ),
     "minimax-cn": ProviderConfig(
         id="minimax-cn",
         name="MiniMax (China)",

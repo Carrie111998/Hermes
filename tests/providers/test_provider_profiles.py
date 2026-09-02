@@ -279,7 +279,14 @@ class TestAlibabaRegionalAndTokenPlanProfiles:
         p = get_provider_profile("alibaba-coding-plan-cn")
         assert p is not None and p.name == "alibaba-coding-plan-cn"
         assert p.base_url == "https://coding.dashscope.aliyuncs.com/v1"
-        assert "ALIBABA_CODING_PLAN_API_KEY" in p.env_vars
+        # #101122: the CN profile has its own, non-overlapping key var --
+        # mirroring kimi-coding / kimi-coding-cn (#10526) and the
+        # alibaba-token-plan / alibaba-token-plan-cn pair -- so it no longer
+        # shares ALIBABA_CODING_PLAN_API_KEY (or DASHSCOPE_API_KEY) with the
+        # intl profile and both stop appearing together off a single key.
+        assert "ALIBABA_CODING_PLAN_CN_API_KEY" in p.env_vars
+        assert "ALIBABA_CODING_PLAN_API_KEY" not in p.env_vars
+        assert "DASHSCOPE_API_KEY" not in p.env_vars
 
     def test_alibaba_token_plan_registered(self):
         p = get_provider_profile("alibaba-token-plan")

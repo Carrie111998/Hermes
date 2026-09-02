@@ -1234,13 +1234,17 @@ class TestRuntimeAlibabaRegionalAndTokenPlan:
         assert result["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     def test_runtime_alibaba_coding_plan_cn(self, monkeypatch):
-        monkeypatch.setenv("ALIBABA_CODING_PLAN_API_KEY", "acp-key")
+        # #101122: the CN provider now has its own, non-overlapping key var
+        # (mirroring kimi-coding / kimi-coding-cn) -- it no longer resolves
+        # off the shared intl ALIBABA_CODING_PLAN_API_KEY / DASHSCOPE_API_KEY.
+        monkeypatch.setenv("ALIBABA_CODING_PLAN_CN_API_KEY", "acp-cn-key")
+        monkeypatch.delenv("ALIBABA_CODING_PLAN_API_KEY", raising=False)
         monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
         from hermes_cli.runtime_provider import resolve_runtime_provider
         result = resolve_runtime_provider(requested="alibaba-coding-plan-cn")
         assert result["provider"] == "alibaba-coding-plan-cn"
         assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "acp-key"
+        assert result["api_key"] == "acp-cn-key"
         assert result["base_url"] == "https://coding.dashscope.aliyuncs.com/v1"
 
     def test_runtime_alibaba_token_plan(self, monkeypatch):
