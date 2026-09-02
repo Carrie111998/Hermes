@@ -64,6 +64,7 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
+    AssistantMessageIdAllocator,
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
@@ -1947,9 +1948,15 @@ class HermesACPAgent(acp.Agent):
                 tool_call_meta,
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
             )
-            reasoning_cb = make_thinking_cb(conn, session_id, loop)
+            # Per-session, monotonic across turns: a new turn must never reuse
+            # a previous turn's assistant messageId (root-reply replacement
+            # semantics in ACP clients). Ported from prime-agent#1781.
+            if state.message_ids is None:
+                state.message_ids = AssistantMessageIdAllocator()
+            state.message_ids.close()  # new turn -> next chunk opens a fresh id
+            reasoning_cb = make_thinking_cb(conn, session_id, loop, state.message_ids)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
-            message_cb = make_message_cb(conn, session_id, loop)
+            message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
             def stream_delta_cb(text: str) -> None:
                 nonlocal streamed_message
@@ -2179,6 +2186,17 @@ class HermesACPAgent(acp.Agent):
             # finished (e.g. transform_llm_output) — otherwise the appended /
             # rewritten text never reaches the client.
             update = acp.update_agent_message_text(final_response)
+            if state.message_ids is not None:
+                if streamed_message and result.get("response_transformed"):
+                    # The rewritten text replaces the streamed reply, so it
+                    # reuses the streamed message's id (replacement semantics).
+                    update.message_id = (
+                        state.message_ids.last() or state.message_ids.current()
+                    )
+                else:
+                    # Unstreamed final response opens its own message.
+                    update.message_id = state.message_ids.current()
+                state.message_ids.close()
             await conn.session_update(session_id, update)
 
         # Mark this turn idle before draining queued work so recursive prompt()
