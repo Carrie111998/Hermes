@@ -14,13 +14,16 @@ died.  See commit message for full context.
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from tools.environments import local as local_mod
+from tools.environments.base import ProcessHandle
 from tools.environments.local import LocalEnvironment
 
 
@@ -200,3 +203,100 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             env.cleanup()
         except Exception:
             pass
+
+
+def test_wait_for_process_closes_stdout_on_timeout():
+    """Timeout cleanup closes the read end of the child stdout pipe."""
+    env = LocalEnvironment(cwd="/tmp")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    if hasattr(os, "getpgid"):
+        setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
+    try:
+        result = env._wait_for_process(proc, timeout=0)
+        assert result["returncode"] == 124
+        assert proc.stdout is not None
+        assert proc.stdout.closed
+    finally:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        env.cleanup()
+
+
+def test_wait_for_process_closes_stdout_on_interrupt():
+    """Agent interrupt cleanup closes the child stdout pipe."""
+    from tools.interrupt import set_interrupt
+
+    env = LocalEnvironment(cwd="/tmp")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    if hasattr(os, "getpgid"):
+        setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
+    set_interrupt(True)
+    try:
+        result = env._wait_for_process(proc, timeout=60)
+        assert result["returncode"] == 130
+        assert proc.stdout is not None
+        assert proc.stdout.closed
+    finally:
+        set_interrupt(False)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        env.cleanup()
+
+
+def test_drain_thread_eventually_closes_stdout_after_join_timeout(monkeypatch):
+    """A still-running reader owns the close after main-thread cleanup returns."""
+    release = threading.Event()
+    closed = threading.Event()
+
+    class BlockingStream:
+        def fileno(self):
+            raise OSError("iterator-backed stream")
+
+        def __iter__(self):
+            release.wait(timeout=10)
+            return iter(())
+
+        def close(self):
+            closed.set()
+
+    class FakeProc:
+        stdout = BlockingStream()
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    proc = FakeProc()
+    env = object.__new__(LocalEnvironment)
+    monkeypatch.setattr(env, "_kill_process", lambda _proc: None)
+
+    result = env._wait_for_process(cast(ProcessHandle, proc), timeout=0)
+
+    assert result["returncode"] == 124
+    assert not closed.is_set()
+    release.set()
+    assert closed.wait(timeout=2), "drain thread did not close stdout after exiting"

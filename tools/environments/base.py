@@ -1127,6 +1127,16 @@ class BaseEnvironment(ABC):
                 except Exception:
                     pass
 
+        def _close_stream(stream) -> None:
+            """Close a drained stdout stream without masking command results."""
+            close = getattr(stream, "close", None)
+            if not callable(close):
+                return
+            try:
+                close()
+            except Exception:
+                pass
+
         def _drain():
             # Resolve a real OS file descriptor up front.  Real subprocesses and
             # the SDK ``_ThreadedProcessHandle`` (os.pipe-backed) both return an
@@ -1143,7 +1153,10 @@ class BaseEnvironment(ABC):
             except Exception:
                 fd = None
             if not isinstance(fd, int) or fd < 0:
-                _drain_iterable(stream)
+                try:
+                    _drain_iterable(stream)
+                finally:
+                    _close_stream(stream)
                 return
             # select.select does NOT work on pipe fds on Windows (only sockets).
             # Use blocking os.read in a daemon thread instead — safe because
@@ -1164,6 +1177,7 @@ class BaseEnvironment(ABC):
                             output.append(tail)
                     except Exception:
                         pass
+                    _close_stream(stream)
                 return
             idle_after_exit = 0
             try:
@@ -1198,9 +1212,20 @@ class BaseEnvironment(ABC):
                         output.append(tail)
                 except Exception:
                     pass
+                _close_stream(stream)
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
+
+        def _close_stdout_after_drain() -> None:
+            """Close our pipe reader once no drain thread is using it."""
+            if drain_thread.is_alive():
+                return
+            stream = proc.stdout
+            if stream is None:
+                return
+            _close_stream(stream)
+
         deadline = time.monotonic() + timeout
         _now = time.monotonic()
         _activity_state = {
@@ -1240,6 +1265,7 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    _close_stdout_after_drain()
                     return self._finalize_wait_result(
                         output,
                         output.render(suffix="\n[Command interrupted]"),
@@ -1254,6 +1280,7 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    _close_stdout_after_drain()
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return self._finalize_wait_result(
                         output,
@@ -1312,6 +1339,7 @@ class BaseEnvironment(ABC):
             try:
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
+                _close_stdout_after_drain()
             except Exception:
                 pass  # cleanup is best-effort
             raise
@@ -1321,10 +1349,7 @@ class BaseEnvironment(ABC):
         # it means the non-blocking loop itself stopped cooperating.
         drain_thread.join(timeout=2)
 
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
+        _close_stdout_after_drain()
 
         if _DEBUG_INTERRUPT:
             logger.info(
