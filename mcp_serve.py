@@ -1667,10 +1667,18 @@ def _configure_transport_security(
     ]
     hosts = list(dict.fromkeys([*default_hosts, *allowed_hosts]))
     origins = list(dict.fromkeys(allowed_origins))
-    server.settings.transport_security = TransportSecuritySettings(
+    security = TransportSecuritySettings(
         allowed_hosts=hosts,
         allowed_origins=origins,
     )
+    # FastMCP 1.x stored transport options on ``server.settings``. MCP 2.x
+    # accepts them directly in ``streamable_http_app`` and its Settings model
+    # rejects unknown attributes. Retain the assignment only for compatible
+    # servers while returning the settings for the MCP 2.x call path.
+    settings = getattr(server, "settings", None)
+    if settings is not None and hasattr(settings, "transport_security"):
+        settings.transport_security = security
+    return security
 
 
 async def _read_request_body_limited(request, limit: int) -> bytes:
@@ -1695,17 +1703,32 @@ def create_streamable_http_app(
     *,
     auth_config: Optional[McpHttpAuthConfig] = None,
     health_path: str = "/health",
+    host: Optional[str] = None,
+    path: Optional[str] = None,
+    json_response: Optional[bool] = None,
+    transport_security=None,
 ):
     """Create the Starlette app for Streamable HTTP, including optional auth.
 
-    The returned app serves the MCP endpoint at ``server.settings.streamable_http_path``.
+    The returned app serves the MCP endpoint at ``path`` (default ``/mcp``).
     If ``auth_config`` is provided, the MCP path requires either a PSK bearer/header
     token or an OAuth-compatible bearer token issued by the local token endpoint.
     """
     if not hasattr(server, "streamable_http_app"):
         raise RuntimeError("Installed MCP SDK does not support Streamable HTTP")
 
-    bind_host = str(getattr(getattr(server, "settings", None), "host", "127.0.0.1"))
+    settings = getattr(server, "settings", None)
+    bind_host = str(host or getattr(settings, "host", "127.0.0.1"))
+    streamable_http_path = _normalize_path(
+        path or getattr(settings, "streamable_http_path", "/mcp")
+    )
+    use_json_response = (
+        bool(json_response)
+        if json_response is not None
+        else bool(getattr(settings, "json_response", False))
+    )
+    if transport_security is None:
+        transport_security = getattr(settings, "transport_security", None)
     if auth_config is None and not _is_loopback_host(bind_host):
         raise ValueError(
             "Unauthenticated MCP HTTP serving is restricted to loopback hosts"
@@ -1715,7 +1738,12 @@ def create_streamable_http_app(
     from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse
 
     store = _OAuthTokenStore()
-    app = server.streamable_http_app()
+    app = server.streamable_http_app(
+        streamable_http_path=streamable_http_path,
+        json_response=use_json_response,
+        transport_security=transport_security,
+        host=bind_host,
+    )
     health_path = _normalize_path(health_path)
     config = auth_config
 
@@ -1957,7 +1985,6 @@ def create_streamable_http_app(
 
         app.add_middleware(McpAuthMiddleware)
 
-    transport_security = getattr(server.settings, "transport_security", None)
     if transport_security is not None:
         from mcp.server.transport_security import TransportSecurityMiddleware
 
@@ -2128,11 +2155,7 @@ def run_mcp_http_server(
             expose_tools=expose_tools,
             expose_plugin_tools=expose_plugin_tools,
         )
-        server.settings.host = host
-        server.settings.port = int(port)
-        server.settings.streamable_http_path = path
-        server.settings.json_response = True
-        _configure_transport_security(
+        transport_security = _configure_transport_security(
             server,
             host,
             int(port),
@@ -2141,7 +2164,13 @@ def run_mcp_http_server(
         )
 
         app = create_streamable_http_app(
-            server, auth_config=auth_config, health_path=health_path
+            server,
+            auth_config=auth_config,
+            health_path=health_path,
+            host=host,
+            path=path,
+            json_response=True,
+            transport_security=transport_security,
         )
 
         import uvicorn

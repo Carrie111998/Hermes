@@ -1068,7 +1068,7 @@ class TestServerCreation:
         )
         monkeypatch.setattr(plugins_mod, "discover_plugins", lambda force=False: None)
         monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: manager)
-        server = _FakeFastMCP()
+        server = _FakeMCPServer()
 
         with pytest.raises(
             RuntimeError, match="No enabled plugin tools are available for MCP exposure"
@@ -1102,7 +1102,7 @@ class TestServerCreation:
         try:
             with pytest.raises(RuntimeError, match="collide with built-in server tools"):
                 mcp_serve._register_registry_tools_as_mcp(
-                    _FakeFastMCP(),
+                    _FakeMCPServer(),
                     expose_toolsets=["test-mcp-reserved-collision"],
                 )
         finally:
@@ -1148,7 +1148,7 @@ class TestServerCreation:
             # return False and incorrectly hide the tool.
             assert registry.get_definitions({tool_name}, quiet=True)
 
-            server = _FakeFastMCP()
+            server = _FakeMCPServer()
             registered = mcp_serve._register_registry_tools_as_mcp(
                 server, expose_tools=[tool_name]
             )
@@ -1176,7 +1176,7 @@ class TestServerCreation:
         )
         invalidate_check_fn_cache()
         try:
-            server = _FakeFastMCP()
+            server = _FakeMCPServer()
             mcp_serve._register_registry_tools_as_mcp(
                 server, expose_tools=["video_generate"]
             )
@@ -1234,8 +1234,8 @@ class TestServerCreation:
             handler=handler,
         )
         monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *_args, **_kwargs: "Blocked by MCP test policy",
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *_args, **_kwargs: ("Blocked by MCP test policy", None),
         )
         try:
             result = json.loads(mcp_serve._make_registry_tool_wrapper(tool_name)())
@@ -1630,14 +1630,16 @@ class TestHttpAuthHelpers:
 
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         server = mcp_serve.create_mcp_server()
-        server.settings.host = "127.0.0.1"
-        server.settings.port = 8666
-        server.settings.streamable_http_path = "/mcp"
-        server.settings.json_response = True
-        mcp_serve._configure_transport_security(
+        transport_security = mcp_serve._configure_transport_security(
             server, "127.0.0.1", 8666, [], []
         )
-        app = mcp_serve.create_streamable_http_app(server)
+        app = mcp_serve.create_streamable_http_app(
+            server,
+            host="127.0.0.1",
+            path="/mcp",
+            json_response=True,
+            transport_security=transport_security,
+        )
 
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
@@ -1669,11 +1671,7 @@ class TestHttpAuthHelpers:
 
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         server = mcp_serve.create_mcp_server()
-        server.settings.host = "127.0.0.1"
-        server.settings.port = 8666
-        server.settings.streamable_http_path = "/mcp"
-        server.settings.json_response = True
-        mcp_serve._configure_transport_security(
+        transport_security = mcp_serve._configure_transport_security(
             server,
             "127.0.0.1",
             8666,
@@ -1683,6 +1681,10 @@ class TestHttpAuthHelpers:
         app = mcp_serve.create_streamable_http_app(
             server,
             auth_config=mcp_serve.McpHttpAuthConfig(psk="test-server-psk"),
+            host="127.0.0.1",
+            path="/mcp",
+            json_response=True,
+            transport_security=transport_security,
         )
         initialize = {
             "jsonrpc": "2.0",
@@ -1745,11 +1747,7 @@ class TestHttpAuthHelpers:
 
         pytest.importorskip("mcp", reason="MCP SDK not installed")
         server = mcp_serve.create_mcp_server()
-        server.settings.host = "127.0.0.1"
-        server.settings.port = 8666
-        server.settings.streamable_http_path = "/mcp"
-        server.settings.json_response = True
-        mcp_serve._configure_transport_security(
+        transport_security = mcp_serve._configure_transport_security(
             server, "127.0.0.1", 8666, [], []
         )
         app = mcp_serve.create_streamable_http_app(
@@ -1760,6 +1758,10 @@ class TestHttpAuthHelpers:
                 public_base_url="http://127.0.0.1:8666",
                 path="/mcp",
             ),
+            host="127.0.0.1",
+            path="/mcp",
+            json_response=True,
+            transport_security=transport_security,
         )
 
         async with app.router.lifespan_context(app):
@@ -1921,13 +1923,15 @@ class TestHttpAuthHelpers:
         class FakeServer:
             settings = Settings()
 
-            def streamable_http_app(self):
+            def streamable_http_app(
+                self, *, streamable_http_path="/mcp", **_kwargs
+            ):
                 app = Starlette()
 
                 async def mcp(_request):
                     return JSONResponse({"ok": True})
 
-                app.add_route("/mcp", mcp, methods=["GET", "POST"])
+                app.add_route(streamable_http_path, mcp, methods=["GET", "POST"])
                 return app
 
         return mcp_serve.create_streamable_http_app(
