@@ -9,6 +9,7 @@ with a short notice.
 
 from __future__ import annotations
 
+import re
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
 def _ensure_discord_mock():
@@ -39,15 +41,24 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _apply_yaml_config,
+)
 
 
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH
 CAP = DiscordAdapter.MAX_SPLIT_MESSAGES
 
 
-def _make_adapter():
-    return DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+def _make_adapter(*, chunk_indicators=False):
+    return DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"chunk_indicators": chunk_indicators},
+        )
+    )
 
 
 def _huge_content(chars: int = 60_000) -> str:
@@ -56,6 +67,33 @@ def _huge_content(chars: int = 60_000) -> str:
 
 
 class TestCapSplitChunks:
+    def test_default_config_preserves_chunk_indicators(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["discord"]["chunk_indicators"] is True
+
+    def test_yaml_config_seeds_chunk_indicator_setting(self):
+        seeded = _apply_yaml_config({}, {"chunk_indicators": False})
+
+        assert seeded == {"chunk_indicators": False}
+
+    def test_disabled_chunk_indicators_are_not_rendered(self):
+        adapter = _make_adapter(chunk_indicators=False)
+
+        chunks = adapter.split_message("word " * 1000, MAX)
+
+        assert len(chunks) > 1
+        assert all(re.search(r"\(\d+/\d+\)\s*$", chunk) is None for chunk in chunks)
+
+    def test_stream_split_respects_disabled_chunk_indicators(self):
+        adapter = _make_adapter(chunk_indicators=False)
+        consumer = GatewayStreamConsumer(adapter, "555", StreamConsumerConfig())
+
+        chunks = consumer._truncate_for_stream("word " * 1000, MAX, len)
+
+        assert len(chunks) > 1
+        assert all(re.search(r"\(\d+/\d+\)\s*$", chunk) is None for chunk in chunks)
+
     def test_below_cap_unchanged(self):
         adapter = _make_adapter()
         chunks = ["a", "b", "c"]
@@ -74,6 +112,40 @@ class TestCapSplitChunks:
 
 
 class TestSendCap:
+    @pytest.mark.asyncio
+    async def test_standalone_send_respects_disabled_indicators(self, monkeypatch):
+        from gateway.config import Platform
+        from gateway.platform_registry import platform_registry
+        from tools.send_message_tool import _send_to_platform
+
+        sender = AsyncMock(return_value={"success": True, "message_id": "1"})
+        entry = SimpleNamespace(max_message_length=MAX, standalone_sender_fn=sender)
+        original_get = platform_registry.get
+
+        def fake_get(name):
+            return entry if name == "discord" else original_get(name)
+
+        monkeypatch.setattr(platform_registry, "get", fake_get)
+        pconfig = SimpleNamespace(
+            enabled=True,
+            token="***",
+            extra={"chunk_indicators": False},
+        )
+
+        result = await _send_to_platform(
+            Platform.DISCORD,
+            pconfig,
+            "ch",
+            "word " * 1000,
+        )
+
+        assert result["success"] is True
+        assert sender.await_count >= 3
+        assert all(
+            re.search(r"\(\d+/\d+\)\s*$", call.args[2]) is None
+            for call in sender.await_args_list
+        )
+
     @pytest.mark.asyncio
     async def test_send_caps_split_flood(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -95,6 +167,9 @@ class TestSendCap:
         assert result.success is True
         assert len(sends) == CAP
         assert "Response truncated" in sends[-1]
+        assert all(
+            re.search(r"\(\d+/\d+\)\s*$", content) is None for content in sends
+        )
 
 
 class TestForumCap:
@@ -127,6 +202,10 @@ class TestForumCap:
         # 1 starter message + at most (CAP - 1) follow-up chunks.
         assert len(thread_sends) <= CAP - 1
         assert "Response truncated" in thread_sends[-1]
+        assert all(
+            re.search(r"\(\d+/\d+\)\s*$", content) is None
+            for content in thread_sends
+        )
 
 
 class TestEditOverflowCap:
@@ -154,3 +233,7 @@ class TestEditOverflowCap:
         assert len(edits) == 1
         assert len(sends) <= CAP - 1
         assert "Response truncated" in (sends[-1] if sends else edits[-1])
+        assert all(
+            re.search(r"\(\d+/\d+\)\s*$", content) is None
+            for content in edits + sends
+        )
