@@ -3373,38 +3373,58 @@ def _sync_with_upstream_if_needed(
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return False
 
-    # If origin/main has commits not on upstream, don't trample
-    if origin_ahead > 0:
-        print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return True
-
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
+        if origin_ahead > 0:
+            print(f"  ✓ Upstream is up to date ({origin_ahead} local commit(s) ahead)")
+        else:
+            print("  ✓ Fork is up to date with upstream")
         return True
 
-    # origin/main is strictly behind upstream/main (can fast-forward)
-    print()
-    print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
-
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
+    # If origin has local commits AND upstream has new commits -> Rebase upstream main
+    if origin_ahead > 0:
+        print()
         print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
+            f"→ Upstream has {upstream_ahead} new commit(s); fork has {origin_ahead} local commit(s)."
         )
-        return False
+        print("→ Rebasing local changes onto upstream/main...")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--rebase", "upstream", "main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            print("  ✓ Successfully rebased local changes on top of upstream")
+        except subprocess.CalledProcessError:
+            # Safely abort rebase on conflict to avoid leaving repo in a broken state
+            subprocess.run(
+                git_cmd + ["rebase", "--abort"], cwd=cwd, capture_output=True
+            )
+            print("  ⚠ Conflicts detected during upstream rebase. Rebase aborted.")
+            print("    To resolve manually, run:")
+            print("      git pull --rebase upstream main")
+            return False
+    else:
+        # origin/main is strictly behind upstream/main (can fast-forward)
+        print()
+        print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
+        print("→ Pulling from upstream...")
 
-    print("  ✓ Updated from upstream")
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            print(
+                "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
+            )
+            return False
+
+        print("  ✓ Updated from upstream")
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
