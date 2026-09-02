@@ -4346,7 +4346,20 @@ class MatrixAdapter(BasePlatformAdapter):
                 key,
                 len(event.text or ""),
             )
-            await self.handle_message(event)
+            try:
+                await self.handle_message(event)
+            except asyncio.CancelledError:
+                # The event was already popped above: re-buffer it so a
+                # cancellation mid-dispatch cannot lose the message.
+                existing = self._pending_text_batches.get(key)
+                if existing is not None and event.text:
+                    existing.text = f"{event.text}\n{existing.text}"
+                    if event.media_urls:
+                        existing.media_urls[:0] = event.media_urls
+                        existing.media_types[:0] = event.media_types
+                else:
+                    self._pending_text_batches[key] = event
+                raise
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
@@ -4364,7 +4377,13 @@ class MatrixAdapter(BasePlatformAdapter):
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug("Matrix: background read receipt failed: %s", exc)
 
-        asyncio.ensure_future(_send())
+        # Track the task: the loop keeps only weak references, so an
+        # unreferenced ensure_future result can be GC-reaped before the
+        # receipt is sent.
+        task = asyncio.ensure_future(_send())
+        self._background_tasks.add(task)
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
 
     async def send_read_receipt(self, room_id: str, event_id: str) -> bool:
         """Send a read receipt (m.read) for an event."""
