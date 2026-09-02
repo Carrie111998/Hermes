@@ -39,6 +39,44 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_discard_unstarted_execution_removes_owned_claim(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    claimed = executions.create_execution("overlap-loser", source="builtin")
+
+    assert executions.discard_unstarted_execution(claimed["id"]) is True
+    assert executions.list_executions(job_id="overlap-loser") == []
+
+
+def test_discard_unstarted_execution_preserves_nonmatching_rows(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    foreign = executions.create_execution("foreign", source="builtin")
+    started = executions.create_execution("started", source="builtin")
+    running = executions.create_execution("running", source="builtin")
+    completed = executions.create_execution("completed", source="builtin")
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET process_id='another-process' WHERE id=?",
+            (foreign["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET started_at='already-started' WHERE id=?",
+            (started["id"],),
+        )
+    executions.mark_execution_running(running["id"])
+    executions.finish_execution(completed["id"], success=True)
+    before = {
+        row["id"]: row for row in executions.list_executions(limit=100)
+    }
+
+    for execution_id in (foreign["id"], started["id"], running["id"], completed["id"]):
+        assert executions.discard_unstarted_execution(execution_id) is False
+
+    after = {
+        row["id"]: row for row in executions.list_executions(limit=100)
+    }
+    assert after == before
+
+
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
     import cron.executions as executions
 
@@ -211,6 +249,51 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_tick_lost_fire_claim_discards_only_its_placeholder(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    winner = executions.create_execution("overlap-job", source="manual")
+    winner = executions.mark_execution_running(winner["id"])
+
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "overlap-job",
+        "name": "overlap",
+        "prompt": "test",
+        "schedule": "every 5m",
+        "enabled": True,
+        "next_run_at": "2020-01-01T00:00:00",
+        "deliver": "local",
+    }
+    job_run_updates = []
+    scheduler._shutdown_parallel_pool()
+    scheduler._running_job_ids.clear()
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
+    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda *_a, **_kw: False)
+    monkeypatch.setattr(
+        scheduler,
+        "run_one_job",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_run",
+        lambda *_a, **_kw: job_run_updates.append((_a, _kw)),
+    )
+
+    try:
+        assert scheduler.tick(verbose=False) == 1
+    finally:
+        scheduler._shutdown_parallel_pool()
+
+    assert executions.list_executions(job_id="overlap-job") == [winner]
+    assert job_run_updates == []
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
