@@ -545,6 +545,47 @@ def _resolve_cdp_override(cdp_url: str) -> str:
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
+        # Chromium in a sibling container can advertise a debugger URL using
+        # its own loopback authority (for example, ws://127.0.0.1/...). That
+        # authority points at Hermes when the resolver runs in another
+        # container. Rebase only that authority to the configured discovery
+        # service, preserving Chromium's dynamic path and query string.
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+
+            advertised = urlsplit(ws_url)
+            discovery = urlsplit(discovery_url)
+            advertised_host = (advertised.hostname or "").lower().rstrip(".")
+            discovery_host = (discovery.hostname or "").lower().rstrip(".")
+
+            def is_loopback_host(host: str) -> bool:
+                return (
+                    host in {"localhost", "0.0.0.0", "::", "::1"}
+                    or host.startswith("127.")
+                    or host.endswith(".localhost")
+                )
+
+            if (
+                advertised_host
+                and discovery_host
+                and is_loopback_host(advertised_host)
+                and not is_loopback_host(discovery_host)
+                and discovery.netloc
+            ):
+                scheme = "wss" if discovery.scheme in {"https", "wss"} else "ws"
+                ws_url = urlunsplit(
+                    (
+                        scheme,
+                        discovery.netloc,
+                        advertised.path,
+                        advertised.query,
+                        advertised.fragment,
+                    )
+                )
+        except ValueError:
+            # Preserve the existing actionable connection error for malformed
+            # advertised URLs instead of guessing an endpoint here.
+            pass
         logger.info(
             "Resolved CDP endpoint %s -> %s",
             _sanitize_url_for_logs(raw),
