@@ -13,15 +13,19 @@ import type { PluginContext } from '@hermes/plugin-sdk'
 import { $lastRoster } from './data'
 import {
   $groupChats,
-  $groupClarify,
-  $groupNeedsYou,
   applyHostedRoomAuthority,
   groupChatHostedGateway,
   mergeGroupChatSyncEntries,
   uniqueGroupChatName,
   updateGroupChat
 } from './group-chat'
-import { groupMemberKey } from './group-membership'
+import {
+  clearHostedRoomApprovalState,
+  resetHostedRoomApprovalState,
+  resolveHostedRoomApprovalAttention,
+  syncHostedRoomApprovals
+} from './hosted-room-approval-state'
+import { readHostedMessageAttachment, stageHostedMessageAttachments } from './hosted-room-attachments-client'
 import {
   addHostedRoomCleanup,
   armHostedRoomCleanup,
@@ -52,15 +56,22 @@ import type {
   reduceHostedRoomOutbox
 } from './hosted-room-client'
 import {
+  failedHostedRoomCommand,
+  hostedRoomCommandFailureCode,
+  pendingHostedRoomSafetyCommand,
+  safetyCommandsBlockedByFailure,
+  surfaceHostedRoomCommandFailure
+} from './hosted-room-command-failures'
+import {
   mutateHostedRoomOutbox,
-  readHostedRoomOutbox,
   recoverHostedRoomOutbox,
   resetHostedRoomOutboxLocksForTests,
+  withHostedRoomCommandOrder,
   withHostedRoomOutboxDispatch
 } from './hosted-room-outbox'
 import { botsText } from './i18n'
 import { requestForBot } from './routing'
-import type { GroupChat, GroupMember, GroupMessage, GroupPrompt, ProfileRoute } from './types'
+import type { Attachment, GroupChat, GroupMember, GroupMessage, GroupPrompt, ProfileRoute } from './types'
 
 export { $hostedRoomCleanup } from './hosted-room-cleanup'
 export { describeAutonomousRoomPlan, describeHostedRoomCreationError } from './hosted-room-client'
@@ -73,7 +84,6 @@ const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30_000
 export const $hostedRoomCapabilities = atom<Record<string, HostedRoomCapability>>({})
 export const $hostedRoomOutbox = atom<HostedRoomOutbox>(createHostedRoomOutbox())
 
-const hostedAuthorityRoutes = new Map<string, ProfileRoute>()
 const hostedRoomPollCache = new Map<string, string>()
 const hostedRoomPollGenerations = new Map<string, number>()
 const hostedRoomMutationGenerations = new Map<string, number>()
@@ -83,7 +93,7 @@ let hostedRoomSyncTimer: ReturnType<typeof setTimeout> | null = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = true
 let hostedRoomLifecycleGeneration = 0
-let hostedOutboxDispatching = false
+let hostedOutboxDispatchPromise: Promise<void> | null = null
 let hostedRoomStorage: null | PluginContext['storage'] = null
 let hostedRoomHooks: HostedRoomRuntimeHooks = {}
 const hostedUnsupportedUntil = new Map<string, number>()
@@ -141,7 +151,7 @@ export function groupChatContinuityReady(room: GroupChat | null | undefined) {
   }
 
   if (groupChatHostedGateway(room)) {
-    return !['deleted', 'needs-attention', 'unsupported'].includes(String(room.hostedStatus?.state || ''))
+    return !['deleted', 'failed', 'unsupported'].includes(String(room.hostedStatus?.state || ''))
   }
 
   if (!room.roomId) {
@@ -165,6 +175,7 @@ export interface HostedRoomRuntimeHooks {
 
 export interface HostedRoomProbe {
   attachmentParity: boolean
+  attachmentUnavailableMembers: string[]
   capability: HostedRoomCapability | null
   capabilities: Record<string, HostedRoomCapability>
   eligible: boolean
@@ -275,6 +286,37 @@ async function withHostedRoomProbeTimeout<T>(task: Promise<T>, timeoutMs = 3000)
   }
 }
 
+async function verifiedHostedAuthorityRoute(routes: ProfileRoute[], authorityId: string, preferredConnectionId = '') {
+  const ordered = [...routes].sort(
+    (left, right) =>
+      Number(right.connectionId === preferredConnectionId) - Number(left.connectionId === preferredConnectionId)
+  )
+
+  for (const route of ordered) {
+    const connectionId = String(route.connectionId || '')
+
+    try {
+      const capability = classifyHostedRoomCapability(
+        await withHostedRoomProbeTimeout(requestHostedConnection(route, 'groups.capabilities')),
+        { connectionId }
+      )
+
+      $hostedRoomCapabilities.set({
+        ...$hostedRoomCapabilities.get(),
+        [connectionId]: capability
+      })
+
+      if (capability.authorityId === authorityId && isHostedRoomContinuityEligible(capability)) {
+        return route
+      }
+    } catch {
+      // Capability probes reveal no room data; try the next current route.
+    }
+  }
+
+  return null
+}
+
 function sourceLabel(connectionId: string) {
   const source = ($lastRoster.get() || []).find(row => String(row?.connectionId || '') === connectionId)
 
@@ -340,90 +382,6 @@ function hostedMemberDescriptors(
       targetProfile: profile
     }
   })
-}
-
-function syncHostedRoomApprovals(
-  group: string,
-  room: HostedRoomServerState,
-  members: GroupMember[],
-  pendingActions: unknown[]
-) {
-  const current = $groupClarify.get()
-
-  const next: Record<string, GroupPrompt> = Object.fromEntries(
-    Object.entries(current).filter(([, prompt]) => prompt.group !== group || !prompt.hostedApproval)
-  )
-
-  const serverMembers = Array.isArray(room.members) ? room.members : []
-  let waiting = false
-
-  for (const raw of pendingActions) {
-    const action = record(raw)
-
-    if (action?.kind !== 'approval') {
-      continue
-    }
-
-    const memberId = String(action.member_id || '')
-    const taskId = String(action.task_id || '')
-    const requestId = String(action.request_id || '')
-    const executionGeneration = Number(action.execution_generation || 0)
-    const memberIndex = serverMembers.findIndex(rawMember => String(record(rawMember)?.member_id || '') === memberId)
-    const member = memberIndex >= 0 ? members[memberIndex] : null
-    const approval = record(action.approval)
-
-    if (
-      !member ||
-      !memberId ||
-      !taskId ||
-      !requestId ||
-      !Number.isSafeInteger(executionGeneration) ||
-      executionGeneration < 1
-    ) {
-      continue
-    }
-
-    const key = `${group}::${groupMemberKey(member)}`
-    const prior = current[key]
-
-    const choices = (Array.isArray(approval?.choices) ? approval.choices : [])
-      .filter(choice => choice === 'once' || choice === 'deny')
-      .map(String)
-
-    next[key] =
-      prior?.requestId === requestId && prior.hostedApproval
-        ? prior
-        : {
-            at: Date.now(),
-            choices: choices.length ? choices : ['once', 'deny'],
-            command: typeof approval?.command === 'string' ? approval.command : '',
-            group,
-            hostedApproval: {
-              executionGeneration,
-              memberId,
-              roomId: String(room.room_id || ''),
-              taskId
-            },
-            kind: 'approval',
-            member: member.name,
-            memberKey: groupMemberKey(member),
-            multiSelect: false,
-            question: typeof approval?.description === 'string' ? approval.description : '',
-            questions: null,
-            requestId,
-            sessionId: null
-          }
-    waiting = true
-  }
-
-  $groupClarify.set(next)
-
-  if (waiting) {
-    $groupNeedsYou.set({
-      ...$groupNeedsYou.get(),
-      [group]: true
-    })
-  }
 }
 
 function hostedRoomContinuityMode(room: HostedRoomServerState) {
@@ -530,7 +488,8 @@ function replayMessages(messages: ReturnType<typeof createHostedRoomReplayState>
     eventId: message.eventId,
     seq: message.seq,
     text: message.text,
-    thread: message.thread
+    thread: message.thread,
+    ...(message.images?.length ? { images: message.images } : {})
   }))
 }
 
@@ -682,7 +641,6 @@ export async function refreshHostedRooms() {
         continue
       }
 
-      hostedAuthorityRoutes.set(capability.authorityId, route)
       const listedRooms: unknown[] = []
       let listOffset = 0
       let listComplete = false
@@ -946,6 +904,8 @@ export async function refreshHostedRooms() {
           .map(record)
           .find(action => action?.kind === 'retry' && String(action?.task_id || ''))
 
+        const commandFailure = failedHostedRoomCommand($hostedRoomOutbox.get(), roomId)
+
         const memberDescriptors = hostedMemberDescriptors(
           serverRoom,
           connectionId,
@@ -965,29 +925,43 @@ export async function refreshHostedRooms() {
               log: mergeGroupChatSyncEntries(current.log || [], replayMessages(replay.state.messages)),
               hostedConnectionId: connectionId,
               hostedSeq: replay.state.cursor,
-              hostedStatus: {
-                ...hostedStatus(friendly, sourceLabel(connectionId)),
-                ...(retryAction ? { taskId: String(retryAction.task_id) } : {}),
-                ...(reconnectMemberId && reconnectSupported
-                  ? {
-                      canReconnect: true,
-                      reconnectMemberId
-                    }
-                  : {}),
-                ...(!replay.complete && !reconnectMemberId ? { canRetry: true } : {})
-              },
+              hostedStatus: commandFailure
+                ? {
+                    canRetry: true,
+                    canStop: friendly.canStop,
+                    label: botsText().group.hostedNeedsAttention,
+                    retryCommandId: commandFailure.commandId,
+                    state: 'failed'
+                  }
+                : {
+                    ...hostedStatus(friendly, sourceLabel(connectionId)),
+                    ...(retryAction && !reconnectMemberId ? { taskId: String(retryAction.task_id) } : {}),
+                    ...(reconnectMemberId && reconnectSupported
+                      ? {
+                          canReconnect: true,
+                          reconnectMemberId
+                        }
+                      : {}),
+                    ...(reconnectMemberId &&
+                    (!reconnectCapabilityKnown || reconnectCapability?.kind === 'transient-failure')
+                      ? { canRetry: true }
+                      : {}),
+                    ...(!replay.complete && !reconnectMemberId ? { canRetry: true } : {})
+                  },
               continuityMode: hostedRoomContinuityMode(serverRoom),
-              continuityIssue: reconnectMemberId
-                ? !reconnectCapabilityKnown || reconnectCapability?.kind === 'transient-failure'
-                  ? botsText().group.hostedSyncing
-                  : reconnectSupported
-                    ? botsText().group.memberReconnectToContinue(reconnectName)
-                    : botsText().group.hostUpdateNeeded(
-                        reconnectUpdateConnectionId ? sourceLabel(reconnectUpdateConnectionId) : reconnectName
-                      )
-                : replay.complete
-                  ? null
-                  : botsText().group.hostedSyncing,
+              continuityIssue: commandFailure
+                ? botsText().group.hostRejectedCommand
+                : reconnectMemberId
+                  ? !reconnectCapabilityKnown || reconnectCapability?.kind === 'transient-failure'
+                    ? botsText().group.reconnectFailed
+                    : reconnectSupported
+                      ? botsText().group.memberReconnectToContinue(reconnectName)
+                      : botsText().group.hostUpdateNeeded(
+                          reconnectUpdateConnectionId ? sourceLabel(reconnectUpdateConnectionId) : reconnectName
+                        )
+                  : replay.complete
+                    ? null
+                    : botsText().group.hostedSyncing,
               running
             }
           },
@@ -1039,6 +1013,7 @@ export async function refreshHostedRooms() {
                 sync: false
               }
             )
+            clearHostedRoomApprovalState(name)
           }
         }
       }
@@ -1087,6 +1062,7 @@ export async function refreshHostedRooms() {
             }),
             { sync: false }
           )
+          clearHostedRoomApprovalState(name)
         }
       }
     }
@@ -1138,161 +1114,219 @@ async function transitionHostedRoomOutbox(action: Parameters<typeof reduceHosted
   }
 }
 
-const TERMINAL_HOSTED_ROOM_COMMAND_CODES = new Set([4110, 4111, 4113, 4117])
+async function consumeImmediateHostedRoomCommandFailure(commandId: unknown) {
+  const id = String(commandId || '')
 
-function terminalCommandFailure(error: unknown) {
-  const candidate = record(error)
-  const nested = record(candidate?.error)
-  const code = Number(candidate?.code ?? nested?.code)
+  const failed = $hostedRoomOutbox
+    .get()
+    .commands.find(command => command.commandId === id && command.status === 'failed')
 
-  return Number.isInteger(code) && TERMINAL_HOSTED_ROOM_COMMAND_CODES.has(code)
-}
-
-export async function dispatchHostedRoomOutbox() {
-  if (hostedOutboxDispatching || hostedRoomSyncDisposed) {
-    return
+  if (!failed) {
+    return false
   }
 
-  hostedOutboxDispatching = true
+  await transitionHostedRoomOutbox({ type: 'acknowledge', commandId: id })
+  const roomName = Object.entries($groupChats.get()).find(([, room]) => room.roomId === failed.roomId)?.[0]
 
-  try {
-    await withHostedRoomOutboxDispatch(async () => {
+  if (roomName) {
+    updateGroupChat(
+      roomName,
+      room => ({
+        ...room,
+        hostedStatus: {
+          canStop: room.hostedStatus?.canStop,
+          label: botsText().roster.ready,
+          state: 'ready'
+        },
+        continuityIssue: null
+      }),
+      { sync: false }
+    )
+  }
+
+  hostedRoomPollCache.delete(failed.roomId)
+  await refreshHostedRooms().catch(() => undefined)
+
+  return true
+}
+
+export function dispatchHostedRoomOutbox(): Promise<void> {
+  if (hostedRoomSyncDisposed) {
+    return Promise.resolve()
+  }
+
+  if (hostedOutboxDispatchPromise) {
+    return hostedOutboxDispatchPromise.then(() => dispatchHostedRoomOutbox())
+  }
+
+  const run = withHostedRoomOutboxDispatch(async () => {
+    if (hostedRoomSyncDisposed) {
+      return
+    }
+
+    let state = await recoverHostedRoomOutbox(hostedRoomStorage)
+    const routes = await hostedDefaultRoutes()
+
+    for (const safety of safetyCommandsBlockedByFailure(state)) {
+      state = await transitionHostedRoomOutbox({ type: 'enqueue-safety', command: safety })
+    }
+
+    const blockedRooms = new Set(
+      state.commands.filter(command => command.status === 'failed').map(command => command.roomId)
+    )
+
+    $hostedRoomOutbox.set(state)
+
+    for (const failed of state.commands.filter(command => command.status === 'failed')) {
+      surfaceHostedRoomCommandFailure(failed)
+    }
+
+    for (const command of state.commands.filter(entry => entry.status === 'pending')) {
       if (hostedRoomSyncDisposed) {
         return
       }
 
-      let state = await readHostedRoomOutbox(hostedRoomStorage)
-      const routes = await hostedDefaultRoutes()
-      const capabilities = $hostedRoomCapabilities.get()
-      const blockedRooms = new Set<string>()
+      if (blockedRooms.has(command.roomId)) {
+        continue
+      }
 
-      $hostedRoomOutbox.set(state)
+      const exact = routes.find(candidate => candidate.connectionId === command.connectionId)
 
-      for (const command of state.commands.filter(entry => entry.status === 'pending')) {
+      const route = command.authorityId
+        ? await verifiedHostedAuthorityRoute(routes, command.authorityId, command.connectionId)
+        : exact
+
+      if (!route) {
+        blockedRooms.add(command.roomId)
+
+        continue
+      }
+
+      state = await transitionHostedRoomOutbox({
+        type: 'dispatch',
+        commandId: command.commandId
+      })
+
+      const claimed = state.commands.find(entry => entry.commandId === command.commandId)
+
+      if (!claimed || claimed.status !== 'in-flight') {
+        continue
+      }
+
+      const method: Record<HostedRoomCommand['kind'], string> = {
+        create: 'groups.create',
+        retry: 'groups.retry',
+        rename: 'groups.rename',
+        send: 'groups.send',
+        stop: 'groups.stop',
+        disband: 'groups.disband'
+      }
+
+      const params =
+        command.kind === 'send'
+          ? {
+              room_id: command.roomId,
+              event_id: command.commandId,
+              payload: command.payload
+            }
+          : command.kind === 'rename'
+            ? {
+                room_id: command.roomId,
+                event_id: command.commandId,
+                name: command.payload.name
+              }
+            : command.kind === 'retry'
+              ? {
+                  room_id: command.roomId,
+                  task_id: command.payload.task_id,
+                  command_id: command.commandId
+                }
+              : command.kind === 'stop' || command.kind === 'disband'
+                ? {
+                    room_id: command.roomId,
+                    cancel_id: command.commandId
+                  }
+                : command.payload
+
+      try {
+        await requestHostedConnection(route, method[command.kind], params)
+
+        // Keep the persisted in-flight command untouched when the window is
+        // disposed mid-request. Rehydration returns it to pending with the
+        // same idempotency key, covering an unknown server outcome safely.
         if (hostedRoomSyncDisposed) {
           return
         }
 
-        if (blockedRooms.has(command.roomId)) {
-          continue
-        }
-
-        const exact = routes.find(candidate => candidate.connectionId === command.connectionId)
-        const exactAuthority = exact ? capabilities[String(exact.connectionId || '')]?.authorityId : null
-
-        const route =
-          exact && (!command.authorityId || !exactAuthority || exactAuthority === command.authorityId)
-            ? exact
-            : command.authorityId
-              ? routes.find(
-                  candidate => capabilities[String(candidate.connectionId || '')]?.authorityId === command.authorityId
-                )
-              : null
-
-        if (!route) {
-          blockedRooms.add(command.roomId)
-
-          continue
-        }
-
         state = await transitionHostedRoomOutbox({
-          type: 'dispatch',
+          type: 'acknowledge',
           commandId: command.commandId
         })
+      } catch (error) {
+        const failureCode = hostedRoomCommandFailureCode(error, claimed)
+        const terminal = Boolean(failureCode)
 
-        const claimed = state.commands.find(entry => entry.commandId === command.commandId)
-
-        if (!claimed || claimed.status !== 'in-flight') {
-          continue
-        }
-
-        const method: Record<HostedRoomCommand['kind'], string> = {
-          create: 'groups.create',
-          retry: 'groups.retry',
-          rename: 'groups.rename',
-          send: 'groups.send',
-          stop: 'groups.stop',
-          disband: 'groups.disband'
-        }
-
-        const params =
-          command.kind === 'send'
+        state = await transitionHostedRoomOutbox(
+          terminal
             ? {
-                room_id: command.roomId,
-                event_id: command.commandId,
-                payload: command.payload
+                type: 'terminal-failure',
+                commandId: command.commandId,
+                failureCode
               }
-            : command.kind === 'rename'
-              ? {
-                  room_id: command.roomId,
-                  event_id: command.commandId,
-                  name: command.payload.name
-                }
-              : command.kind === 'retry'
-                ? {
-                    room_id: command.roomId,
-                    task_id: command.payload.task_id
-                  }
-                : command.kind === 'stop' || command.kind === 'disband'
-                  ? {
-                      room_id: command.roomId,
-                      cancel_id: command.commandId
-                    }
-                  : command.payload
+            : {
+                type: 'transient-failure',
+                commandId: command.commandId
+              }
+        )
 
-        try {
-          await requestHostedConnection(route, method[command.kind], params)
+        if (terminal) {
+          const failed = state.commands.find(entry => entry.commandId === command.commandId)
 
-          // Keep the persisted in-flight command untouched when the window is
-          // disposed mid-request. Rehydration returns it to pending with the
-          // same idempotency key, covering an unknown server outcome safely.
-          if (hostedRoomSyncDisposed) {
-            return
+          const safety = pendingHostedRoomSafetyCommand(state, command.roomId)
+
+          if (failed) {
+            surfaceHostedRoomCommandFailure(failed)
           }
 
-          state = await transitionHostedRoomOutbox({
-            type: 'acknowledge',
-            commandId: command.commandId
-          })
-        } catch (error) {
-          const terminal = terminalCommandFailure(error)
-
-          state = await transitionHostedRoomOutbox(
-            terminal
-              ? {
-                  type: 'terminal-failure',
-                  commandId: command.commandId,
-                  failureCode: String(record(error)?.code || 'command-rejected')
-                }
-              : {
-                  type: 'transient-failure',
-                  commandId: command.commandId
-                }
-          )
-
-          if (!terminal) {
+          if (safety) {
+            state = await transitionHostedRoomOutbox({ type: 'enqueue-safety', command: safety })
+            blockedRooms.delete(command.roomId)
+          } else {
             blockedRooms.add(command.roomId)
           }
+        } else {
+          blockedRooms.add(command.roomId)
         }
       }
-    })
-  } finally {
-    hostedOutboxDispatching = false
-  }
+    }
+  })
+
+  let owned: Promise<void>
+
+  owned = run.finally(() => {
+    if (hostedOutboxDispatchPromise === owned) {
+      hostedOutboxDispatchPromise = null
+    }
+  })
+  hostedOutboxDispatchPromise = owned
+
+  return owned
 }
 
 async function enqueueHostedRoomCommand(command: Partial<HostedRoomCommand>) {
-  await transitionHostedRoomOutbox({
-    type: 'enqueue',
-    command
-  })
+  await withHostedRoomCommandOrder(String(command.roomId || ''), () =>
+    transitionHostedRoomOutbox({
+      type: command.kind === 'disband' || command.kind === 'stop' ? 'enqueue-safety' : 'enqueue',
+      command
+    })
+  )
   await dispatchHostedRoomOutbox()
 
-  const pending = $hostedRoomOutbox.get().commands.find(entry => entry.commandId === command.commandId)
-
-  if (pending?.status === 'failed') {
+  if (await consumeImmediateHostedRoomCommandFailure(command.commandId)) {
     throw new Error(botsText().group.hostRejectedCommand)
   }
+
+  const pending = $hostedRoomOutbox.get().commands.find(entry => entry.commandId === command.commandId)
 
   scheduleHostedRoomSync(0)
 
@@ -1302,6 +1336,11 @@ async function enqueueHostedRoomCommand(command: Partial<HostedRoomCommand>) {
 async function hostedRouteForRoom(room: GroupChat) {
   const connectionId = String(room?.hostedConnectionId || '')
   const routes = await hostedDefaultRoutes()
+  const authorityId = groupChatHostedGateway(room)
+
+  if (authorityId) {
+    return verifiedHostedAuthorityRoute(routes, authorityId, connectionId)
+  }
 
   if (connectionId) {
     const exact = routes.find(candidate => candidate.connectionId === connectionId)
@@ -1311,7 +1350,7 @@ async function hostedRouteForRoom(room: GroupChat) {
     }
   }
 
-  return hostedAuthorityRoutes.get(groupChatHostedGateway(room)) || null
+  return null
 }
 
 export async function approveHostedGroupChat(entry: GroupPrompt, choice: string) {
@@ -1331,6 +1370,8 @@ export async function approveHostedGroupChat(entry: GroupPrompt, choice: string)
     choice,
     request_id: entry.requestId
   })
+  await refreshHostedRooms().catch(() => undefined)
+  resolveHostedRoomApprovalAttention(entry)
   scheduleHostedRoomSync(0)
 }
 
@@ -1350,41 +1391,39 @@ export async function probeHostedRoomMembers(members: GroupMember[]): Promise<Ho
   const capabilities: Record<string, HostedRoomCapability> = {}
   const now = Date.now()
 
-  for (const connectionId of connectionIds) {
-    const cached = $hostedRoomCapabilities.get()[connectionId]
+  await Promise.all(
+    connectionIds.map(async connectionId => {
+      const cached = $hostedRoomCapabilities.get()[connectionId]
 
-    if (cached?.kind === 'unsupported' && Number(hostedUnsupportedUntil.get(connectionId) || 0) > now) {
-      capabilities[connectionId] = cached
+      if (cached?.kind === 'unsupported' && Number(hostedUnsupportedUntil.get(connectionId) || 0) > now) {
+        capabilities[connectionId] = cached
 
-      continue
-    }
+        return
+      }
 
-    const route = routes[connectionId]
-    let capability: HostedRoomCapability
+      const route = routes[connectionId]
+      let capability: HostedRoomCapability
 
-    try {
-      capability = classifyHostedRoomCapability(
-        route
-          ? await withHostedRoomProbeTimeout(requestHostedConnection(route, 'groups.capabilities'))
-          : { ok: false, error: new Error('Gateway route unavailable') },
-        { connectionId }
-      )
-    } catch (error) {
-      capability = classifyHostedRoomCapability({ ok: false, error }, { connectionId })
-    }
+      try {
+        capability = classifyHostedRoomCapability(
+          route
+            ? await withHostedRoomProbeTimeout(requestHostedConnection(route, 'groups.capabilities'))
+            : { ok: false, error: new Error('Gateway route unavailable') },
+          { connectionId }
+        )
+      } catch (error) {
+        capability = classifyHostedRoomCapability({ ok: false, error }, { connectionId })
+      }
 
-    capabilities[connectionId] = capability
+      capabilities[connectionId] = capability
 
-    if (capability.kind === 'unsupported') {
-      hostedUnsupportedUntil.set(connectionId, now + HOSTED_ROOM_UNSUPPORTED_REPROBE_MS)
-    } else {
-      hostedUnsupportedUntil.delete(connectionId)
-    }
-
-    if (capability.authorityId && isHostedRoomContinuityEligible(capability) && route) {
-      hostedAuthorityRoutes.set(capability.authorityId, route)
-    }
-  }
+      if (capability.kind === 'unsupported') {
+        hostedUnsupportedUntil.set(connectionId, now + HOSTED_ROOM_UNSUPPORTED_REPROBE_MS)
+      } else {
+        hostedUnsupportedUntil.delete(connectionId)
+      }
+    })
+  )
 
   $hostedRoomCapabilities.set({ ...$hostedRoomCapabilities.get(), ...capabilities })
 
@@ -1394,11 +1433,35 @@ export async function probeHostedRoomMembers(members: GroupMember[]): Promise<Ho
   })
 
   const capability = route.connectionId ? capabilities[route.connectionId] || null : null
+  const homeConnectionId = String(route.homeConnectionId || route.connectionId || '')
+
+  const attachmentUnavailableConnections = new Set(
+    connectionIds.filter(connectionId => {
+      const candidate = capabilities[connectionId]
+
+      return (
+        candidate?.limits.attachments !== true ||
+        (connectionId !== homeConnectionId && candidate?.roomLink?.catalog?.attachments !== true)
+      )
+    })
+  )
 
   return {
     attachmentParity:
-      connectionIds.length > 0 &&
-      connectionIds.every(connectionId => capabilities[connectionId]?.roomLink?.catalog?.attachments === true),
+      Boolean(homeConnectionId) &&
+      capabilities[homeConnectionId]?.limits.attachments === true &&
+      route.remoteConnectionIds.every(
+        connectionId =>
+          capabilities[connectionId]?.limits.attachments === true &&
+          capabilities[connectionId]?.roomLink?.catalog?.attachments === true
+      ),
+    attachmentUnavailableMembers: members
+      .filter(member =>
+        attachmentUnavailableConnections.has(
+          String(member?.route?.connectionId || member?.connectionId || activeConnectionId() || '')
+        )
+      )
+      .map(member => String(member.display_name || member.handle || member.name || botsText().group.aBot)),
     route,
     routes,
     capabilities,
@@ -1452,8 +1515,6 @@ export async function createHostedGroupChat({ route, roomId, name, members }: Ho
   if (!authorityId) {
     throw new Error(botsText().group.hostRejectedCommand)
   }
-
-  hostedAuthorityRoutes.set(authorityId, profileRoute)
 
   return {
     authorityId,
@@ -1609,7 +1670,7 @@ export async function createAutonomousHostedGroupChat({
   }
 }
 
-export async function sendHostedGroupChat(group: string, message: GroupMessage, thread: string) {
+async function hostedGroupChatSendCommand(group: string, message: GroupMessage, thread: string) {
   const room = $groupChats.get()[group]
 
   if (!room?.roomId || !groupChatHostedGateway(room)) {
@@ -1623,17 +1684,93 @@ export async function sendHostedGroupChat(group: string, message: GroupMessage, 
     throw new Error(botsText().group.hostRouteMissing)
   }
 
-  return enqueueHostedRoomCommand({
-    commandId: String(message.id || ''),
-    kind: 'send',
+  const commandId = String(message.id || '')
+
+  const attachments = Array.isArray(message.images)
+    ? message.images.filter((attachment): attachment is Attachment => Boolean(attachment?.data))
+    : []
+
+  if (attachments.length) {
+    const parity = await probeHostedRoomMembers(room.members || [])
+
+    if (!route || !parity.attachmentParity) {
+      throw new Error(
+        botsText().group.hostedAttachmentMemberUnavailable(parity.attachmentUnavailableMembers.join(', '))
+      )
+    }
+  }
+
+  const manifest = attachments.length
+    ? await stageHostedMessageAttachments(requestHostedConnection, route as ProfileRoute, room.roomId, attachments)
+    : []
+
+  return {
+    commandId,
+    kind: 'send' as const,
     roomId: room.roomId,
     authorityId: groupChatHostedGateway(room),
     connectionId,
     payload: {
       text: message.text || '',
-      thread_id: thread
+      thread_id: thread,
+      ...(manifest.length ? { attachments: manifest } : {})
     }
+  }
+}
+
+export async function queueHostedGroupChat(group: string, message: GroupMessage, thread: string) {
+  const roomId = String($groupChats.get()[group]?.roomId || '')
+
+  await withHostedRoomCommandOrder(roomId, async () => {
+    const command = await hostedGroupChatSendCommand(group, message, thread)
+
+    await transitionHostedRoomOutbox({ type: 'enqueue', command })
   })
+  await dispatchHostedRoomOutbox()
+
+  if (await consumeImmediateHostedRoomCommandFailure(message.id)) {
+    throw new Error(botsText().group.hostRejectedCommand)
+  }
+
+  const pending = $hostedRoomOutbox.get().commands.find(entry => entry.commandId === message.id)
+
+  scheduleHostedRoomSync(0)
+
+  return !pending
+}
+
+export async function sendHostedGroupChat(group: string, message: GroupMessage, thread: string) {
+  const roomId = String($groupChats.get()[group]?.roomId || '')
+  let command: Partial<HostedRoomCommand> = {}
+
+  await withHostedRoomCommandOrder(roomId, async () => {
+    command = await hostedGroupChatSendCommand(group, message, thread)
+    await transitionHostedRoomOutbox({ type: 'enqueue', command })
+  })
+  await dispatchHostedRoomOutbox()
+
+  if (await consumeImmediateHostedRoomCommandFailure(command.commandId)) {
+    throw new Error(botsText().group.hostRejectedCommand)
+  }
+
+  const pending = $hostedRoomOutbox.get().commands.find(entry => entry.commandId === command.commandId)
+
+  scheduleHostedRoomSync(0)
+
+  return !pending
+}
+
+export async function readHostedGroupChatAttachment(group: string, message: GroupMessage, attachment: Attachment) {
+  const room = $groupChats.get()[group]
+  const route = room ? await hostedRouteForRoom(room) : null
+  const roomId = String(room?.roomId || '')
+  const eventId = String(message.eventId || message.id || '')
+
+  if (!roomId || !route) {
+    throw new Error('This Group Chat attachment is unavailable.')
+  }
+
+  return readHostedMessageAttachment(requestHostedConnection, route, roomId, eventId, attachment)
 }
 
 export async function stopHostedGroupChat(group: string) {
@@ -1698,6 +1835,33 @@ export async function retryHostedRoomReplay(group: string) {
   scheduleHostedRoomSync(0)
 
   return true
+}
+
+export async function retryFailedHostedRoomCommand(group: string, commandId: string) {
+  const room = $groupChats.get()[group]
+  const failed = failedHostedRoomCommand($hostedRoomOutbox.get(), String(room?.roomId || ''))
+
+  if (!room || !failed || failed.commandId !== String(commandId || '')) {
+    return false
+  }
+
+  await transitionHostedRoomOutbox({ type: 'retry', commandId: failed.commandId })
+  updateGroupChat(
+    group,
+    current => ({
+      ...current,
+      hostedStatus: {
+        state: 'queued',
+        label: botsText().group.hostedQueued(sourceLabel(current.hostedConnectionId || ''))
+      },
+      continuityIssue: null
+    }),
+    { sync: false }
+  )
+  await dispatchHostedRoomOutbox()
+  scheduleHostedRoomSync(0)
+
+  return !failedHostedRoomCommand($hostedRoomOutbox.get(), failed.roomId)
 }
 
 export async function renameHostedGroupChat(group: string, name: string) {
@@ -1801,7 +1965,6 @@ export function stopHostedRoomRuntime() {
   stopHostedRoomCleanup()
   hostedRoomStorage = null
   hostedRoomHooks = {}
-  hostedAuthorityRoutes.clear()
   hostedRoomPollCache.clear()
   hostedRoomPollGenerations.clear()
   hostedRoomMutationGenerations.clear()
@@ -1820,9 +1983,10 @@ export function stopHostedRoomRuntime() {
 export function resetHostedRoomRuntimeForTests() {
   stopHostedRoomRuntime()
   hostedRoomSyncRunning = false
-  hostedOutboxDispatching = false
+  hostedOutboxDispatchPromise = null
   resetHostedRoomOutboxLocksForTests()
   resetHostedRoomCleanupForTests()
+  resetHostedRoomApprovalState()
   $hostedRoomCapabilities.set({})
   $hostedRoomOutbox.set(createHostedRoomOutbox())
 }

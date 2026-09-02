@@ -66,6 +66,7 @@ const roster: RosterRow[] = [
 
 const eligibleProbe: HostedRoomProbe = {
   attachmentParity: true,
+  attachmentUnavailableMembers: [],
   eligible: true,
   capability: {
     authorityId: 'install:studio',

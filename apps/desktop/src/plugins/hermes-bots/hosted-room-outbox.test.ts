@@ -1,4 +1,8 @@
 import type { PluginContext } from '@hermes/plugin-sdk'
+
+const { notify } = vi.hoisted(() => ({ notify: vi.fn() }))
+
+vi.mock('@hermes/plugin-sdk', () => ({ host: { notify } }))
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 interface TestLockManager {
@@ -51,6 +55,7 @@ function command(commandId: string) {
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.resetModules()
+  notify.mockReset()
 })
 
 describe('hosted Group Chat outbox persistence', () => {
@@ -116,5 +121,33 @@ describe('hosted Group Chat outbox persistence', () => {
     await expect(outbox.recoverHostedRoomOutbox(storage)).resolves.toMatchObject({
       commands: [{ commandId: 'send-a', status: 'pending' }]
     })
+  })
+
+  it('quarantines one corrupt row while preserving the valid queue', async () => {
+    const values = new Map<string, unknown>([
+      [
+        'hosted-room-outbox-v1',
+        {
+          commands: [
+            { ...command('send-a'), status: 'pending' },
+            { commandId: '', kind: 'send', roomId: 'room-1' },
+            { ...command('send-b'), status: 'pending' },
+            { ...command('send-c'), roomId: 'room-2', status: 'pending' }
+          ],
+          version: 1
+        }
+      ]
+    ])
+
+    const outbox = await import('./hosted-room-outbox')
+    const storage = storageFor(values)
+
+    await expect(outbox.readHostedRoomOutbox(storage)).resolves.toMatchObject({
+      commands: [{ commandId: 'send-a' }, { commandId: 'send-c', roomId: 'room-2' }]
+    })
+    expect(values.get('hosted-room-outbox-v1')).toMatchObject({
+      commands: [{ commandId: 'send-a' }, { commandId: 'send-c', roomId: 'room-2' }]
+    })
+    expect(notify).toHaveBeenCalledTimes(1)
   })
 })

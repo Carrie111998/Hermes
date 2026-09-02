@@ -167,6 +167,8 @@ type BotsMessages = {
     deleteAction: string
     composerPlaceholder: string
     attachHint: string
+    downloadAttachment: string
+    attachmentDownloadFailed: string
     newThread: string
     reply: string
     replyInThread: string
@@ -192,7 +194,7 @@ type BotsMessages = {
     pickAtLeastTwo: string
     thisHost: string
     hostedFallbackToDesktop: (host: string) => string
-    hostedAttachmentsUnavailable: string
+    hostedAttachmentMemberUnavailable: (members: string) => string
     hostedSending: string
     hostedWorking: string
     hostedQueued: (host: string) => string
@@ -233,6 +235,9 @@ type BotsMessages = {
     memberCouldNotRespond: (member: string) => string
     memberRetryWhenOnline: (member: string) => string
     desktopStorageUnavailable: string
+    hostedQueueRepaired: (count: number) => string
+    hostedApprovalFailed: string
+    hostedApprovalRetry: string
     hostRejectedCommand: string
     nameTaken: (name: string) => string
     memberCount: (count: number) => string
@@ -443,6 +448,8 @@ const en: BotsMessages = {
     deleteAction: 'Delete',
     composerPlaceholder: 'Say something — every bot in this group hears the room.',
     attachHint: 'Attach files — every responding bot sees them',
+    downloadAttachment: 'Download attachment',
+    attachmentDownloadFailed: 'This attachment could not be downloaded.',
     newThread: 'New Thread',
     reply: 'Reply',
     replyInThread: 'Reply in thread',
@@ -468,7 +475,8 @@ const en: BotsMessages = {
     pickAtLeastTwo: 'Pick at least 2 bots',
     thisHost: 'this device',
     hostedFallbackToDesktop: host => `${host} can't keep this Group Chat running yet. Keep Desktop open.`,
-    hostedAttachmentsUnavailable: 'Attachments need Desktop mode for now.',
+    hostedAttachmentMemberUnavailable: members =>
+      `Files cannot reach ${members || 'every Bot'} right now. Check the affected gateway connection and try again.`,
     hostedSending: 'Sending…',
     hostedWorking: 'Working',
     hostedQueued: host => `Waiting for ${host}`,
@@ -509,6 +517,10 @@ const en: BotsMessages = {
     memberCouldNotRespond: member => `${member} could not respond.`,
     memberRetryWhenOnline: member => `${member} will retry when online.`,
     desktopStorageUnavailable: 'Desktop could not save this action. Try again.',
+    hostedQueueRepaired: count =>
+      `${count} damaged pending Group Chat ${count === 1 ? 'change was' : 'changes were'} removed; the rest were kept.`,
+    hostedApprovalFailed: 'This approval is no longer available. Refresh the Group Chat and try again.',
+    hostedApprovalRetry: 'Could not send this approval. Check the gateway connection and try again.',
     hostRejectedCommand: 'The connected device rejected this action.',
     nameTaken: name => `A group named “${name}” already exists.`,
     memberCount: count => `${count} bots`,
@@ -712,6 +724,8 @@ const ja: BotsMessages = {
     deleteAction: '削除',
     composerPlaceholder: '何か書いてください — このグループのすべてのボットが部屋の内容を受け取ります。',
     attachHint: 'ファイルを添付 — 応答するすべてのボットが見ます',
+    downloadAttachment: '添付ファイルをダウンロード',
+    attachmentDownloadFailed: 'この添付ファイルをダウンロードできませんでした。',
     newThread: '新しいスレッド',
     reply: '返信',
     replyInThread: 'スレッドで返信',
@@ -738,7 +752,8 @@ const ja: BotsMessages = {
     thisHost: 'このデバイス',
     hostedFallbackToDesktop: host =>
       `${host} ではまだこのグループチャットを継続できません。Desktopを開いたままにしてください。`,
-    hostedAttachmentsUnavailable: '現在、添付ファイルにはDesktopモードが必要です。',
+    hostedAttachmentMemberUnavailable: members =>
+      `${members || '一部のボット'} にファイルを届けられません。該当するゲートウェイ接続を確認して、もう一度お試しください。`,
     hostedSending: '送信中…',
     hostedWorking: '作業中',
     hostedQueued: host => `${host} を待っています`,
@@ -779,6 +794,9 @@ const ja: BotsMessages = {
     memberCouldNotRespond: member => `${member} は応答できませんでした。`,
     memberRetryWhenOnline: member => `${member} はオンラインになると再試行します。`,
     desktopStorageUnavailable: 'Desktopでこの操作を保存できませんでした。もう一度お試しください。',
+    hostedQueueRepaired: count => `破損した保留中のグループチャット変更 ${count} 件を削除し、残りは保持しました。`,
+    hostedApprovalFailed: 'この承認は利用できなくなりました。グループチャットを更新して、もう一度お試しください。',
+    hostedApprovalRetry: 'この承認を送信できませんでした。ゲートウェイ接続を確認して、もう一度お試しください。',
     hostRejectedCommand: '接続先がこの操作を拒否しました。',
     nameTaken: name => `「${name}」という名前のグループはすでに存在します。`,
     memberCount: count => `ボット${count}体`,
@@ -978,6 +996,8 @@ const zh: BotsMessages = {
     deleteAction: '删除',
     composerPlaceholder: '说点什么 — 这个群里的每个机器人都会听到。',
     attachHint: '附加文件 — 每个回应的机器人都能看到',
+    downloadAttachment: '下载附件',
+    attachmentDownloadFailed: '无法下载此附件。',
     newThread: '新帖子',
     reply: '回复',
     replyInThread: '在帖子中回复',
@@ -1003,7 +1023,8 @@ const zh: BotsMessages = {
     pickAtLeastTwo: '请至少选择 2 个机器人',
     thisHost: '此设备',
     hostedFallbackToDesktop: host => `${host} 暂时无法保持此群聊运行。请保持 Desktop 打开。`,
-    hostedAttachmentsUnavailable: '附件目前需要 Desktop 模式。',
+    hostedAttachmentMemberUnavailable: members =>
+      `文件目前无法送达${members || '所有机器人'}。请检查受影响的网关连接后重试。`,
     hostedSending: '正在发送…',
     hostedWorking: '正在工作',
     hostedQueued: host => `正在等待 ${host}`,
@@ -1044,6 +1065,9 @@ const zh: BotsMessages = {
     memberCouldNotRespond: member => `${member} 无法回复。`,
     memberRetryWhenOnline: member => `${member} 上线后将重试。`,
     desktopStorageUnavailable: 'Desktop 无法保存此操作。请重试。',
+    hostedQueueRepaired: count => `已移除 ${count} 个损坏的待处理群聊更改，其余更改已保留。`,
+    hostedApprovalFailed: '此审批已不可用。请刷新群聊后重试。',
+    hostedApprovalRetry: '无法发送此审批。请检查网关连接后重试。',
     hostRejectedCommand: '连接的设备拒绝了此操作。',
     nameTaken: name => `已存在名为“${name}”的群聊。`,
     memberCount: count => `${count} 个机器人`,
@@ -1243,6 +1267,8 @@ const zhHant: BotsMessages = {
     deleteAction: '刪除',
     composerPlaceholder: '說點什麼 — 這個群組裡的每個機器人都會聽到。',
     attachHint: '附加檔案 — 每個回應的機器人都能看到',
+    downloadAttachment: '下載附件',
+    attachmentDownloadFailed: '無法下載此附件。',
     newThread: '新討論串',
     reply: '回覆',
     replyInThread: '在討論串中回覆',
@@ -1268,7 +1294,8 @@ const zhHant: BotsMessages = {
     pickAtLeastTwo: '請至少選擇 2 個機器人',
     thisHost: '此裝置',
     hostedFallbackToDesktop: host => `${host} 暫時無法保持此群組聊天運作。請保持 Desktop 開啟。`,
-    hostedAttachmentsUnavailable: '附件目前需要 Desktop 模式。',
+    hostedAttachmentMemberUnavailable: members =>
+      `檔案目前無法送達${members || '所有機器人'}。請檢查受影響的閘道連線後再試一次。`,
     hostedSending: '正在傳送…',
     hostedWorking: '正在工作',
     hostedQueued: host => `正在等待 ${host}`,
@@ -1309,6 +1336,9 @@ const zhHant: BotsMessages = {
     memberCouldNotRespond: member => `${member} 無法回覆。`,
     memberRetryWhenOnline: member => `${member} 上線後將重試。`,
     desktopStorageUnavailable: 'Desktop 無法儲存此操作。請再試一次。',
+    hostedQueueRepaired: count => `已移除 ${count} 個損壞的待處理群組聊天變更，其餘變更已保留。`,
+    hostedApprovalFailed: '此核准已無法使用。請重新整理群組聊天後再試一次。',
+    hostedApprovalRetry: '無法傳送此核准。請檢查閘道連線後再試一次。',
     hostRejectedCommand: '已連接的裝置拒絕了此操作。',
     nameTaken: name => `已存在名為「${name}」的群組聊天。`,
     memberCount: count => `${count} 個機器人`,
