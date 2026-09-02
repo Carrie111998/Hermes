@@ -1179,6 +1179,15 @@ gateway:
   # if an agent has not unwound. Keep it below the service-manager stop budget.
   # signal_interrupt_grace_timeout: 1
 
+  # Inbound voice-note routing:
+  #   auto   = send audio natively when the active model supports it;
+  #            otherwise use the configured STT provider (default)
+  #   native = prefer native audio regardless of capability metadata
+  #   stt    = always transcribe before invoking the model
+  # If a native attachment cannot be read, encoded, or transcoded safely,
+  # Hermes falls back to STT for that attachment instead of dropping it.
+  audio_mode: auto
+
 # =============================================================================
 # Toolsets
 # =============================================================================

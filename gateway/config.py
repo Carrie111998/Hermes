@@ -257,6 +257,15 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     return default
 
 
+def _normalize_audio_mode(value: Any, default: str = "auto") -> str:
+    """Normalize inbound voice routing to auto, native, or STT."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"auto", "native", "stt"}:
+            return normalized
+    return default
+
+
 def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     """Normalize notice delivery mode to a supported value."""
     if isinstance(value, str):
@@ -966,6 +975,9 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
+    # auto uses model capabilities; native or stt forces the preferred path.
+    # Native payload-construction failures still fall back to STT.
+    audio_mode: str = "auto"
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -1148,6 +1160,7 @@ class GatewayConfig:
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
+            "audio_mode": self.audio_mode,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -1217,11 +1230,17 @@ class GatewayConfig:
                 else None
             )
 
+        raw_gateway = data.get("gateway")
+        nested_gateway = raw_gateway if isinstance(raw_gateway, dict) else {}
+        audio_mode = _normalize_audio_mode(
+            data.get("audio_mode")
+            if "audio_mode" in data
+            else nested_gateway.get("audio_mode")
+        )
+
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
-        raw_gateway = data.get("gateway")
-        nested_gateway = raw_gateway if isinstance(raw_gateway, dict) else {}
         if "multiplex_profile_allowlist" in data:
             multiplex_profile_allowlist = data.get("multiplex_profile_allowlist")
         else:
@@ -1333,6 +1352,7 @@ class GatewayConfig:
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
+            audio_mode=audio_mode,
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
@@ -1465,6 +1485,13 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["stt_echo_transcripts"] = yaml_cfg["stt_echo_transcripts"]
             elif isinstance(gateway_section, dict) and "stt_echo_transcripts" in gateway_section:
                 gw_data["stt_echo_transcripts"] = gateway_section["stt_echo_transcripts"]
+
+            # Canonical user surface is gateway.audio_mode. Preserve the
+            # original top-level compatibility form with top-level precedence.
+            if "audio_mode" in yaml_cfg:
+                gw_data["audio_mode"] = yaml_cfg["audio_mode"]
+            elif isinstance(gateway_section, dict) and "audio_mode" in gateway_section:
+                gw_data["audio_mode"] = gateway_section["audio_mode"]
 
             gateway_cfg = yaml_cfg.get("gateway")
 

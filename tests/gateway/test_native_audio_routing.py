@@ -4,7 +4,7 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -84,6 +84,20 @@ def test_audio_routing_uses_native_only_for_audio_capable_model(monkeypatch):
         == "stt"
     )
 
+    # The DEFAULT_CONFIG-merged gateway.audio_mode="auto" must not mask the
+    # compatibility top-level form when both keys are present.
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="google/gemini-test",
+            user_config={
+                "audio_mode": "stt",
+                "gateway": {"audio_mode": "auto"},
+            },
+        )
+        == "stt"
+    )
+
 
 @pytest.mark.asyncio
 async def test_voice_message_stages_native_audio_without_stt(tmp_path):
@@ -133,6 +147,7 @@ class _CaptureAgent:
     def __init__(self, **kwargs):
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.provider = kwargs.get("provider", "")
 
     def run_conversation(self, message, **kwargs):
         type(self).calls.append((message, kwargs))
@@ -217,6 +232,200 @@ async def test_agent_pipeline_sends_input_audio_and_persists_compact_marker(
     assert audio_part["input_audio"]["format"] == "ogg"
     assert kwargs["persist_user_message"] == "[Voice message attached natively]"
     assert runner._consume_pending_native_audio_attachments(session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_pipeline_falls_back_to_stt_when_native_audio_is_rejected(
+    monkeypatch,
+    tmp_path,
+):
+    _CaptureAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *_, **__: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    media_routing = importlib.import_module("agent.media_routing")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***", "provider": "openai"},
+    )
+    monkeypatch.setattr(
+        media_routing,
+        "transcode_audio_to_supported_format",
+        lambda *_args, **_kwargs: None,
+    )
+
+    runner = _pipeline_runner()
+    runner._enrich_message_with_transcription = AsyncMock(
+        return_value=('"fallback transcript"', ["fallback transcript"])
+    )
+    source = _source()
+    session_key = build_session_key(source)
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"OggS-test-audio")
+    runner._session_state(session_key).persistent.native_audio_attachments = [
+        {
+            "path": str(audio_path),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        }
+    ]
+
+    result = await runner._run_agent(
+        message="",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-native-stt-fallback",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    message, kwargs = _CaptureAgent.calls[0]
+    assert message == '"fallback transcript"'
+    assert kwargs.get("persist_user_message") is None
+    runner._enrich_message_with_transcription.assert_awaited_once_with(
+        "",
+        [str(audio_path)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_native_audio_failure_transcribes_only_rejected_clip(
+    monkeypatch,
+    tmp_path,
+):
+    _CaptureAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *_, **__: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    media_routing = importlib.import_module("agent.media_routing")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***", "provider": "openai"},
+    )
+    monkeypatch.setattr(
+        media_routing,
+        "transcode_audio_to_supported_format",
+        lambda *_args, **_kwargs: None,
+    )
+
+    runner = _pipeline_runner()
+    runner._enrich_message_with_transcription = AsyncMock(
+        return_value=('"second clip transcript"', ["second clip transcript"])
+    )
+    source = _source()
+    session_key = build_session_key(source)
+    native_path = tmp_path / "first.mp3"
+    native_path.write_bytes(b"ID3-native-audio")
+    rejected_path = tmp_path / "second.ogg"
+    rejected_path.write_bytes(b"OggS-rejected-audio")
+    runner._session_state(session_key).persistent.native_audio_attachments = [
+        {
+            "path": str(native_path),
+            "mime_type": "audio/mpeg",
+            "modality": "audio",
+        },
+        {
+            "path": str(rejected_path),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        },
+    ]
+
+    result = await runner._run_agent(
+        message="",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-partial-native-stt-fallback",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    message, kwargs = _CaptureAgent.calls[0]
+    assert isinstance(message, list)
+    assert sum(part.get("type") == "input_audio" for part in message) == 1
+    text_part = next(part for part in message if part.get("type") == "text")
+    assert '"second clip transcript"' in text_part["text"]
+    assert kwargs["persist_user_message"] == (
+        '"second clip transcript"\n\n[Voice message attached natively]'
+    )
+    runner._enrich_message_with_transcription.assert_awaited_once_with(
+        "",
+        [str(rejected_path)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_audio_stt_fallback_echoes_each_transcript_once():
+    runner = _bare_runner()
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._thread_metadata_for_source = lambda *_args: {"thread_id": "topic-1"}
+    runner._enrich_message_with_transcription = AsyncMock(
+        return_value=('"one"\n\n"two"', ["one", "two"])
+    )
+
+    fallback_text = await runner._transcribe_native_audio_fallback(
+        ["one.ogg", "two.ogg"],
+        source=_source(),
+        reply_to_message_id="reply-1",
+    )
+
+    assert fallback_text == '"one"\n\n"two"'
+    assert adapter.send.await_count == 2
+    assert [call.args[1] for call in adapter.send.await_args_list] == [
+        '🎙️ "one"',
+        '🎙️ "two"',
+    ]
+    assert all(
+        call.kwargs["metadata"] == {"thread_id": "topic-1"}
+        for call in adapter.send.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_audio_fallback_remains_nonempty_when_stt_is_disabled(
+    monkeypatch,
+    tmp_path,
+):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_probe_audio_duration",
+        AsyncMock(return_value=None),
+    )
+    runner = _bare_runner()
+    runner.config.stt_enabled = False
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"OggS-test-audio")
+
+    fallback_text = await runner._transcribe_native_audio_fallback(
+        [str(audio_path)],
+        source=_source(),
+    )
+
+    assert fallback_text.strip()
+    assert "The user sent a voice message" in fallback_text
+    assert str(audio_path.resolve()) in fallback_text
 
 
 def test_audio_routing_forces_stt_for_meta_and_muse_spark(monkeypatch):
@@ -352,6 +561,9 @@ async def test_agent_pipeline_falls_back_to_native_image_when_all_audio_is_skipp
     )
 
     runner = _pipeline_runner()
+    runner._enrich_message_with_transcription = AsyncMock(
+        return_value=('"fallback transcript"', ["fallback transcript"])
+    )
     source = _source()
     session_key = build_session_key(source)
     image_path = tmp_path / "photo.png"
@@ -379,4 +591,6 @@ async def test_agent_pipeline_falls_back_to_native_image_when_all_audio_is_skipp
     assert isinstance(message, list)
     assert any(part.get("type") == "image_url" for part in message)
     assert not any(part.get("type") == "input_audio" for part in message)
+    text_part = next(part for part in message if part.get("type") == "text")
+    assert '"fallback transcript"' in text_part["text"]
     assert kwargs.get("persist_user_message") is None
