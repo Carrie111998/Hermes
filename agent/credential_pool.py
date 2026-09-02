@@ -146,6 +146,11 @@ EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60   # 1 minute
 # the classifier), so the value is duplicated here rather than referenced.
 FAILURE_REASON_BILLING = "billing"
 
+# An explicit per-credential spend cap. Like billing exhaustion, retrying the
+# same key after a minute cannot help; unlike billing, it must not be surfaced
+# as evidence that the account itself is out of credits.
+FAILURE_REASON_KEY_LIMIT = "key_limit"
+
 # Billing verdict that rests on an ambiguous body (#82154): Anthropic's
 # "out of extra usage" 400 is returned both for genuine overage depletion and
 # for a server-side content-filter rejection of the request. The latter leaves
@@ -342,8 +347,8 @@ def _exhausted_ttl(
     *failure_reason* is the classified semantics from
     ``agent/error_classifier.py``. The raw status alone can't size the
     cooldown: an OpenRouter ``key limit exceeded`` and an xAI spending-limit
-    block both arrive as **403** but classify as ``billing``, and a 60s retry
-    on a spent account just re-fails every minute. Billing keeps the full
+    block both arrive as **403**, and a 60s retry against either exhausted
+    capacity just fails again. Billing and explicit key limits keep the full
     bench regardless of status; 402 does too, since it is billing by
     definition even when nothing classified it.
     """
@@ -363,8 +368,11 @@ def _exhausted_ttl(
     # edge-throttle, 5xx server, or unknown). Billing exhaustion — whether
     # classified as such or self-evident from a 402 — is a genuine depletion
     # where a quick retry can't help, so it keeps the full bench.
-    is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
-    if sole_credential and not is_billing:
+    is_capacity_exhausted = error_code == 402 or failure_reason in {
+        FAILURE_REASON_BILLING,
+        FAILURE_REASON_KEY_LIMIT,
+    }
+    if sole_credential and not is_capacity_exhausted:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     return base
 

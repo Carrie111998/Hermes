@@ -64,6 +64,15 @@ def test_result_billing_reason_without_block():
     assert surface == {"layer": LAYER_BILLING, "code": "billing", "retryable": False}
 
 
+def test_result_key_limit_is_nonretryable_provider_capacity_not_billing():
+    surface = build_error_surface_from_result(_failed_result("key_limit"))
+    assert surface == {
+        "layer": LAYER_PROVIDER,
+        "code": "key_limit",
+        "retryable": False,
+    }
+
+
 def test_result_provider_default_for_classified_reasons():
     for reason in (
         "rate_limit",

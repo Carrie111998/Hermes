@@ -872,6 +872,62 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
     return f"Billing or credits exhausted: {summary}"
 
 
+def _key_limit_message(*, provider: str, model: str) -> str:
+    """Actionable guidance for an explicit per-credential spend cap."""
+    provider_label = (provider or "").strip() or "The selected provider"
+    model_label = (model or "").strip() or "the selected model"
+    lines = [
+        (
+            f"{provider_label} reported that the selected API key reached its "
+            f"configured spending limit for {model_label}. This does not mean "
+            "the provider account is out of credits."
+        ),
+        "Switch to another key or provider, raise the key limit, or wait for its configured reset.",
+    ]
+    if provider_label.lower() == "openrouter":
+        lines.append("Manage OpenRouter keys: https://openrouter.ai/settings/keys")
+    return "\n".join(lines)
+
+
+def _print_key_limit_guidance(agent, *, provider: str, model: str) -> bool:
+    message = _key_limit_message(provider=provider, model=model)
+    for line in message.splitlines():
+        agent._vprint(f"{agent.log_prefix}   💡 {line}", force=True)
+    return bool(message)
+
+
+def _key_limit_terminal_response(*, summary: str, provider: str, model: str) -> str:
+    """Build the canonical terminal response for a per-key spending cap."""
+    guidance = _key_limit_message(provider=provider, model=model)
+    return f"API key spending limit reached: {summary}\n\n{guidance}"
+
+
+def _key_limit_failure_result(
+    *,
+    classified,
+    summary: str,
+    messages,
+    api_call_count: int,
+    provider: str,
+    model: str,
+) -> dict:
+    """Structured terminal result for a per-credential spend-cap failure."""
+    return {
+        "final_response": _key_limit_terminal_response(
+            summary=summary,
+            provider=provider,
+            model=model,
+        ),
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "error": summary,
+        "failure_reason": classified.reason.value,
+        "failure_retryable": bool(classified.retryable),
+    }
+
+
 def _billing_failure_result(
     *,
     classified,
@@ -5915,6 +5971,7 @@ def run_conversation(
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
+                    FailoverReason.key_limit,
                     FailoverReason.upstream_rate_limit,
                 }
                 # Relay-wrapped output-cap errors: some gateways wrap an
@@ -5989,6 +6046,10 @@ def run_conversation(
                                 agent._buffer_status(
                                     "⚠️ Billing or credits exhausted — switching to fallback provider..."
                                 )
+                        elif classified.reason == FailoverReason.key_limit:
+                            agent._buffer_status(
+                                "⚠️ API key spending limit reached — switching to fallback provider..."
+                            )
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
@@ -6768,6 +6829,11 @@ def run_conversation(
                             f"❌ TLS certificate verification failed: "
                             f"{_nonretryable_summary}"
                         )
+                    elif classified.reason == FailoverReason.key_limit:
+                        agent._emit_status(
+                            f"❌ API key spending limit reached: "
+                            f"{_nonretryable_summary}"
+                        )
                     else:
                         agent._emit_status(
                             f"❌ Non-retryable error (HTTP {status_code}): "
@@ -6777,7 +6843,10 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
                     # Actionable guidance for common auth errors
-                    if classified.is_auth or classified.reason == FailoverReason.billing:
+                    if classified.is_auth or classified.reason in {
+                        FailoverReason.billing,
+                        FailoverReason.key_limit,
+                    }:
                         if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
                             agent,
                             capability="model access",
@@ -6785,6 +6854,12 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                             unverified=classified.billing_unverified,
+                        ):
+                            pass
+                        elif classified.reason == FailoverReason.key_limit and _print_key_limit_guidance(
+                            agent,
+                            provider=_provider,
+                            model=_model,
                         ):
                             pass
                         elif _provider == "nous" and _print_nous_entitlement_guidance(
@@ -6920,6 +6995,15 @@ def run_conversation(
                             base_url=_base,
                             model=_model,
                         )
+                    if classified.reason == FailoverReason.key_limit:
+                        return _key_limit_failure_result(
+                            classified=classified,
+                            summary=_nonretryable_summary,
+                            messages=messages,
+                            api_call_count=api_call_count,
+                            provider=_provider,
+                            model=_model,
+                        )
                     return {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
@@ -6985,6 +7069,15 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                             unverified=classified.billing_unverified,
+                        )
+                    elif classified.reason == FailoverReason.key_limit:
+                        agent._emit_status(
+                            f"❌ API key spending limit reached — {_final_summary}"
+                        )
+                        _print_key_limit_guidance(
+                            agent,
+                            provider=_provider,
+                            model=_model,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -7104,6 +7197,12 @@ def run_conversation(
                         _billing_block = _billing_block_dict(
                             _provider, _base, _model, _billing_guidance,
                             unverified=_billing_unverified,
+                        )
+                    elif classified.reason == FailoverReason.key_limit:
+                        _final_response = _key_limit_terminal_response(
+                            summary=_final_summary,
+                            provider=_provider,
+                            model=_model,
                         )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"

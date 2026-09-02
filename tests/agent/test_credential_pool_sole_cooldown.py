@@ -81,16 +81,27 @@ def test_sole_credential_403_recovers_after_short_cooldown(tmp_path, monkeypatch
 def test_sole_credential_billing_403_keeps_full_bench(tmp_path, monkeypatch):
     """A 403 classified as BILLING must keep the full bench, not the 60s cooldown.
 
-    Providers overload 403: OpenRouter returns it for `key limit exceeded` and
-    xAI for a spending-limit block, both of which `error_classifier` maps to
-    FailoverReason.billing. Status alone can't tell those from an edge
-    throttle, so retrying a spent account every 60s just re-fails forever.
+    Providers overload 403: xAI returns it for a spending-limit block, which
+    `error_classifier` maps to FailoverReason.billing. Status alone can't tell
+    that from an edge throttle, so retrying a spent account every 60s just
+    re-fails forever.
     The classified reason rides along on the entry and wins over the status.
     """
     pool = _load(
         tmp_path,
         monkeypatch,
         [_entry(403, age_seconds=90, failure_reason="billing")],
+    )
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
+def test_sole_credential_key_limit_403_keeps_full_bench(tmp_path, monkeypatch):
+    """A configured key cap must not be retried every minute."""
+    pool = _load(
+        tmp_path,
+        monkeypatch,
+        [_entry(403, age_seconds=90, failure_reason="key_limit")],
     )
     assert pool.has_available() is False
     assert pool.select() is None

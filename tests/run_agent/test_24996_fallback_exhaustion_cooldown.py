@@ -111,6 +111,25 @@ class TestExhaustionArmsCooldown:
         # ~60s past the frozen clock, far past the short exhaustion window.
         assert cooldown == frozen + 60
 
+    def test_key_limit_exhaustion_uses_capacity_cooldown(self):
+        """A per-key spend cap follows the established capacity fallback path."""
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        frozen = 1_000.0
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.key_limit) is True
+            assert agent._try_activate_fallback(reason=FailoverReason.key_limit) is False
+            cooldown = getattr(agent, "_rate_limited_until", 0)
+
+        assert cooldown == frozen + 60
+
     def test_cooldown_never_shrinks_existing_window(self):
         """If a longer cooldown is already armed, exhaustion must not reduce
         it (we take the max)."""

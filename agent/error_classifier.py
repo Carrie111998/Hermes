@@ -36,6 +36,7 @@ class FailoverReason(enum.Enum):
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
+    key_limit = "key_limit"              # Per-credential spend cap — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
@@ -1269,15 +1270,31 @@ def _classify_by_status(
             should_fallback=True,
         )
 
+    # OpenRouter's explicit per-key cap is credential capacity, not proof that
+    # the account balance is exhausted. The reported incident arrived as 403;
+    # current OpenRouter documentation groups key-credit exhaustion under 402.
+    # Handle both only for the provider's explicit marker so generic provider
+    # 402s retain their existing account-billing semantics.
+    if (
+        status_code in {402, 403}
+        and provider == "openrouter"
+        and "key limit exceeded" in error_msg
+    ):
+        return result_fn(
+            FailoverReason.key_limit,
+            retryable=False,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
     if status_code == 403:
-        # OpenRouter 403 "key limit exceeded" is actually billing. Other
-        # providers also use 403 for account-plan or credit exhaustion.
+
+        # Other providers also use 403 for account-plan or credit exhaustion.
         if (
             (
                 provider == "xai-oauth"
                 and error_code.lower() == _XAI_SPENDING_LIMIT_ERROR_CODE
             )
-            or "key limit exceeded" in error_msg
             or "spending limit" in error_msg
             or any(p in error_msg for p in _BILLING_PATTERNS)
         ):

@@ -71,6 +71,7 @@ _NON_RETRYABLE_REASONS = {
     "auth_permanent",
     "billing",
     "billing_unverified",
+    "key_limit",
     "content_policy_blocked",
     "provider_policy_blocked",
     "model_not_found",

@@ -56,7 +56,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "key_limit", "rate_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -203,6 +203,36 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
+
+    def test_openrouter_403_key_cap_is_not_account_billing(self):
+        e = MockAPIError(
+            "Key limit exceeded (daily limit)",
+            status_code=403,
+            body={"error": {"message": "Key limit exceeded (daily limit)"}},
+        )
+
+        result = classify_api_error(e, provider="OpenRouter", model="test/model")
+
+        assert result.reason == FailoverReason.key_limit
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_openrouter_402_key_cap_is_not_account_billing(self):
+        e = MockAPIError("Key limit exceeded", status_code=402)
+
+        result = classify_api_error(e, provider="openrouter")
+
+        assert result.reason == FailoverReason.key_limit
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+
+    def test_non_openrouter_403_key_phrase_does_not_invent_key_cap(self):
+        e = MockAPIError("API key limit exceeded", status_code=403)
+
+        result = classify_api_error(e, provider="custom")
+
+        assert result.reason == FailoverReason.auth
 
 
 
@@ -1578,5 +1608,3 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
-

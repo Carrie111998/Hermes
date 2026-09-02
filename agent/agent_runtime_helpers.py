@@ -1190,8 +1190,8 @@ def recover_with_credential_pool(
         if _credential_id:
             kwargs["credential_id"] = _credential_id
         # Hand the pool the classified semantics, not just the status. A
-        # billing 403 (OpenRouter "key limit exceeded", xAI spending limit)
-        # and an edge-throttle 403 are the same number but need opposite
+        # capacity 403 (OpenRouter key limit, xAI spending limit) and an
+        # edge-throttle 403 are the same number but need opposite
         # cooldowns — the pool can only tell them apart if we say which.
         # ``effective_reason`` is resolved below; this closure runs after.
         if effective_reason is not None:
@@ -1232,7 +1232,7 @@ def recover_with_credential_pool(
             )
         return False, has_retried_429
 
-    if effective_reason == FailoverReason.billing:
+    if effective_reason in {FailoverReason.billing, FailoverReason.key_limit}:
         rotate_status = status_code if status_code is not None else 402
         # Runtime credentials can be resolved by a separate pool instance,
         # leaving this recovery pool without ``current_id``. Match the key
@@ -1240,8 +1240,9 @@ def recover_with_credential_pool(
         next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
-                "Credential %s (billing) — rotated to pool entry %s",
+                "Credential %s (%s) — rotated to pool entry %s",
                 rotate_status,
+                effective_reason.value,
                 getattr(next_entry, "id", "?"),
             )
             agent._swap_credential(next_entry)
