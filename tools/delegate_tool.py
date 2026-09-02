@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import math
 import re
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,17 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit, urlunsplit
+from tools import delegate_inspect
+from tools.delegate_inspect import (
+    DelegateEvent,
+    SUBAGENT_INSPECT_EVENT_LIMIT as _SUBAGENT_INSPECT_EVENT_LIMIT,
+    _LEGACY_EVENT_MAP,
+    bind_registry as _bind_inspect_registry,
+    sanitize_input_summary as _sanitize_tool_input_summary,
+    sanitize_target as _sanitize_tool_target,
+    summarize_tool_arguments as _summarize_tool_arguments,
+    wrap_inspect_callback as _wrap_subagent_inspect_callback,
+)
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
@@ -151,6 +162,11 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+
+# The live inspect subsystem records through this same registry + lock; the
+# privacy boundary (URL sanitization), bounded event ring, and strict
+# serializer are owned by tools/delegate_inspect.py.
+_bind_inspect_registry(_active_subagents_lock, _active_subagents)
 
 # subagent_id -> {goal, delegation_id, parent_session_id} retained AFTER the
 # child finishes (bounded FIFO). Child-started background processes routinely
@@ -428,6 +444,8 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_transport",
                     "owner_session_record",
                     "accepting_steer",
+                    "_inspect_events",
+                    "_inspect_capture_errors",
                 }
             }
             for r in _active_subagents.values()
@@ -438,7 +456,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
     """True when *child_agent* sits below *parent_agent* in the spawn tree.
 
     Walks the ``_delegate_parent_ref`` weakref chain stamped at build time.
-    Identity comparison only — a parent may steer/stop its own children and
+    Identity comparison only — a parent may inspect/steer/stop its own children and
     grandchildren, never a sibling tree owned by another conversation.
     """
     if child_agent is None or parent_agent is None:
@@ -457,7 +475,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "inspect", "steer", "stop"})
 
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
@@ -526,7 +544,7 @@ def _handle_control_action(
     message: Optional[str],
     parent_agent: Any,
 ) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop.
+    """Synchronous control plane for delegate_task: list/inspect/steer/stop.
 
     Runs in-turn (never backgrounded) and only over subagents descended from
     *parent_agent* — the same registry the TUI overlay drives, but scoped so
@@ -570,7 +588,7 @@ def _handle_control_action(
             )
         return json.dumps(payload, ensure_ascii=False)
 
-    # steer / stop need a resolvable, owned target.
+    # inspect / steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()
     if not sid:
         return tool_error(
@@ -584,6 +602,86 @@ def _handle_control_action(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
             "may have already finished (its result arrives as a normal "
             "completion message). Use action='list' to see live children."
+        )
+
+    if action == "inspect":
+        # Copy only bounded model-safe registry metadata under the lock, then
+        # sample live agent activity outside it. This is a read-only control
+        # action; it never touches the child conversation or steer queue.
+        with _active_subagents_lock:
+            live_record = _active_subagents.get(sid)
+            if live_record is not record:
+                return tool_error(
+                    f"No live subagent '{sid}' in this conversation's spawn tree. It "
+                    "may have already finished (its result arrives as a normal "
+                    "completion message). Use action='list' to see live children."
+                )
+            agent = live_record.get("agent")
+            started = live_record.get("started_at")
+            base_snapshot = {
+                "subagent_id": sid,
+                "goal": live_record.get("goal"),
+                "model": live_record.get("model"),
+                "status": live_record.get("status"),
+                "started_at": started,
+                "accepting_steer": bool(live_record.get("accepting_steer", False)),
+                "last_tool": live_record.get("last_tool"),
+                "tool_count": live_record.get("tool_count", 0),
+                "capture_errors": live_record.get("_inspect_capture_errors", 0),
+                "recent_events": (
+                    list(live_record.get("_inspect_events", []))
+                    if isinstance(live_record.get("_inspect_events", []), list)
+                    else []
+                ),
+            }
+
+        activity_reader = getattr(agent, "get_activity_summary", None)
+        if not callable(activity_reader):
+            return tool_error(
+                f"Could not inspect '{sid}': live activity telemetry is unavailable. "
+                "Retry while the child is still live or use action='list'."
+            )
+        try:
+            activity_raw = activity_reader()
+        except Exception:
+            logger.debug(
+                "delegate_task inspect: activity read failed for %s",
+                sid,
+                exc_info=True,
+            )
+            return tool_error(
+                f"Could not inspect '{sid}': live activity telemetry is unavailable. "
+                "Retry while the child is still live or use action='list'."
+            )
+        if not isinstance(activity_raw, dict):
+            return tool_error(
+                f"Could not inspect '{sid}': live activity telemetry is unavailable. "
+                "Retry while the child is still live or use action='list'."
+            )
+
+        now = time.time()
+        # A child can finish or a public id can be replaced during sampling.
+        # Revalidate exact record identity + ownership before returning a live
+        # capability. Stale state fails closed instead of leaking old evidence.
+        if not _owns_subagent_record(record, parent_agent):
+            return tool_error(
+                f"No live subagent '{sid}' in this conversation's spawn tree. It "
+                "may have already finished (its result arrives as a normal "
+                "completion message). Use action='list' to see live children."
+            )
+        with _active_subagents_lock:
+            current_record = _active_subagents.get(sid)
+            if current_record is not record:
+                return tool_error(
+                    f"No live subagent '{sid}' in this conversation's spawn tree. It "
+                    "may have already finished (its result arrives as a normal "
+                    "completion message). Use action='list' to see live children."
+                )
+
+        # Strict serialization + counter normalization are owned by the
+        # inspect subsystem so the privacy boundary has a single module.
+        return delegate_inspect.serialize_inspect_response(
+            base_snapshot, agent, activity_raw, now=now
         )
 
     if action == "stop":
@@ -636,7 +734,9 @@ def _handle_control_action(
             "message; re-delegate a follow-up task if more work is needed."
         )
 
-    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+    return tool_error(
+        f"Unknown action '{action}'. Use spawn, list, inspect, steer, or stop."
+    )
 
 
 def _extract_output_tail(
@@ -722,99 +822,11 @@ def _stringify_tool_content(content: Any) -> str:
     return str(content)
 
 
-_TOOL_INPUT_TARGET_KEYS = frozenset({
-    "cwd",
-    "destination_path",
-    "directory",
-    "dst",
-    "endpoint",
-    "file_path",
-    "new_path",
-    "old_path",
-    "path",
-    "source_path",
-    "src",
-    "target_path",
-    "url",
-    "urls",
-})
-_TOOL_INPUT_URL_KEYS = frozenset({"endpoint", "url", "urls"})
-
-
-def _sanitize_tool_target(key: str, value: Any) -> Any:
-    """Keep bounded side-effect targets while dropping URL secrets."""
-    if isinstance(value, list):
-        cleaned = [
-            item for item in (_sanitize_tool_target(key, item) for item in value[:16])
-            if item is not None
-        ]
-        return cleaned or None
-    if not isinstance(value, str) or not value:
-        return None
-    bounded = value[:1024]
-    if key in _TOOL_INPUT_URL_KEYS:
-        try:
-            parsed = urlsplit(bounded)
-            if parsed.scheme and parsed.netloc:
-                hostname = parsed.hostname
-                if not hostname:
-                    return None
-                # ``SplitResult.netloc`` includes ``user:password@``. Rebuild
-                # the authority from parsed host/port so hook-visible history
-                # cannot carry URL credentials. Bracket IPv6 literals before
-                # appending a validated port.
-                host = f"[{hostname}]" if ":" in hostname else hostname
-                port = parsed.port
-                netloc = f"{host}:{port}" if port is not None else host
-                return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-        except ValueError:
-            return None
-    return bounded
-
-
-def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
-    """Summarize argument names and side-effect targets without raw payloads."""
-    if not isinstance(arguments, str):
-        return {"argument_keys": [], "targets": {}}
-    try:
-        parsed = json.loads(arguments)
-    except (TypeError, ValueError):
-        return {"argument_keys": [], "targets": {}}
-    if not isinstance(parsed, dict):
-        return {"argument_keys": [], "targets": {}}
-
-    keys = sorted(str(key)[:128] for key in parsed)[:64]
-    targets: Dict[str, Any] = {}
-    for raw_key, value in parsed.items():
-        key = str(raw_key).lower()
-        if key not in _TOOL_INPUT_TARGET_KEYS:
-            continue
-        cleaned = _sanitize_tool_target(key, value)
-        if cleaned is not None:
-            targets[key] = cleaned
-    return {"argument_keys": keys, "targets": targets}
-
-
-def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
-    if not isinstance(summary, dict):
-        return {"argument_keys": [], "targets": {}}
-    keys = summary.get("argument_keys")
-    safe_keys = (
-        [str(key)[:128] for key in keys[:64]]
-        if isinstance(keys, list)
-        else []
-    )
-    targets = summary.get("targets")
-    safe_targets: Dict[str, Any] = {}
-    if isinstance(targets, dict):
-        for raw_key, value in targets.items():
-            key = str(raw_key).lower()
-            if key not in _TOOL_INPUT_TARGET_KEYS:
-                continue
-            cleaned = _sanitize_tool_target(key, value)
-            if cleaned is not None:
-                safe_targets[key] = cleaned
-    return {"argument_keys": safe_keys, "targets": safe_targets}
+_record_subagent_tool_started = delegate_inspect.record_tool_started
+_record_subagent_inspect_capture_error = (
+    delegate_inspect.record_capture_error
+)
+_append_subagent_inspect_event = delegate_inspect.append_inspect_event
 
 
 def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
@@ -1190,36 +1202,8 @@ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 # ---------------------------------------------------------------------------
 
 
-class DelegateEvent(str, enum.Enum):
-    """Formal event types emitted during delegation progress.
-
-    _build_child_progress_callback normalises incoming legacy strings
-    (``tool.started``, ``_thinking``, …) to these enum values via
-    ``_LEGACY_EVENT_MAP``.  External consumers (gateway SSE, ACP adapter,
-    CLI) still receive the legacy strings during the deprecation window.
-
-    TASK_SPAWNED / TASK_COMPLETED / TASK_FAILED are reserved for
-    future orchestrator lifecycle events and are not currently emitted.
-    """
-
-    TASK_SPAWNED = "delegate.task_spawned"
-    TASK_PROGRESS = "delegate.task_progress"
-    TASK_COMPLETED = "delegate.task_completed"
-    TASK_FAILED = "delegate.task_failed"
-    TASK_THINKING = "delegate.task_thinking"
-    TASK_TOOL_STARTED = "delegate.tool_started"
-    TASK_TOOL_COMPLETED = "delegate.tool_completed"
-
-
-# Legacy event strings → DelegateEvent mapping.
-# Incoming child-agent events use the old names; the callback normalises them.
-_LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
-    "_thinking": DelegateEvent.TASK_THINKING,
-    "reasoning.available": DelegateEvent.TASK_THINKING,
-    "tool.started": DelegateEvent.TASK_TOOL_STARTED,
-    "tool.completed": DelegateEvent.TASK_TOOL_COMPLETED,
-    "subagent_progress": DelegateEvent.TASK_PROGRESS,
-}
+# DelegateEvent and _LEGACY_EVENT_MAP live in tools.delegate_inspect and are
+# re-exported above for backward compatibility (gateway SSE, ACP adapter, CLI).
 
 
 def check_delegate_requirements() -> bool:
@@ -1628,12 +1612,6 @@ def _build_child_progress_callback(
 
         # TASK_TOOL_STARTED — display and batch for parent relay
         _tool_count[0] += 1
-        if subagent_id is not None:
-            with _active_subagents_lock:
-                rec = _active_subagents.get(subagent_id)
-                if rec is not None:
-                    rec["tool_count"] = _tool_count[0]
-                    rec["last_tool"] = tool_name or ""
         if spinner:
             short = (
                 (preview[:35] + "...")
@@ -2814,9 +2792,11 @@ def _run_single_child(
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
+                "_inspect_events": [],
+                "_inspect_capture_errors": 0,
                 "agent": child,
                 # Durable conversation lineage for the model-facing control
-                # plane (list/steer/stop). The weakref identity chain breaks
+                # plane (list/inspect/steer/stop). The weakref identity chain breaks
                 # when the CLI rebuilds its AIAgent mid-session; this id is
                 # the same spine completion delivery routes by.
                 "owner_agent_session_id": _owner_agent_session_id or None,
@@ -2827,6 +2807,13 @@ def _run_single_child(
                 "owner_session_record": owner_session_record,
             }
         )
+        # Always install the model-safe telemetry tee after live registration.
+        # It wraps the existing live-transcript/display callback and preserves
+        # its _flush contract.
+        child_progress_cb = _wrap_subagent_inspect_callback(
+            child_progress_cb, _subagent_id
+        )
+        child.tool_progress_callback = child_progress_cb
 
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
@@ -3934,10 +3921,12 @@ def delegate_task(
       - Batch:  provide tasks array [{goal, context, role}, ...]
 
     Control modes (synchronous, never backgrounded):
-      - action='list'  -> live children of this conversation's spawn tree
-      - action='steer' -> queue course-correction text into a running child
-                          (subagent_id + message)
-      - action='stop'  -> interrupt a running child early (subagent_id)
+      - action='list'    -> live children of this conversation's spawn tree
+      - action='inspect' -> bounded operational evidence for one running child
+                            (subagent_id; no reasoning/raw transcript)
+      - action='steer'   -> queue course-correction text into a running child
+                            (subagent_id + message)
+      - action='stop'    -> interrupt a running child early (subagent_id)
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -3949,7 +3938,7 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # ── Control plane: list/steer/stop run synchronously and return here.
+    # ── Control plane: list/inspect/steer/stop run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.
     normalized_action = (action or "").strip().lower()
@@ -3959,7 +3948,7 @@ def delegate_task(
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn (default), list, inspect, steer, or stop."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -4648,9 +4637,10 @@ def delegate_task(
                 payload["control_hint"] = (
                     "While a child runs you can orchestrate it live with this "
                     "same tool: delegate_task(action='list') to see live "
-                    "children, action='steer' with subagent_id + message to "
-                    "redirect one, action='stop' with subagent_id to end one "
-                    "early."
+                    "children, action='inspect' with subagent_id to get a "
+                    "bounded operational snapshot, action='steer' with "
+                    "subagent_id + message to redirect one, action='stop' "
+                    "with subagent_id to end one early."
                 )
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
@@ -5118,11 +5108,15 @@ def _build_top_level_description() -> str:
         "you. Pass every task in `tasks` — one entry spawns one subagent, "
         "several run in parallel (limit in the tasks description).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message, "
+"transcript paths, and the completed result (one consolidated message, "
         "results in task order) re-enters the conversation on its own. Do NOT "
         "wait or poll; continue other work. While children run, `action` "
         "(list/steer/stop) controls them live — steer when a transcript shows "
         "a child drifting.\n\n"
+        "LIVE ORCHESTRATION: while children run: action='list' (ids), "
+        "action='inspect' (subagent_id; bounded sanitized activity snapshot), "
+        "action='steer' (subagent_id + message), action='stop' "
+        "(subagent_id; partial result returns). Inspect before steering.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -5279,22 +5273,28 @@ DELEGATE_TASK_SCHEMA = {
             # re-add to the schema.
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "inspect", "steer", "stop"],
                 "description": (
-                    "Default 'spawn'. Live control of running children: "
-                    "'list' = ids/goals/status/transcripts; 'steer' = queue "
-                    "course-correction text into one child (subagent_id + "
-                    "message) without stopping it; 'stop' = end one child "
-                    "early (subagent_id; partial result still returns). "
-                    "Control actions return immediately; goal/tasks are "
-                    "ignored unless spawning."
+"Default 'spawn' (omit for normal delegation). Live "
+                    "orchestration of running subagents: 'list' shows this "
+                    "conversation's live children (ids, goals, status, "
+                    "transcript paths); 'inspect' returns bounded liveness, "
+                    "usage, and sanitized recent tool metadata for one live "
+                    "child (requires subagent_id; no reasoning/raw transcript); "
+                    "'steer' queues course-correction text into one child "
+                    "(requires subagent_id + message) without stopping it; "
+                    "'stop' ends one child early (requires subagent_id) — its "
+                    "partial result still returns as a completion message. "
+                    "Control actions return immediately; "
+                    "goal/tasks are ignored when action is not 'spawn'."
                 ),
             },
             "subagent_id": {
                 "type": "string",
                 "description": (
-                    "Target for action='steer'/'stop' (ids from the spawn "
-                    "response or action='list')."
+"Target for action='inspect'/'steer'/'stop'. Ids are returned in the "
+                    "spawn dispatch response (subagent_ids) and by "
+                    "action='list'."
                 ),
             },
             "message": {
