@@ -4691,7 +4691,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     kwargs["limits"] = _pool_limits
                 return kwargs
 
-            disable_fallback = (
+            # Fallback IPs are specific to api.telegram.org. Applying that
+            # transport to a custom Bot API endpoint is both unnecessary and
+            # incorrect: the replacement endpoint has its own DNS/TLS identity.
+            # Custom-endpoint plugins may also provide a dedicated proxy env
+            # name so their traffic and credentials stay isolated.
+            disable_fallback = bool(custom_base_url) or (
                 os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "")
                 .strip()
                 .lower()
@@ -4732,8 +4737,20 @@ class TelegramAdapter(BasePlatformAdapter):
                         ", ".join(fallback_ips),
                     )
 
-            proxy_targets = ["api.telegram.org", *fallback_ips]
-            proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
+            if custom_base_url:
+                from urllib.parse import urlparse
+
+                custom_host = urlparse(str(custom_base_url)).hostname
+                proxy_targets = [custom_host] if custom_host else []
+            else:
+                proxy_targets = ["api.telegram.org", *fallback_ips]
+            proxy_env_var = str(
+                self.config.extra.get("proxy_env_var") or "TELEGRAM_PROXY"
+            )
+            proxy_url = resolve_proxy_url(
+                proxy_env_var,
+                target_hosts=proxy_targets,
+            )
             if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
