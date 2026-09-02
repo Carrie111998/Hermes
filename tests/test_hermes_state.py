@@ -1106,6 +1106,90 @@ class TestCounts:
         db.append_message("s1", role="assistant", content="Hi")
         assert db.message_count() == 2
 
+    def test_discard_observed_message_preserves_archived_rows_and_active_count(self, db):
+        db.create_session(session_id="s1", source="qqbot")
+        db.append_message("s1", role="user", content="active")
+        archived_id = db.append_message(
+            "s1",
+            role="user",
+            content="archived observation",
+            platform_message_id="msg-archived",
+            observed=True,
+        )
+        db._conn.execute(
+            "UPDATE messages SET active = 0, compacted = 1 WHERE id = ?",
+            (archived_id,),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET message_count = 1 WHERE id = ?",
+            ("s1",),
+        )
+        db._conn.commit()
+
+        assert db.discard_observed_platform_message("s1", "msg-archived") is True
+
+        session = db.get_session("s1")
+        active_count = db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+            ("s1",),
+        ).fetchone()[0]
+        total_count = db.message_count(session_id="s1")
+        assert session["message_count"] == 1
+        assert active_count == 1
+        assert total_count == 2
+
+    def test_discard_observed_message_rejects_active_foreign_turn_lease(self, db):
+        db.create_session(session_id="s1", source="qqbot")
+        db.append_message(
+            "s1",
+            role="user",
+            content="passive observation",
+            platform_message_id="msg-observed",
+            observed=True,
+        )
+        holder = f"pid={hermes_state.os.getpid()}:turn=foreign"
+        assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=5)
+
+        with pytest.raises(
+            hermes_state.SessionTurnLeaseLostError,
+            match="active turn lease",
+        ):
+            db.discard_observed_platform_message("s1", "msg-observed")
+
+        rows = db.get_messages("s1")
+        assert [row["platform_message_id"] for row in rows] == ["msg-observed"]
+        assert db.get_session("s1")["message_count"] == 1
+        db.release_session_turn_lease("s1", holder)
+
+    def test_discard_observed_message_rejects_active_compression_lock(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_S", 0.0)
+        db.create_session(session_id="s1", source="qqbot")
+        db.append_message(
+            "s1",
+            role="user",
+            content="passive observation",
+            platform_message_id="msg-observed",
+            observed=True,
+        )
+        compression_holder = (
+            f"pid={hermes_state.os.getpid()}:compression=foreign"
+        )
+        assert db.try_acquire_compression_lock(
+            "s1",
+            compression_holder,
+            ttl_seconds=60,
+        )
+
+        with pytest.raises(hermes_state.SessionCompressionInProgressError):
+            db.discard_observed_platform_message("s1", "msg-observed")
+
+        rows = db.get_messages("s1")
+        assert [row["platform_message_id"] for row in rows] == ["msg-observed"]
+        assert db.get_session("s1")["message_count"] == 1
+        db.release_compression_lock("s1", compression_holder)
+
 
 
 # =========================================================================

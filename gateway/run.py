@@ -1727,7 +1727,16 @@ def _build_replay_entry(
 
 
 _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_QQ_OBSERVED_CONTEXT_PROMPT_MARKER = "observed QQ group context"
+_YUANBAO_OBSERVED_CONTEXT_PROMPT_MARKER = (
+    "You are handling a Yuanbao group chat message"
+)
+_OBSERVED_GROUP_CONTEXT_PROMPT_MARKERS = (
+    _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER,
+    _QQ_OBSERVED_CONTEXT_PROMPT_MARKER,
+    _YUANBAO_OBSERVED_CONTEXT_PROMPT_MARKER,
+)
+_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed group context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
 
 
@@ -1743,6 +1752,14 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     """
 
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+
+
+def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True when a platform marks prior group chatter as context-only."""
+    return bool(
+        channel_prompt
+        and any(marker in channel_prompt for marker in _OBSERVED_GROUP_CONTEXT_PROMPT_MARKERS)
+    )
 
 
 def _csv_or_list_to_set(raw: Any) -> set[str]:
@@ -1820,7 +1837,7 @@ def _build_gateway_agent_history(
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
-    Observed Telegram group rows are returned as API-only context for the
+    Observed group rows are returned as API-only context for the
     current addressed message instead of being replayed as normal prior user
     turns.  Keeping that context out of ``conversation_history`` avoids
     consecutive-user repair merging it with the live user turn and then hiding
@@ -1839,7 +1856,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -1860,6 +1877,12 @@ def _build_gateway_agent_history(
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
+            continue
+        if msg.get("observed") and role == "user":
+            # Passive group chatter must never become a normal actionable user
+            # turn. If observation was later disabled (or the prompt marker is
+            # unavailable), drop the row entirely rather than replaying it as a
+            # request to the current addressed turn.
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -3013,6 +3036,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    resolve_session_isolation,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -7467,6 +7491,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._profile_configs: Dict[str, GatewayConfig] = {"default": self.config}
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            self._profile_configs[get_active_profile_name() or "default"] = self.config
+        except Exception:
+            logger.debug("could not register active profile config", exc_info=True)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -7506,10 +7537,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
         self.session_store = SessionStore(
-            self.config.sessions_dir, self.config,
+            self.config.sessions_dir,
+            self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            config_for_source_fn=self._session_config_for_source,
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
@@ -8429,6 +8462,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def exit_code(self) -> Optional[int]:
         return self._exit_code
 
+    def _session_config_for_source(
+        self, source: SessionSource
+    ) -> Optional[GatewayConfig]:
+        """Return the registered gateway config for ``source``'s profile.
+
+        Returning ``None`` for an unknown explicit profile is deliberate: key
+        derivation and ownership checks must fail closed rather than silently
+        applying the primary profile's isolation policy.
+        """
+        profile = str(getattr(source, "profile", "") or "").strip()
+        primary_config = getattr(self, "config", None)
+        if not profile:
+            return primary_config
+        configs = getattr(self, "_profile_configs", None)
+        if isinstance(configs, dict):
+            return configs.get(profile)
+        return primary_config if profile == "default" else None
+
+    def _quick_commands_for_source(self, source: SessionSource) -> Dict[str, Any]:
+        """Return only the quick commands registered for ``source``'s profile."""
+        config = self._session_config_for_source(source)
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            quick_commands = config.get("quick_commands", {}) or {}
+        else:
+            quick_commands = getattr(config, "quick_commands", {}) or {}
+        return quick_commands if isinstance(quick_commands, dict) else {}
+
+    def _build_session_context_for_source(
+        self,
+        source: SessionSource,
+        session_entry: Optional[SessionEntry] = None,
+    ) -> SessionContext:
+        """Build prompt context with the same profile config used for routing."""
+        config = self._session_config_for_source(source)
+        if config is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
+        return build_session_context(source, config, session_entry)
+
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
         if hasattr(self, "session_store") and self.session_store is not None:
@@ -8438,7 +8513,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return session_key
             except Exception:
                 pass
-        config = getattr(self, "config", None)
+        config = self._session_config_for_source(source)
+        if config is None:
+            # Preserve the pre-profile fallback for intentionally partial
+            # ``GatewayRunner.__new__`` fixtures. An explicit profile still
+            # fails closed; only an unprofiled source on a runner that has
+            # never been initialized may use the legacy defaults.
+            if source.profile:
+                raise RuntimeError(
+                    "no gateway config registered for session source profile "
+                    f"{source.profile!r}"
+                )
+            return build_session_key(
+                source,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+                profile=None,
+            )
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy
         # agent:main) unless multiplexing is on, then the active profile.
@@ -8452,10 +8543,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        group_per_user, thread_per_user = resolve_session_isolation(config, source)
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
             profile=_profile,
         )
 
@@ -14932,16 +15024,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"profile '{profile_name}' has no live adapters in this gateway"
                 )
             handoff_adapters = secondary
-            # The watcher already entered _profile_runtime_scope for this
-            # profile, so a fresh load resolves that profile's config.yaml
-            # and .env (home channel, tokens) rather than the primary's.
-            try:
-                handoff_config = load_gateway_config()
-            except Exception:
-                logger.warning(
-                    "Handoff: could not load config for profile %s; "
-                    "falling back to the primary's config",
-                    profile_name, exc_info=True,
+            profile_configs = getattr(self, "_profile_configs", None)
+            handoff_config = (
+                profile_configs.get(profile_name)
+                if isinstance(profile_configs, dict)
+                else None
+            )
+            if handoff_config is None:
+                raise RuntimeError(
+                    f"profile '{profile_name}' has no registered gateway config"
                 )
 
         # Adapter must be live. A relay-fronted gateway registers ONE adapter
@@ -15050,8 +15141,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # entry. For thread destinations build_session_key keys without
         # user_id (thread_sessions_per_user defaults to False) — so the
         # next real user message in the thread shares this same session.
-        platform_cfg = handoff_config.platforms.get(platform)
-        extra = platform_cfg.extra if platform_cfg else {}
+        group_per_user, thread_per_user = resolve_session_isolation(
+            handoff_config,
+            dest_source,
+        )
         # Namespace the key to the profile that queued this handoff. Without
         # it, a multiplexed gateway builds ``agent:main:...`` here while the
         # profile's own adapter routes real inbound messages on
@@ -15081,15 +15174,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Handoff: could not resolve profile namespace", exc_info=True)
         session_key = build_session_key(
             dest_source,
-            group_sessions_per_user=extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
             profile=handoff_profile,
         )
 
-        # Make sure there's an entry in the session_store for this key. If
-        # the home channel has never been used, get_or_create_session
-        # creates one; switch_session then re-points it.
-        await self.async_session_store.get_or_create_session(dest_source)
+        # Make sure there's an entry in the session_store for this source and
+        # switch the exact key the store created. The store is the single source
+        # of truth for profile-specific isolation; independently rebuilding the
+        # key here can diverge when a secondary profile overrides group/thread
+        # policy.
+        created_entry = await self.async_session_store.get_or_create_session(dest_source)
+        created_key = getattr(created_entry, "session_key", None)
+        if not isinstance(created_key, str) or not created_key:
+            raise RuntimeError("session store returned an entry without a session key")
+        if created_key != session_key:
+            logger.debug(
+                "Handoff: store-resolved key %s supersedes precomputed key %s",
+                created_key,
+                session_key,
+            )
+        session_key = created_key
 
         # Re-bind the destination key to the CLI session_id. switch_session
         # ends the prior session in SQLite and reopens the CLI session under
@@ -16843,6 +16948,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "for that profile, or change dm_policy/group_policy away from "
                 "'open'."
             )
+        profile_configs = getattr(self, "_profile_configs", None)
+        if not isinstance(profile_configs, dict):
+            profile_configs = {"default": self.config}
+            self._profile_configs = profile_configs
+        profile_configs[profile_name] = profile_cfg
 
         port_binding_platforms = sorted(
             platform.value
@@ -16876,7 +16986,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             try:
                 with _profile_runtime_scope(profile_home):
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_adapter(
+                        platform,
+                        platform_config,
+                        owner_config=profile_cfg,
+                    )
             except Exception as e:
                 logger.error(
                     "[MULTIPLEX] Profile '%s': _create_adapter('%s') raised %s",
@@ -17045,10 +17159,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     profile_home = get_profile_dir(profile_name)
                     with _profile_runtime_scope(profile_home):
-                        profile_config = load_gateway_config().platforms.get(platform)
+                        profile_gateway_config = load_gateway_config()
+                        profile_config = profile_gateway_config.platforms.get(platform)
                         if profile_config is None or not profile_config.enabled:
                             return
-                        adapter = self._create_adapter(platform, profile_config)
+                        adapter = self._create_adapter(
+                            platform,
+                            profile_config,
+                            owner_config=profile_gateway_config,
+                        )
                         if adapter is None:
                             logger.warning(
                                 "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
@@ -17548,23 +17667,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
-        self, 
-        platform: Platform, 
-        config: Any
+        self,
+        platform: Platform,
+        config: Any,
+        *,
+        owner_config: Optional[GatewayConfig] = None,
     ) -> Optional[BasePlatformAdapter]:
         """Create the appropriate adapter for a platform.
 
         Checks the platform_registry first (plugin adapters), then falls
         through to the built-in if/elif chain for core platforms.
         """
+        owning_config = owner_config or self.config
         if hasattr(config, "extra") and isinstance(config.extra, dict):
             config.extra.setdefault(
                 "group_sessions_per_user",
-                self.config.group_sessions_per_user,
+                owning_config.group_sessions_per_user,
             )
             config.extra.setdefault(
                 "thread_sessions_per_user",
-                getattr(self.config, "thread_sessions_per_user", False),
+                getattr(owning_config, "thread_sessions_per_user", False),
             )
 
         # ── Plugin-registered platforms (checked first) ───────────────────
@@ -19073,11 +19195,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Preserve built-in precedence; aliases only need early handling when
         # the typed command is not already known.
         if command and _cmd_def is None:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if isinstance(quick_commands, dict) and command in quick_commands:
+            quick_commands = self._quick_commands_for_source(source)
+            if command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "alias":
                     target = (qcmd.get("target") or "").strip()
@@ -19518,12 +19637,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if not isinstance(quick_commands, dict):
-                quick_commands = {}
+            quick_commands = self._quick_commands_for_source(source)
             if command in quick_commands:
                 # Quick commands are slash capabilities too — and type:exec
                 # ones run a shell command in the gateway process. The early
@@ -19965,8 +20079,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _pending_stt_prepared
             else event.text
         ) or ""
-        _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
-        _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
+        isolation_config = self._session_config_for_source(source)
+        if isolation_config is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
+        _group_sessions_per_user, _thread_sessions_per_user = resolve_session_isolation(
+            isolation_config,
+            source,
+        )
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back
         # to deriving it here for tests and legacy standalone callers.
@@ -20669,8 +20790,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
+            _platform_name,
+            source.user_name or source.user_id or "unknown",
+            source.chat_id or "unknown",
+            _msg_preview,
+            _reply_id,
+            _reply_txt,
         )
 
         # Get or create session
@@ -20837,8 +20962,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_key": session_key,
             })
         
-        # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        # Build session context with the same profile-specific isolation policy
+        # used by SessionStore and /resume ownership checks.
+        context = self._build_session_context_for_source(source, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -23455,7 +23581,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        config = self._session_config_for_source(source)
+        if config is None and source.profile:
+            logger.warning(
+                "Slash command /%s denied: no config registered for profile %r",
+                canonical_cmd,
+                source.profile,
+            )
+            return (
+                f"⛔ /{canonical_cmd} denied because this profile's "
+                "configuration is unavailable."
+            )
+        policy = _policy_for_source(config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(

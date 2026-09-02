@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -1075,6 +1075,27 @@ def is_shared_multi_user_session(
     return not group_sessions_per_user
 
 
+def resolve_session_isolation(
+    config: GatewayConfig,
+    source: SessionSource,
+) -> tuple[bool, bool]:
+    """Resolve group/thread isolation with optional per-platform overrides."""
+    group_per_user = getattr(config, "group_sessions_per_user", True)
+    thread_per_user = getattr(config, "thread_sessions_per_user", False)
+
+    platform_cfg = getattr(config, "platforms", {}).get(source.platform)
+    extra = getattr(platform_cfg, "extra", None)
+    if isinstance(extra, dict):
+        group_override = extra.get("group_sessions_per_user")
+        thread_override = extra.get("thread_sessions_per_user")
+        if isinstance(group_override, bool):
+            group_per_user = group_override
+        if isinstance(thread_override, bool):
+            thread_per_user = thread_override
+
+    return group_per_user, thread_per_user
+
+
 def _session_key_namespace(profile: Optional[str]) -> str:
     """Return the ``agent:<ns>`` namespace prefix for a session key.
 
@@ -1258,10 +1279,18 @@ class SessionStore:
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
     
-    def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+    def __init__(
+        self,
+        sessions_dir: Path,
+        config: GatewayConfig,
+        has_active_processes_fn=None,
+        config_for_source_fn: Optional[
+            Callable[[SessionSource], Optional[GatewayConfig]]
+        ] = None,
+    ):
         self.sessions_dir = sessions_dir
         self.config = config
+        self._config_for_source_fn = config_for_source_fn
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         # A fallback-only initial load must be reconciled with state.db after
@@ -2223,12 +2252,28 @@ class SessionStore:
 
         return recovered_profile == self._active_profile_name()
 
+    def _config_for_source(self, source: SessionSource) -> GatewayConfig:
+        """Return the profile-specific config used to derive ``source`` keys."""
+        if self._config_for_source_fn is None:
+            return self.config
+        resolved = self._config_for_source_fn(source)
+        if resolved is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
+        return resolved
+
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        config = self._config_for_source(source)
+        group_per_user, thread_per_user = resolve_session_isolation(
+            config,
+            source,
+        )
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
             profile=self._resolve_profile_for_key(source),
         )
 
@@ -2243,14 +2288,15 @@ class SessionStore:
         if source.platform != Platform.SLACK or not source.scope_id:
             return None
         legacy_source = replace(source, scope_id=None, guild_id=None)
+        config = self._config_for_source(source)
+        group_per_user, thread_per_user = resolve_session_isolation(
+            config,
+            source,
+        )
         return build_session_key(
             legacy_source,
-            group_sessions_per_user=getattr(
-                self.config, "group_sessions_per_user", True
-            ),
-            thread_sessions_per_user=getattr(
-                self.config, "thread_sessions_per_user", False
-            ),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
             profile=self._resolve_profile_for_key(source),
         )
 
@@ -4330,6 +4376,49 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def discard_observed_platform_message(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Discard a passive copy before the platform dispatches it as addressed.
+
+        Uses the same drain lock as transcript appends so an observed row cannot
+        race from the retry queue into SQLite after the delete transaction.
+        """
+        if not self._db or not platform_message_id:
+            return True
+        with self._get_transcript_drain_lock():
+            with self._transcript_retry_lock:
+                pending = self._dirty_transcripts.get(session_id, [])
+                if pending:
+                    self._dirty_transcripts[session_id] = [
+                        message
+                        for message in pending
+                        if not (
+                            bool(message.get("observed"))
+                            and str(
+                                message.get("platform_message_id")
+                                or message.get("message_id")
+                                or ""
+                            )
+                            == str(platform_message_id)
+                        )
+                    ]
+                    if not self._dirty_transcripts[session_id]:
+                        self._dirty_transcripts.pop(session_id, None)
+                        self._transcript_append_failures.pop(session_id, None)
+            try:
+                return self._db.discard_observed_platform_message(
+                    session_id, str(platform_message_id)
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to discard observed platform message %s from %s",
+                    platform_message_id,
+                    session_id,
+                    exc_info=True,
+                )
+                return False
+
     def rewrite_transcript(
         self,
         session_id: str,
@@ -4547,14 +4636,15 @@ def build_session_context(
         if home:
             home_channels[platform] = home
     
+    group_per_user, thread_per_user = resolve_session_isolation(config, source)
     context = SessionContext(
         source=source,
         connected_platforms=connected,
         home_channels=home_channels,
         shared_multi_user_session=is_shared_multi_user_session(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
         ),
     )
     

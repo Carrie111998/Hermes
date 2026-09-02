@@ -21,8 +21,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry
+from gateway.session import SessionEntry, SessionSource
 
 
 def _adapter(tag):
@@ -53,6 +54,10 @@ def _make_multiplex_runner():
     runner._profile_adapters = {
         "medicina": {Platform.TELEGRAM: _adapter("medicina")},
     }
+    runner._profile_configs = {
+        "default": runner.config,
+        "medicina": _config("2222"),
+    }
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(
         emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]), loaded_hooks=False,
@@ -62,7 +67,7 @@ def _make_multiplex_runner():
 
     store = MagicMock()
     store.get_or_create_session = AsyncMock(return_value=SessionEntry(
-        session_key="k", session_id="s",
+        session_key="agent:medicina:telegram:dm:2222", session_id="s",
         created_at=datetime.now(), updated_at=datetime.now(),
         platform=Platform.TELEGRAM, chat_type="dm",
     ))
@@ -149,6 +154,86 @@ async def test_secondary_profile_handoff_uses_its_own_adapter(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_secondary_sethome_refreshes_registered_handoff_config(monkeypatch):
+    runner, _ = _make_multiplex_runner()
+    monkeypatch.setattr(
+        "gateway.slash_commands.persist_home_channel",
+        lambda _home, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.save_env_value",
+        lambda _key, _value: None,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="9999",
+        chat_name="new-secondary-home",
+        chat_type="dm",
+        user_id="secondary-user",
+        profile="medicina",
+    )
+
+    result = await runner._handle_set_home_command(
+        MessageEvent(text="/sethome", source=source, message_id="sethome-1")
+    )
+
+    assert "Home channel set" in result
+    assert runner.config.get_home_channel(Platform.TELEGRAM).chat_id == "1111"
+    assert (
+        runner._profile_configs["medicina"]
+        .get_home_channel(Platform.TELEGRAM)
+        .chat_id
+        == "9999"
+    )
+
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport",
+        _spy_transport_factory(used),
+    )
+    await runner._process_handoff(
+        {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
+        profile_name="medicina",
+    )
+
+    assert used["home_chat_id"] == "9999"
+    assert used["adapter_tag"] == "medicina"
+
+
+@pytest.mark.asyncio
+async def test_handoff_switches_the_exact_key_created_by_session_store(monkeypatch):
+    runner, captured = _make_multiplex_runner()
+    created_key = "agent:medicina:telegram:thread:2222:topic:system:handoff"
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=created_key,
+        session_id="created-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="thread",
+    )
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport", _spy_transport_factory(used),
+    )
+    secondary = _config("2222")
+    secondary.platforms[Platform.TELEGRAM].extra["thread_sessions_per_user"] = True
+    monkeypatch.setattr("gateway.run.load_gateway_config", lambda: secondary)
+
+    await runner._process_handoff(
+        {
+            "id": "cli-session",
+            "title": "work",
+            "handoff_platform": "telegram",
+            "handoff_thread_id": "topic",
+        },
+        profile_name="medicina",
+    )
+
+    assert captured["session_key"] == created_key
+
+
+@pytest.mark.asyncio
 async def test_default_profile_handoff_keeps_primary_adapter(monkeypatch):
     """The default/root path must behave exactly as before the fix."""
     runner, captured = _make_multiplex_runner()
@@ -186,3 +271,25 @@ async def test_secondary_profile_without_live_adapters_fails_loudly(monkeypatch)
             {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
             profile_name="medicina",
         )
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_without_registered_config_fails_closed(monkeypatch):
+    runner, _ = _make_multiplex_runner()
+    runner._profile_configs.pop("medicina")
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport", _spy_transport_factory(used),
+    )
+    monkeypatch.setattr(
+        "gateway.run.load_gateway_config",
+        MagicMock(side_effect=RuntimeError("broken config")),
+    )
+
+    with pytest.raises(RuntimeError, match="no registered gateway config"):
+        await runner._process_handoff(
+            {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
+            profile_name="medicina",
+        )
+
+    assert used == {}

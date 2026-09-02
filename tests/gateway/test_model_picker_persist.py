@@ -24,7 +24,7 @@ import types
 import yaml
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -126,6 +126,15 @@ def _make_named_runner(monkeypatch, default_adapter, named_adapter, named_home):
         runner,
         "_profile_adapters",
         {"named": {Platform.TELEGRAM: named_adapter}},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_profile_configs",
+        {
+            "default": runner.config,
+            "named": GatewayConfig(multiplex_profiles=True),
+        },
         raising=False,
     )
     monkeypatch.setattr(

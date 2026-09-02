@@ -14718,6 +14718,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def discard_observed_platform_message(
+        self, session_id: str, platform_message_id: str
+    ) -> bool:
+        """Atomically delete passive copies before an addressed redelivery.
+
+        Some platforms emit the same message first as passive group traffic and
+        then as an addressed event. The addressed path persists its own user
+        turn, so retaining the passive row would replay the same content twice.
+        Returns True when the transaction succeeds, whether or not a matching
+        passive row existed.
+        """
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                reject_active_turn_lease=True,
+                reject_active_compression_lock=True,
+            )
+            cursor = conn.execute(
+                "DELETE FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? "
+                "AND observed = 1 AND active = 1",
+                (session_id, platform_message_id),
+            )
+            deleted = max(int(cursor.rowcount or 0), 0)
+            if deleted:
+                conn.execute(
+                    "UPDATE sessions SET message_count = MAX(message_count - ?, 0) "
+                    "WHERE id = ?",
+                    (deleted, session_id),
+                )
+
+        self._execute_write(_do)
+        return True
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

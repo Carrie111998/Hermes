@@ -39,6 +39,7 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    resolve_session_isolation,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -416,7 +417,13 @@ class GatewaySlashCommandsMixin:
         from gateway.slash_access import policy_for_source as _policy_for_source
 
         source = event.source
-        policy = _policy_for_source(self.config, source)
+        config = self._session_config_for_source(source)
+        if config is None:
+            return (
+                "**You** — profile configuration unavailable\n"
+                "Slash command access cannot be resolved safely."
+            )
+        policy = _policy_for_source(config, source)
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
@@ -1069,10 +1076,19 @@ class GatewaySlashCommandsMixin:
         # Non-DM: scope by participant whenever the session key for this source
         # is per-user. is_shared_multi_user_session mirrors build_session_key's
         # isolation rules exactly, so the guard stays in lock-step with the key.
+        config_for_source = getattr(self, "_session_config_for_source", None)
+        isolation_config = (
+            config_for_source(current) if callable(config_for_source) else self.config
+        )
+        if isolation_config is None:
+            return False
+        group_per_user, thread_per_user = resolve_session_isolation(
+            isolation_config, current
+        )
         shared = is_shared_multi_user_session(
             current,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
         )
         if shared:
             return True
@@ -1099,7 +1115,10 @@ class GatewaySlashCommandsMixin:
         """
         try:
             from gateway.slash_access import policy_for_source
-            policy = policy_for_source(self.config, source)
+            config = self._session_config_for_source(source)
+            if config is None:
+                return False
+            policy = policy_for_source(config, source)
             uid = getattr(source, "user_id", None)
             return bool(policy.enabled and uid and policy.is_admin(uid))
         except Exception:
@@ -1224,10 +1243,21 @@ class GatewaySlashCommandsMixin:
             # do NOT also require user-id equality (otherwise a co-member is
             # wrongly blocked from their own shared session). A per-user session
             # still requires the same owner.
+            config_for_source = getattr(self, "_session_config_for_source", None)
+            isolation_config = (
+                config_for_source(source)
+                if callable(config_for_source)
+                else self.config
+            )
+            if isolation_config is None:
+                return False
+            group_per_user, thread_per_user = resolve_session_isolation(
+                isolation_config, source
+            )
             shared = is_shared_multi_user_session(
                 source,
-                group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-                thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+                group_sessions_per_user=group_per_user,
+                thread_sessions_per_user=thread_per_user,
             )
             if shared:
                 return True
@@ -3280,6 +3310,12 @@ class GatewaySlashCommandsMixin:
         chat_name = source.chat_name or chat_id
         if source.platform is None:
             return t("gateway.set_home.save_failed", error="Missing logical platform")
+        runtime_config = self._session_config_for_source(source)
+        if runtime_config is None:
+            return t(
+                "gateway.set_home.save_failed",
+                error=f"No gateway config registered for profile {source.profile!r}",
+            )
 
         via_relay = getattr(source, "delivered_via_upstream_relay", False) is True
         if via_relay:
@@ -3332,9 +3368,10 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.warning("Home config saved but legacy env persistence failed: %s", e)
 
-        # Keep the running gateway config in sync too. The pre-restart
-        # notification path reads self.config before the process reloads config.
-        platform_config = getattr(self, "config").platforms.setdefault(
+        # Keep the running profile config in sync too. The pre-restart
+        # notification and handoff paths read this registered config before the
+        # process reloads config.
+        platform_config = runtime_config.platforms.setdefault(
             source.platform,
             PlatformConfig(enabled=not via_relay),
         )
@@ -4183,7 +4220,10 @@ class GatewaySlashCommandsMixin:
         # This mutates profile-wide security policy. The central slash gate can
         # allow selected commands to non-admin users, so enforce admin again at
         # this side-effect boundary. Unconfigured policies remain unrestricted.
-        policy = policy_for_source(self.config, event.source)
+        config = self._session_config_for_source(event.source)
+        if config is None:
+            return "Profile configuration is unavailable; approval mode was not changed."
+        policy = policy_for_source(config, event.source)
         if requested and not policy.is_admin(event.source.user_id):
             return "Only gateway admins can change the persistent approval mode."
         result = run_approval_mode_command(requested)

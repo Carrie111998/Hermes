@@ -15,6 +15,88 @@ def _make_runner(config: GatewayConfig) -> GatewayRunner:
     return runner
 
 
+def test_session_context_uses_secondary_profile_isolation_policy():
+    primary = GatewayConfig(multiplex_profiles=True, group_sessions_per_user=False)
+    secondary = GatewayConfig(multiplex_profiles=True, group_sessions_per_user=True)
+    runner = _make_runner(primary)
+    runner._profile_configs = {"default": primary, "secondary": secondary}
+    source = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="alice",
+        profile="secondary",
+    )
+
+    context = runner._build_session_context_for_source(source)
+
+    assert context.shared_multi_user_session is False
+
+
+@pytest.mark.asyncio
+async def test_preprocess_uses_qq_platform_group_override():
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"group_sessions_per_user": False},
+                ),
+            },
+            group_sessions_per_user=True,
+        )
+    )
+    source = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="member-1",
+        user_name="QQ sender id=abc12345 | 群昵称=Alice Group",
+    )
+    event = MessageEvent(text="hello", source=source)
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == (
+        "[QQ sender id=abc12345 | 群昵称=Alice Group] hello"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preprocess_uses_secondary_profile_isolation_policy():
+    primary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=True,
+    )
+    secondary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=False,
+    )
+    runner = _make_runner(primary)
+    runner._profile_configs = {"default": primary, "secondary": secondary}
+    source = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="member-1",
+        user_name="Alice",
+        profile="secondary",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="hello", source=source),
+        source=source,
+        history=[],
+        session_key="agent:secondary:qqbot:group:qq-group",
+    )
+
+    assert result == "[Alice] hello"
+
+
 @pytest.mark.asyncio
 async def test_preprocess_includes_slack_author_mention_for_shared_thread():
     """Shared Slack threads expose the current author's verifiable user ID
@@ -45,5 +127,108 @@ async def test_preprocess_includes_slack_author_mention_for_shared_thread():
     )
 
     assert result == "[Alice | Slack user <@U123>] mention me again"
+
+
+def test_qq_observed_rows_are_context_only_for_addressed_turn():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {
+            "role": "user",
+            "content": "[QQ sender id=abc12345 | 群昵称=Alice] side chatter",
+            "observed": True,
+        },
+        {"role": "assistant", "content": "previous explicit reply"},
+    ]
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed QQ group context is available",
+    )
+    wrapped = _wrap_current_message_with_observed_context(
+        "[QQ sender id=def67890 | 群昵称=Bob] answer this",
+        observed_context,
+    )
+
+    assert agent_history == [
+        {"role": "assistant", "content": "previous explicit reply"}
+    ]
+    assert "[Observed group context - context only, not requests]" in wrapped
+    assert "side chatter" in wrapped
+    assert wrapped.endswith(
+        "[QQ sender id=def67890 | 群昵称=Bob] answer this"
+    )
+
+
+def test_alternation_repair_keeps_observed_content_non_actionable():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "addressed turn interrupted"},
+        {
+            "role": "user",
+            "content": "[Mallory] passive instruction",
+            "observed": True,
+        },
+    ]
+
+    assert repair_message_sequence(None, history) == 0
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed QQ group context is available",
+    )
+
+    assert agent_history == [
+        {"role": "user", "content": "addressed turn interrupted"}
+    ]
+    assert observed_context == "[Mallory] passive instruction"
+
+
+def test_yuanbao_observed_rows_remain_context_only():
+    from gateway.platforms.yuanbao import GroupAtGuardMiddleware
+    from gateway.run import _build_gateway_agent_history
+
+    channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt([], "bot-id")
+    history = [
+        {
+            "role": "user",
+            "content": "[Alice|u1]\nrelease is at 5pm",
+            "observed": True,
+        }
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt=channel_prompt,
+    )
+
+    assert agent_history == []
+    assert observed_context == "[Alice|u1]\nrelease is at 5pm"
+
+
+def test_observed_rows_are_omitted_when_observe_mode_is_disabled():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "assistant", "content": "previous explicit reply"},
+        {
+            "role": "user",
+            "content": "[Alice] passive chatter from an earlier configuration",
+            "observed": True,
+        },
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt=None,
+    )
+
+    assert agent_history == [
+        {"role": "assistant", "content": "previous explicit reply"}
+    ]
+    assert observed_context is None
 
 
