@@ -8052,6 +8052,22 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_ungated: list[str] = field(default_factory=list)
+    """Ready task ids deferred this tick because their assignee is listed in
+    ``kanban.gate_required_assignees`` but no review-gate card depends on them
+    yet.
+
+    Closes a create-then-link race: an orchestrator that creates the worker
+    card and only afterwards links its gate leaves a window in which the
+    dispatcher can claim and run the card ungated, so the output is produced
+    (and delivered) before anything reviews it. Prompt instructions alone do
+    not close it — the orchestrator's own report of what it did is not
+    evidence that it did it in that order.
+
+    NOT operator-actionable on its own: the gate is normally linked within the
+    same turn, so the card simply starts one tick later. Only if the gate is
+    still missing after ``kanban.gate_grace_seconds`` is the card auto-blocked
+    (it then appears in ``auto_blocked`` instead, which IS actionable)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8064,6 +8080,12 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    auto_blocked_fidelity: list[str] = field(default_factory=list)
+    """Task ids auto-blocked by the object-fidelity guard (ADR-19): a quoted
+    entity in the card looks like a near-miss transcription of one named in
+    the root card. Separate bucket from ``auto_blocked`` so telemetry can
+    tell "spawn kept failing" apart from "entity drift suspected" — the
+    remediation and urgency are different (the latter always needs Gab)."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -8093,6 +8115,18 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    recovered_from_triage: list[str] = field(default_factory=list)
+    """Task ids auto-promoted ``triage`` -> ``todo`` this tick because they
+    were routed to triage specifically by the no-review-gate loop breaker
+    (see ``skipped_ungated``/``auto_blocked`` above) and a review-gate card
+    now exists. 2026-08-10: found via a real 2-day stuck chain (8 cards on
+    the ``compliance`` board) — ``triage`` is a deliberate human-in-the-loop
+    parking state (see ``block_task``'s ``BLOCK_RECURRENCE_LIMIT`` branch),
+    but nothing ever told a human a card had landed there, so cards whose
+    blocking cause had since resolved sat forever with no automatic path
+    back to ``todo``. This does NOT touch triage cards routed there for any
+    other reason (ADR-19 object-fidelity, a worker's own ``needs_input``) —
+    those still require an actual human decision."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9548,6 +9582,243 @@ def check_respawn_guard(
     return None
 
 
+# Default grace before an ungated card is auto-blocked rather than deferred.
+# Sized to comfortably span several dispatcher ticks (default interval 60s):
+# the orchestrator normally links the gate in the same turn it creates the
+# card, so the common case is one deferred tick, not five minutes of waiting.
+DEFAULT_GATE_GRACE_SECONDS = 300
+
+
+def has_review_gate(
+    conn: sqlite3.Connection, task_id: str, gate_assignee: str = "critic",
+) -> bool:
+    """True when some card assigned to ``gate_assignee`` depends on ``task_id``.
+
+    The review gate is modelled as a CHILD card blocked-by the work card, so a
+    gated worker card is one that appears as ``parent_id`` in ``task_links``
+    with a gate-assignee child. Returns False on any error — callers treat an
+    unreadable link graph as "cannot prove a gate exists", which is the
+    fail-closed reading.
+    """
+    if not task_id or not gate_assignee:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.assignee = ? "
+            "AND t.status != 'archived' LIMIT 1",
+            (task_id, gate_assignee),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+# Auto-recovery for triage cards the no-gate loop breaker parked (2026-08-10).
+# See DispatchResult.recovered_from_triage for the full incident/rationale.
+# Matched on the two stable phrases from the reason string `block_task` writes
+# for THIS specific cause (see its `f"no {gate_assignee} review gate after "`
+# f-string a few hundred lines below) rather than a full-string compare, so a
+# future tweak to the grace-seconds wording doesn't silently stop matching.
+_TRIAGE_GATE_REASON_MARKERS = ("review gate after", "refusing to run ungated")
+
+
+def _recover_gate_stalled_triage(
+    conn: sqlite3.Connection, *, gate_assignee: str = "critic",
+) -> list[str]:
+    """Auto-promote ``triage`` -> ``todo`` for cards the no-gate loop breaker
+    parked there, once a review-gate card has since appeared.
+
+    Narrowly scoped to that ONE cause: only a card whose most recent
+    ``block_loop_detected`` event names "no review gate" is touched. A card
+    in ``triage`` for any other reason (ADR-19 object-fidelity mismatch, a
+    worker's own ``needs_input``) is left exactly where it is — those still
+    need an actual human decision, and this function must not blur that
+    line by loosening the reason match.
+    """
+    recovered: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'triage' AND block_kind = 'needs_input'"
+        ).fetchall()
+    except sqlite3.Error:
+        return recovered
+    for row in rows:
+        task_id = row["id"]
+        try:
+            evt = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'block_loop_detected' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if evt is None:
+            continue
+        try:
+            payload = json.loads(evt["payload"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        reason = str(payload.get("reason") or "")
+        if not all(marker in reason for marker in _TRIAGE_GATE_REASON_MARKERS):
+            continue
+        if not has_review_gate(conn, task_id, gate_assignee):
+            continue
+        try:
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'todo', block_kind = NULL, "
+                    "block_recurrences = 0 WHERE id = ? AND status = 'triage'",
+                    (task_id,),
+                )
+                if cur.rowcount != 1:
+                    continue
+                _append_event(
+                    conn, task_id, "auto_recovered",
+                    {"reason": "review gate now linked", "from_status": "triage"},
+                )
+        except sqlite3.Error:
+            continue
+        recovered.append(task_id)
+    return recovered
+
+
+# Object-fidelity guard (ADR-19, 2026-08-04). See DECISIONS.md D-63 for the
+# full design discussion; the short version: the 2026-08-03 半鞅→半鞍 incident
+# showed that ADR-6's fact-check gates verify "is this information true", not
+# "is this the same object the root card named" — a decomposition-time
+# transcription error can survive every downstream gate because the swapped-in
+# entity is itself real. This is a narrow, mechanical heuristic (edit-distance
+# near-miss on quoted proper nouns), not a semantic "did we answer the
+# question" judge — it catches the specific transcription-typo shape of the
+# actual incident and deliberately does not flag wholly new entities a child
+# card introduces, to avoid blocking legitimate research.
+_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
+    ("「", "」"),  # 「」
+    ("“", "”"),  # “ ”
+    ('"', '"'),
+)
+
+
+def _extract_quoted_entities(text: str) -> set[str]:
+    """Pull proper-noun-shaped substrings wrapped in quote marks out of *text*.
+
+    Terms shorter than 2 characters are dropped (too noisy to be an entity
+    name — usually stray punctuation or a quoted single word like "是").
+    """
+    if not text:
+        return set()
+    out: set[str] = set()
+    for open_q, close_q in _QUOTE_PAIRS:
+        start = 0
+        while True:
+            i = text.find(open_q, start)
+            if i == -1:
+                break
+            j = text.find(close_q, i + len(open_q))
+            if j == -1:
+                break
+            term = text[i + len(open_q):j].strip()
+            if len(term) >= 2:
+                out.add(term)
+            start = j + len(close_q)
+    return out
+
+
+def _edit_distance_le(a: str, b: str, limit: int) -> bool:
+    """True iff the Levenshtein distance between *a* and *b* is <= *limit*.
+
+    Entity names here are always short (a handful of characters), so a plain
+    O(len(a)*len(b)) DP table is cheap — no need for the banded/early-exit
+    variants a general-purpose diff library would use for long strings.
+    """
+    if abs(len(a) - len(b)) > limit:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(
+                prev[j] + 1,
+                cur[j - 1] + 1,
+                prev[j - 1] + (0 if ca == cb else 1),
+            )
+        prev = cur
+    return prev[len(b)] <= limit
+
+
+def _object_fidelity_mismatches(
+    root_entities: set[str], child_text: str,
+) -> list[tuple[str, str]]:
+    """Find root-card entities that look like they were transcribed wrong.
+
+    For each entity named in the root card: verbatim presence in
+    *child_text* is fine. Otherwise, if *child_text* quotes a *different*
+    entity that is a near-miss (edit distance exactly 1, length difference
+    <= 1 — the exact shape of the 半鞅→半鞍 transcription) — flag the pair.
+    A root entity with neither a verbatim match nor a near-miss candidate is
+    NOT flagged: that is "the child card doesn't mention this yet", not
+    drift, and flagging it would block ordinary partial-progress cards.
+    """
+    if not root_entities:
+        return []
+    child_entities = _extract_quoted_entities(child_text)
+    mismatches: list[tuple[str, str]] = []
+    for root_term in root_entities:
+        if root_term in child_text:
+            continue
+        for child_term in child_entities:
+            if child_term == root_term:
+                continue
+            if _edit_distance_le(root_term, child_term, 1):
+                mismatches.append((root_term, child_term))
+                break
+    return mismatches
+
+
+def _root_ancestor_texts(
+    conn: sqlite3.Connection, task_id: str, *, max_nodes: int = 50,
+) -> list[str]:
+    """Walk ``task_links`` upward from *task_id* to every ancestor that has no
+    parents of its own, and return each such root's ``title``+``body`` text.
+
+    BFS with a visited set and a node cap: a real decomposition graph is never
+    remotely this deep, but the cap keeps a malformed/cyclic link graph (which
+    should never exist, but this reads the DB, not a promise about it) from
+    hanging a dispatcher tick. Returns ``[]`` (fail-open, not fail-closed) on
+    any DB error — an unreadable link graph should not itself halt dispatch;
+    the caller simply won't have a root to compare against this tick.
+    """
+    try:
+        seen: set[str] = set()
+        frontier = [task_id]
+        roots: list[str] = []
+        while frontier and len(seen) < max_nodes:
+            current = frontier.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            parent_rows = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (current,),
+            ).fetchall()
+            parent_ids = [r["parent_id"] for r in parent_rows]
+            if not parent_ids:
+                if current != task_id:
+                    roots.append(current)
+                continue
+            frontier.extend(pid for pid in parent_ids if pid not in seen)
+        texts = []
+        for rid in roots:
+            row = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ?", (rid,),
+            ).fetchone()
+            if row is not None:
+                texts.append(f"{row['title'] or ''}\n{row['body'] or ''}")
+        return texts
+    except sqlite3.Error:
+        return []
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -9830,6 +10101,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gate_required_assignees: Optional[frozenset] = None,
+    gate_assignee: str = "critic",
+    gate_grace_seconds: int = DEFAULT_GATE_GRACE_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9865,6 +10139,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            gate_required_assignees=gate_required_assignees,
+            gate_assignee=gate_assignee,
+            gate_grace_seconds=gate_grace_seconds,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9885,6 +10162,9 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                gate_required_assignees=gate_required_assignees,
+                gate_assignee=gate_assignee,
+                gate_grace_seconds=gate_grace_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9912,6 +10192,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gate_required_assignees: Optional[frozenset] = None,
+    gate_assignee: str = "critic",
+    gate_grace_seconds: int = DEFAULT_GATE_GRACE_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9981,6 +10264,15 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    result.recovered_from_triage = _recover_gate_stalled_triage(
+        conn, gate_assignee=gate_assignee,
+    )
+    if result.recovered_from_triage:
+        # Fold straight into this tick rather than waiting for the next one:
+        # a recovered card with no parents is immediately ready to run, and
+        # recompute_ready() only just ran above (it never looks at
+        # ``triage``, so it could not have picked these up itself).
+        result.promoted += recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10044,8 +10336,9 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    # created_at is selected for the review-gate guard's grace-period check.
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_at FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10192,6 +10485,124 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Object-fidelity guard (ADR-19): refuse to dispatch a producer card
+        # whose quoted entities look like a near-miss transcription of the
+        # root card's. See the helper docstrings above and DECISIONS.md D-63
+        # for the full incident/design writeup. A heuristic this blunt must
+        # not be able to talk itself back into running — only a human
+        # (needs_input, same escape hatch as ADR-10) clears the block.
+        #
+        # Deliberately checked BEFORE the review-gate guard below: this is an
+        # independent concern (does the card's content match the root it
+        # descends from), not something that should wait on gate-card
+        # linkage timing. A card that is wrong doesn't become less wrong by
+        # sitting in ``skipped_ungated`` for a tick.
+        if gate_required_assignees and row_assignee in gate_required_assignees:
+            root_texts = _root_ancestor_texts(conn, row["id"])
+            if root_texts:
+                root_entities: set = set()
+                for t in root_texts:
+                    root_entities |= _extract_quoted_entities(t)
+                # ready_rows above only selects id/assignee/created_at (the
+                # hot-path dispatch query) — fetch this card's own text with
+                # a targeted lookup rather than widening that shared query.
+                own_row = conn.execute(
+                    "SELECT title, body FROM tasks WHERE id = ?", (row["id"],),
+                ).fetchone()
+                child_text = (
+                    f"{own_row['title'] or ''}\n{own_row['body'] or ''}"
+                    if own_row is not None else ""
+                )
+                mismatches = _object_fidelity_mismatches(root_entities, child_text)
+                if mismatches:
+                    detail = "; ".join(
+                        f"根卡「{r}」→ 本卡「{c}」" for r, c in mismatches
+                    )
+                    reason = (
+                        f"object-fidelity guard (ADR-19): possible entity "
+                        f"transcription drift — {detail}. Needs Gab to confirm "
+                        f"this is not a mis-transcription before dispatch."
+                    )
+                    if not dry_run:
+                        try:
+                            block_task(
+                                conn, row["id"], reason=reason, kind="needs_input",
+                            )
+                        except Exception:
+                            _log.debug(
+                                "kanban dispatch: failed to auto-block "
+                                "fidelity-mismatched task %s",
+                                row["id"], exc_info=True,
+                            )
+                            continue
+                    _log.warning(
+                        "kanban dispatch: task %s (%s) blocked — %s",
+                        row["id"], row_assignee, reason,
+                    )
+                    result.auto_blocked_fidelity.append(row["id"])
+                    continue
+        # Review-gate guard: refuse to start a card whose output is supposed to
+        # be reviewed until the reviewing card actually exists.
+        #
+        # The failure this closes is a create-then-link race. An orchestrator
+        # that creates the worker card first and links its gate a moment later
+        # leaves a window where the dispatcher claims and runs the card with
+        # nothing gating it; by the time the gate appears the work is done and
+        # already delivered. Ordering instructions in a prompt cannot close
+        # this — the orchestrator's own account of what it did is not evidence
+        # of the order it did it in. Only the dispatcher can refuse to start.
+        #
+        # Deferring (not blocking) is the common path: the gate is normally
+        # linked in the same turn, so the card starts one tick later and
+        # nothing is lost. Blocking is reserved for cards still ungated after
+        # the grace period, where the gate is genuinely never coming and a
+        # human needs to see it — silently running it ungated, or silently
+        # parking it forever, are both worse.
+        if gate_required_assignees and row_assignee in gate_required_assignees:
+            if not has_review_gate(conn, row["id"], gate_assignee):
+                age = 0
+                try:
+                    age = int(time.time()) - int(row["created_at"] or 0)
+                except (TypeError, ValueError):
+                    age = 0
+                if age < max(0, int(gate_grace_seconds)):
+                    result.skipped_ungated.append(row["id"])
+                    continue
+                reason = (
+                    f"no {gate_assignee} review gate after "
+                    f"{gate_grace_seconds}s — refusing to run ungated. "
+                    f"Create a {gate_assignee} card blocked-by this one, then "
+                    f"unblock."
+                )
+                if not dry_run:
+                    try:
+                        # kind=needs_input, NOT dependency. `dependency` means
+                        # "a parent card will finish and free me", and routes
+                        # to `todo` so recompute_ready can promote it — which
+                        # here would loop forever: the card has no unfinished
+                        # parent, so it is promoted straight back to `ready`,
+                        # re-blocked next tick, every tick. The gate card does
+                        # not exist and nothing will create it on its own, so
+                        # this genuinely needs someone to act: `needs_input`
+                        # lands it in the human bucket and participates in the
+                        # unblock-loop breaker.
+                        block_task(
+                            conn, row["id"], reason=reason, kind="needs_input",
+                        )
+                    except Exception:
+                        _log.debug(
+                            "kanban dispatch: failed to auto-block ungated task %s",
+                            row["id"], exc_info=True,
+                        )
+                        result.skipped_ungated.append(row["id"])
+                        continue
+                _log.warning(
+                    "kanban dispatch: task %s (%s) has no %s gate after %ds; "
+                    "blocked instead of running ungated",
+                    row["id"], row_assignee, gate_assignee, age,
+                )
+                result.auto_blocked.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
