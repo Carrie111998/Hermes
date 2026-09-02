@@ -57,6 +57,7 @@ export interface ThemeBrand {
   goodbye: string
   tool: string
   helpHeader: string
+  bannerAnimation: 'none' | 'reveal'
 }
 
 export interface Theme {
@@ -256,7 +257,8 @@ const BRAND: ThemeBrand = {
   welcome: 'Type your message or /help for commands.',
   goodbye: 'Goodbye! ⚕',
   tool: '┊',
-  helpHeader: '(^_^)? Commands'
+  helpHeader: '(^_^)? Commands',
+  bannerAnimation: 'none'
 }
 
 const cleanPromptSymbol = (s: string | undefined, fallback: string) => {
@@ -957,7 +959,8 @@ export function fromSkin(
         welcome: branding.welcome ?? d.brand.welcome,
         goodbye: branding.goodbye ?? d.brand.goodbye,
         tool: toolPrefix || d.brand.tool,
-        helpHeader: branding.help_header ?? (helpHeader || d.brand.helpHeader)
+        helpHeader: branding.help_header ?? (helpHeader || d.brand.helpHeader),
+        bannerAnimation: branding.banner_animation === 'reveal' ? 'reveal' : 'none'
       },
 
       bannerLogo,

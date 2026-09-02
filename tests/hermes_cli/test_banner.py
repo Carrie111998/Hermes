@@ -1,12 +1,43 @@
 """Tests for banner toolset name normalization and skin color usage."""
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rich.console import Console
 
 import hermes_cli.banner as banner
 import model_tools
 import tools.mcp_tool
+
+
+def test_reveal_banner_markup_keeps_height_and_width_while_revealing_columns():
+    frame = banner._reveal_banner_markup(
+        "[#ffffff]ABCD[/]\n[#ffffff]XY[/]",
+        visible_columns=2,
+    )
+
+    assert frame.plain == "AB  \nXY  "
+
+
+def test_print_banner_logo_animates_only_when_requested_on_a_terminal():
+    console = Mock()
+    console.is_terminal = True
+
+    with patch.object(banner, "_animate_banner_logo") as animate:
+        banner._print_banner_logo(console, "LOGO", animation="reveal")
+
+    animate.assert_called_once_with(console, "LOGO")
+    console.print.assert_not_called()
+
+
+def test_print_banner_logo_stays_static_for_non_terminal_output():
+    console = Mock()
+    console.is_terminal = False
+
+    with patch.object(banner, "_animate_banner_logo") as animate:
+        banner._print_banner_logo(console, "LOGO", animation="reveal")
+
+    animate.assert_not_called()
+    console.print.assert_called_once_with("LOGO")
 
 
 def test_cprint_falls_back_to_plain_print_when_prompt_toolkit_has_no_console(capsys):

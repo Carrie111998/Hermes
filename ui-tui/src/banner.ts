@@ -90,4 +90,11 @@ export const caduceus = (c: ThemeColors, customHero?: string): Line[] =>
 
 export const artWidth = (lines: Line[]) => lines.reduce((m, [, t]) => Math.max(m, t.length), 0)
 
+export const revealArtLines = (lines: Line[], visibleColumns: number): Line[] => {
+  const width = artWidth(lines)
+  const visible = Math.max(0, Math.min(width, Math.floor(visibleColumns)))
+
+  return lines.map(([color, text]) => [color, text.slice(0, visible).padEnd(width)] as Line)
+}
+
 type Line = [string, string]

@@ -80,7 +80,8 @@ export const SKIN_BRANDING_TOKENS = [
   'goodbye',
   'response_label',
   'prompt_symbol',
-  'help_header'
+  'help_header',
+  'banner_animation'
 ] as const
 
 export type SkinBrandingToken = (typeof SKIN_BRANDING_TOKENS)[number]
