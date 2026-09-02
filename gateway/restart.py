@@ -39,6 +39,9 @@ def is_global_startup_conflict(error_code: str | None) -> bool:
 # INVOCATION_ID and launchd's XPC_SERVICE_NAME, this survives wrappers that
 # intentionally replace the child environment (for example ``sudo env -i``).
 EXTERNAL_GATEWAY_SUPERVISOR_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"
+# Set by wrapped container entrypoints before their exec chain. The PID binds
+# restart authority to that exact process slot instead of an inheritable flag.
+EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR_PID"
 
 DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = float(
     DEFAULT_CONFIG["agent"]["restart_drain_timeout"]

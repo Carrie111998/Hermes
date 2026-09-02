@@ -20,6 +20,22 @@ def test_external_marker_identifies_supervisor_process(monkeypatch):
     assert gateway._running_under_gateway_supervisor() is True
 
 
+def test_control_identity_reports_pid_bound_external_supervisor(monkeypatch):
+    """Live identity must expose wrapped-runtime ownership to update clients."""
+    import gateway.control_socket as control_socket
+
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("HERMES_DESKTOP_MANAGED", raising=False)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    monkeypatch.setenv(
+        gateway.EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV,
+        str(control_socket.os.getpid()),
+    )
+    monkeypatch.setattr(control_socket.sys, "argv", ["hermes", "gateway", "run"])
+
+    assert control_socket._detect_supervisor() == "external"
+
+
 def test_gateway_run_external_supervisor_flag_marks_process(monkeypatch):
     monkeypatch.delenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
     monkeypatch.setattr(
@@ -41,6 +57,109 @@ def test_gateway_run_external_supervisor_flag_marks_process(monkeypatch):
     assert observed == ["1"]
 
 
+def test_gateway_run_external_supervisor_flag_enables_takeover(monkeypatch):
+    """A wrapped runtime owns its slot and must replace an orphaned holder."""
+    monkeypatch.setenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
+    monkeypatch.setattr(
+        gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
+    )
+    observed = []
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *_args, **kwargs: observed.append(kwargs["replace"]),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(
+            gateway_command="run",
+            external_supervisor=True,
+            replace=False,
+        )
+    )
+
+    assert observed == [True]
+
+
+def test_gateway_run_matching_supervisor_pid_enables_takeover(monkeypatch):
+    """The dispatcher-owned exec slot may replace its previous gateway."""
+    monkeypatch.setenv(
+        gateway.EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV,
+        str(gateway.os.getpid()),
+    )
+    monkeypatch.setattr(
+        gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
+    )
+    observed = []
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *_args, **kwargs: observed.append(kwargs["replace"]),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(
+            gateway_command="run",
+            external_supervisor=False,
+            replace=False,
+        )
+    )
+
+    assert observed == [True]
+
+
+def test_inherited_external_supervisor_marker_does_not_enable_takeover(monkeypatch):
+    """A gateway descendant must not inherit destructive restart authority."""
+    monkeypatch.setenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
+    monkeypatch.setenv(
+        gateway.EXTERNAL_GATEWAY_SUPERVISOR_PID_ENV,
+        str(gateway.os.getpid() + 1),
+    )
+    monkeypatch.setattr(
+        gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
+    )
+    observed = []
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *_args, **kwargs: observed.append(kwargs["replace"]),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(
+            gateway_command="run",
+            external_supervisor=False,
+            replace=False,
+        )
+    )
+
+    assert observed == [False]
+
+
+def test_plain_gateway_run_does_not_enable_takeover(monkeypatch):
+    """An interactive shell must not replace a legitimate running gateway."""
+    monkeypatch.delenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
+    monkeypatch.setattr(
+        gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False
+    )
+    observed = []
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *_args, **kwargs: observed.append(kwargs["replace"]),
+    )
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(
+            gateway_command="run",
+            external_supervisor=False,
+            replace=False,
+        )
+    )
+
+    assert observed == [False]
+
+
 def test_update_hands_external_supervisor_gateway_back_without_watcher(monkeypatch):
     monkeypatch.setattr(
         gateway,
@@ -53,6 +172,29 @@ def test_update_hands_external_supervisor_gateway_back_without_watcher(monkeypat
             "run",
             "--external-supervisor",
         ],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "launch_detached_profile_gateway_restart",
+        lambda *_args: pytest.fail("detached watcher must not be launched"),
+    )
+
+    assert gateway._prepare_profile_gateway_update_restart("work", 1234) == (
+        "external-supervisor"
+    )
+
+
+def test_update_hands_pid_bound_gateway_back_without_watcher(monkeypatch):
+    """Update must not race the wrapped runtime with a detached watcher."""
+    monkeypatch.setattr(
+        gateway,
+        "_capture_gateway_argv",
+        lambda _pid: ["python", "-m", "hermes_cli.main", "gateway", "run"],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_gateway_process_has_bound_external_supervisor",
+        lambda pid: pid == 1234,
     )
     monkeypatch.setattr(
         gateway,
