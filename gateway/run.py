@@ -11137,13 +11137,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key in security_metadata_keys
             )
         )
-        if same_security_context and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
+        merge_types = {
+            getattr(existing, "message_type", None),
+            getattr(event, "message_type", None),
+        }
+        if (
+            same_security_context
+            and MessageType.PHOTO in merge_types
+            and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
-            # Preserve photo-burst / media-merge semantics for the head slot.
+            # Preserve photo-burst / album semantics for the head slot without
+            # throwing away the constituent platform events.  The merged head
+            # remains one conversational turn, while adapters and diagnostics
+            # can still recover every raw message, update id, and metadata map.
+            merged_sources = getattr(existing, "_merged_media_source_events", None)
+            if merged_sources is None:
+                merged_sources = [existing]
+                setattr(existing, "_merged_media_source_events", merged_sources)
+            incoming_sources = getattr(event, "_merged_media_source_events", None)
+            merged_sources.extend(incoming_sources or [event])
             merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
@@ -18596,6 +18608,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return "Usage: /steer <prompt>"
+        if (
+            event.message_type not in {MessageType.TEXT, MessageType.COMMAND}
+            or event.media_urls
+            or event.media_types
+        ):
+            # Keep the complete platform event but strip the command prefix.
+            # Replaying the original ``/steer`` text next turn would dispatch
+            # it as a command again instead of processing the attachment.
+            queued_event = dataclasses.replace(event, text=steer_text)
+            self._queue_or_replace_pending_event(quick_key, queued_event)
+            return (
+                "Attachment queued for the next turn; only plain text can "
+                "steer the current run."
+            )
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:
