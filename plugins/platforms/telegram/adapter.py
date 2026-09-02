@@ -15,6 +15,8 @@ import logging
 import os
 import html as _html
 import re
+import shutil
+import subprocess
 import threading
 import time
 from contextvars import ContextVar
@@ -24,6 +26,69 @@ from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from hermes_cli._subprocess_compat import windows_hide_flags
+
+
+def _probe_video_dimensions(video_path: str) -> Optional[tuple[int, int]]:
+    """Return coded video dimensions for Telegram's sendVideo metadata.
+
+    Telegram can infer an incorrect preview aspect ratio when width and height
+    are omitted. Keep probing best-effort so media delivery still works on
+    hosts without ffprobe or for files ffprobe cannot decode.
+    """
+    try:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height:stream_side_data=rotation",
+                "-of",
+                "json",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+        if result.returncode != 0:
+            return None
+        streams = json.loads(result.stdout).get("streams") or []
+        if not streams:
+            return None
+        stream = streams[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return None
+        for side_data in stream.get("side_data_list") or []:
+            rotation = side_data.get("rotation")
+            if rotation is None:
+                continue
+            if abs(int(round(float(rotation)))) % 180 == 90:
+                width, height = height, width
+            break
+        return width, height
+    except (
+        FileNotFoundError,
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return None
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -8478,6 +8543,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
+            dimensions = await asyncio.to_thread(_probe_video_dimensions, video_path)
+            video_kwargs: Dict[str, Any] = {"supports_streaming": True}
+            if dimensions is not None:
+                video_kwargs.update(width=dimensions[0], height=dimensions[1])
             with open(video_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_video,
@@ -8487,6 +8556,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        **video_kwargs,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
