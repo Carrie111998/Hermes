@@ -211,6 +211,171 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _kanban_primary_adapter_for_routed_subscription(
+        self,
+        platform: Any,
+        sub: dict,
+        owner_profile: Optional[str],
+    ) -> Any:
+        """Authorize the primary transport for one stamped subscription.
+
+        A profile with any connected secondary adapter owns its credential
+        boundary and can never fall back to the primary bot. An empty registry
+        map is only a multiplex-startup placeholder, so the destination's exact
+        profile route remains authoritative. A route match must target the
+        stamped, served profile; an unrouted destination may use the primary
+        adapter only for the active/default runtime profile.
+        """
+        profile_name = str(owner_profile or "").strip()
+        if not profile_name:
+            return None
+        adapters = getattr(self, "adapters", None) or {}
+        adapter = adapters.get(platform)
+        if adapter is None:
+            return None
+        # A non-empty entry means this profile has its own credential boundary.
+        # Multiplex startup also leaves empty maps for served profiles with no
+        # connected adapters; those may still use an exact primary route below.
+        profile_adapters = (getattr(self, "_profile_adapters", None) or {}).get(
+            profile_name
+        )
+        if profile_adapters:
+            return None
+
+        config = getattr(self, "config", None)
+        routes = getattr(config, "profile_routes", None) or []
+        multiplex = bool(getattr(config, "multiplex_profiles", False))
+        active_profile = str(
+            getattr(self, "_kanban_notifier_profile", None)
+            or getattr(self, "_active_profile_name")()
+        ).strip()
+        if not multiplex or not routes:
+            return adapter if profile_name == active_profile else None
+
+        metadata = sub.get("delivery_metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        platform_name = getattr(platform, "value", str(platform)).lower()
+        guild_id = metadata.get("guild_id") or metadata.get("scope_id")
+        parent_chat_id = metadata.get("parent_chat_id")
+        try:
+            from gateway.profile_routing import match_profile_route
+
+            matched = match_profile_route(
+                routes,
+                platform=platform_name,
+                guild_id=str(guild_id) if guild_id else None,
+                chat_id=str(sub.get("chat_id") or "") or None,
+                thread_id=str(sub.get("thread_id") or "") or None,
+                parent_chat_id=(
+                    str(parent_chat_id) if parent_chat_id else None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "kanban notifier: profile-route resolution failed for %s/%s",
+                platform_name,
+                sub.get("chat_id"),
+                exc_info=True,
+            )
+            return None
+
+        # Persisted rows predating route-anchor metadata cannot safely prove
+        # that a more-specific route does not own this destination. Deny only
+        # when an otherwise-compatible route outranks the match we could make;
+        # known conflicting chat/thread/guild values still rule a route out.
+        chat_id = str(sub.get("chat_id") or "") or None
+        thread_id = str(sub.get("thread_id") or "") or None
+        chat_type = str(
+            metadata.get("chat_type") or sub.get("chat_type") or ""
+        ).lower()
+        thread_like = chat_type in {
+            "thread", "forum", "forum_post", "forum-post", "topic"
+        }
+        matched_specificity = matched.specificity if matched is not None else -1
+        for route in routes:
+            if not getattr(route, "enabled", True):
+                continue
+            if str(getattr(route, "platform", "")).lower() != platform_name:
+                continue
+            if getattr(route, "specificity", 0) <= matched_specificity:
+                continue
+            route_thread = getattr(route, "thread_id", None)
+            if route_thread and str(route_thread) != thread_id:
+                continue
+            missing_anchor = False
+            route_chat = getattr(route, "chat_id", None)
+            if route_chat:
+                route_chat = str(route_chat)
+                if route_chat == chat_id:
+                    pass
+                elif parent_chat_id:
+                    if route_chat != str(parent_chat_id):
+                        continue
+                elif thread_id or thread_like:
+                    missing_anchor = True
+                else:
+                    continue
+            route_guild = getattr(route, "guild_id", None)
+            if route_guild:
+                if guild_id:
+                    if str(route_guild) != str(guild_id):
+                        continue
+                else:
+                    missing_anchor = True
+            if missing_anchor:
+                return None
+
+        if matched is None:
+            return adapter if profile_name == active_profile else None
+        if matched.profile != profile_name:
+            return None
+
+        served_profiles = getattr(self, "_kanban_served_profiles", None)
+        if served_profiles is None:
+            try:
+                from hermes_cli.profiles import profiles_to_serve
+
+                served_profiles = frozenset(
+                    name
+                    for name, _home in profiles_to_serve(
+                        multiplex=True,
+                        profile_allowlist=getattr(
+                            config, "multiplex_profile_allowlist", None
+                        ),
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "kanban notifier: served-profile resolution failed; "
+                    "denying routed primary transport",
+                    exc_info=True,
+                )
+                served_profiles = frozenset()
+            setattr(self, "_kanban_served_profiles", served_profiles)
+        return adapter if profile_name in served_profiles else None
+
+    def _kanban_adapter_for_subscription(
+        self,
+        platform: Any,
+        sub: dict,
+        owner_profile: Optional[str],
+    ) -> Any:
+        """Resolve a subscription adapter without crossing profile credentials."""
+        authorized = getattr(self, "_authorization_adapter")(
+            platform, owner_profile
+        )
+        effective_profile = str(
+            owner_profile
+            or getattr(self, "_kanban_notifier_profile", None)
+            or getattr(self, "_active_profile_name")()
+        ).strip()
+        primary = (getattr(self, "adapters", None) or {}).get(platform)
+        if authorized is not None and authorized is not primary:
+            return authorized
+        return self._kanban_primary_adapter_for_routed_subscription(
+            platform, sub, effective_profile,
+        )
+
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -343,6 +508,28 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    # A primary credential can explicitly transport named
+                    # routed profiles without creating `_profile_adapters`
+                    # entries for them. Include only route targets on a live
+                    # primary platform in the coarse ownership query; the
+                    # subscription's exact destination is re-matched below
+                    # before any event is claimed.
+                    _config = getattr(self, "config", None)
+                    if getattr(_config, "multiplex_profiles", False):
+                        notifier_profiles.update(
+                            str(getattr(route, "profile", "")).strip()
+                            for route in (
+                                getattr(_config, "profile_routes", None) or []
+                            )
+                            # Compatible route representations may omit an
+                            # explicit enabled field. Treat omission as active;
+                            # ``enabled: false`` still denies the route before
+                            # the exact authorization pass.
+                            if getattr(route, "enabled", True)
+                            and str(getattr(route, "platform", "")).lower()
+                            in active_platforms
+                            and str(getattr(route, "profile", "")).strip()
+                        )
                     # Widen to every platform any secondary profile has live,
                     # not just the default profile's. This is only a coarse
                     # pre-filter to skip claiming events for subs nobody can
@@ -463,15 +650,25 @@ class GatewayKanbanWatchersMixin:
                             for sub in subs:
                                 try:
                                     owner_profile = sub.get("notifier_profile") or None
-                                    if owner_profile and owner_profile != notifier_profile:
-                                        _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                        if not _owner_adapters:
-                                            logger.debug(
-                                                "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                                sub.get("task_id"), owner_profile, notifier_profile,
-                                            )
-                                            continue
                                     platform = (sub.get("platform") or "").lower()
+                                    effective_owner = owner_profile or notifier_profile
+                                    try:
+                                        _sub_platform = _Platform(platform)
+                                    except ValueError:
+                                        _sub_platform = None
+                                    _owner_adapter = (
+                                        self._kanban_adapter_for_subscription(
+                                            _sub_platform, sub, effective_owner,
+                                        )
+                                        if _sub_platform is not None
+                                        else None
+                                    )
+                                    if _owner_adapter is None:
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s owned by profile %s has no authorized adapter or exact route; skipping",
+                                            sub.get("task_id"), effective_owner,
+                                        )
+                                        continue
                                     if platform not in active_platforms:
                                         logger.debug(
                                             "kanban notifier: subscription for %s on %s skipped; adapter not connected",
@@ -538,7 +735,9 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    adapter = self._kanban_adapter_for_subscription(
+                        plat, sub, sub_profile or None,
+                    )
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
@@ -989,6 +1188,15 @@ class GatewayKanbanWatchersMixin:
                                         _delivery_meta.get("chat_type") or ""
                                     ).strip()
                             _chat_type = _chat_type or "group"
+                            _route_meta = sub.get("delivery_metadata")
+                            _route_meta = (
+                                _route_meta if isinstance(_route_meta, dict) else {}
+                            )
+                            _scope_id = (
+                                _route_meta.get("scope_id")
+                                or _route_meta.get("guild_id")
+                                or _wake_scope_id(adapter, sub)
+                            )
                             _source = SessionSource(
                                 platform=plat,
                                 chat_id=sub["chat_id"],
@@ -997,8 +1205,29 @@ class GatewayKanbanWatchersMixin:
                                 user_id=sub.get("user_id"),
                                 user_id_alt=sub.get("user_id_alt"),
                                 profile=sub_profile or None,
-                                scope_id=_wake_scope_id(adapter, sub),
+                                scope_id=str(_scope_id) if _scope_id else None,
+                                parent_chat_id=(
+                                    str(_route_meta["parent_chat_id"])
+                                    if _route_meta.get("parent_chat_id")
+                                    else None
+                                ),
                             )
+                            # Preserve the same in-process transport provenance
+                            # as BasePlatformAdapter.build_source(). A routed
+                            # runtime profile may intentionally have no
+                            # `_profile_adapters` entry; provenance keeps authz
+                            # and reply delivery on the primary credential that
+                            # the exact route authorized above.
+                            try:
+                                import weakref
+
+                                setattr(
+                                    _source,
+                                    "_transport_adapter_ref",
+                                    weakref.ref(adapter),
+                                )
+                            except TypeError:
+                                pass
                             # deliver_wake preserves the synthetic
                             # MessageEvent/handle_message path for
                             # push-capable adapters (the non-push /

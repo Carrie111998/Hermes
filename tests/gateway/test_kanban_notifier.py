@@ -745,3 +745,428 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_kanban_subscription_metadata_keeps_profile_route_anchors():
+    """Auto-subscribe persists enough source identity to replay exact routing."""
+    from types import SimpleNamespace
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="thread-7",
+        thread_id="thread-7",
+        chat_type="thread",
+        message_id="message-9",
+        scope_id="guild-3",
+        guild_id="guild-3",
+        parent_chat_id="engineering-chat",
+    )
+
+    metadata = runner._thread_metadata_for_source(source)
+
+    assert metadata == {
+        "thread_id": "thread-7",
+        "scope_id": "guild-3",
+        "guild_id": "guild-3",
+        "parent_chat_id": "engineering-chat",
+    }
+
+
+def test_gateway_kanban_create_subscription_uses_routed_source_profile(
+    tmp_path, monkeypatch,
+):
+    """Slash-created subscriptions belong to the routed conversation profile."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="slash routed", assignee="peer")
+    finally:
+        conn.close()
+
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    import hermes_cli.kanban as kanban_cli
+
+    monkeypatch.setattr(
+        kanban_cli,
+        "run_slash",
+        lambda _text: f"Created {task_id}  (ready, assignee=peer)",
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    runner._active_profile_name = lambda: "default"
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="engineering-chat",
+        chat_type="channel",
+        thread_id=None,
+        user_id="user-1",
+        user_id_alt=None,
+        guild_id="engineering-guild",
+        scope_id="engineering-guild",
+        parent_chat_id=None,
+        profile="yuki",
+        message_id="message-1",
+    )
+    event = SimpleNamespace(text="/kanban create slash routed", source=source)
+
+    output = asyncio.run(
+        runner._handle_kanban_command(event)  # type: ignore[arg-type]
+    )
+
+    assert "Subscribed" in output or "subscribed" in output
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id=task_id)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "yuki"
+    assert subs[0]["delivery_metadata"]["guild_id"] == "engineering-guild"
+
+
+def _make_routed_discord_runner(
+    adapter,
+    *,
+    route_profile="yuki",
+    route_enabled=True,
+    served_profiles=("default", "yuki"),
+):
+    from gateway.config import GatewayConfig
+    from gateway.profile_routing import parse_profile_routes
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = None
+    setattr(runner, "_kanban_served_profiles", frozenset(served_profiles))
+    runner._active_profile_name = lambda: "default"
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        profile_routes=parse_profile_routes(
+            [
+                {
+                    "name": "engineering-discord",
+                    "platform": "discord",
+                    "guild_id": "engineering-guild",
+                    "chat_id": "engineering-chat",
+                    "profile": route_profile,
+                    "enabled": route_enabled,
+                }
+            ]
+        ),
+    )
+    return runner
+
+
+def _create_routed_discord_completion(
+    *,
+    board,
+    notifier_profile: str | None = "yuki",
+    chat_id="engineering-chat",
+    chat_type="group",
+    thread_id=None,
+    guild_id="engineering-guild",
+    include_guild_metadata=True,
+):
+    conn = kb.connect(board=board)
+    try:
+        tid = kb.create_task(
+            conn,
+            title="routed engineering task",
+            assignee="worker",
+            session_id=f"agent:yuki:discord:group:{chat_id}:creator",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_id="creator",
+            notifier_profile=notifier_profile,
+            delivery_mode="notify+wake",
+            delivery_metadata=(
+                {"guild_id": guild_id} if include_guild_metadata else None
+            ),
+        )
+        kb.complete_task(conn, tid, summary="route-aware completion")
+        return tid
+    finally:
+        conn.close()
+
+
+def _unseen_routed_event_count(task_id, chat_id="engineering-chat"):
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id=chat_id,
+            kinds=["completed"],
+        )
+        return len(events)
+    finally:
+        conn.close()
+
+
+def test_routed_profile_uses_primary_discord_adapter_on_secondary_board_once(
+    tmp_path, monkeypatch,
+):
+    """An exact profile route owns the primary transport for notify and wake."""
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb.create_board("engineering", name="Engineering")
+    tid = _create_routed_discord_completion(board="engineering")
+
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+    # Multiplex startup creates an empty registry map even when a routed
+    # profile has no independently connected adapters.  An empty map is not a
+    # credential boundary and must not block its exact primary route.
+    runner._profile_adapters = {"yuki": {}}  # type: ignore[assignment]
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "engineering-chat"
+    assert tid in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    wake_source = adapter.handled[0].source
+    assert wake_source.profile == "yuki"
+    assert wake_source.guild_id == "engineering-guild"
+    assert runner._adapter_for_source(wake_source) is adapter
+
+    from gateway.session import build_session_key
+
+    assert build_session_key(wake_source, profile=wake_source.profile) == (
+        "agent:yuki:discord:group:engineering-chat:creator"
+    )
+
+    # The engineering-board cursor is the dedup boundary: a second tick neither
+    # re-sends the visible completion nor wakes the creator again.
+    runner = _make_routed_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
+def test_disabled_profile_route_is_not_a_primary_transport_target(
+    tmp_path, monkeypatch,
+):
+    """An explicitly disabled parsed route remains fail-closed."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(board=None)
+
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter, route_enabled=False)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
+
+
+def test_routed_profile_primary_adapter_denies_wrong_or_unmatched_route(
+    tmp_path, monkeypatch,
+):
+    """A primary credential is never a general secondary-profile fallback."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "route-denied.db"))
+    kb.init_db()
+    wrong_tid = _create_routed_discord_completion(
+        board=None,
+        notifier_profile="other-profile",
+    )
+    unmatched_tid = _create_routed_discord_completion(
+        board=None,
+        notifier_profile="yuki",
+        chat_id="unrouted-chat",
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        for task_id, chat_id in (
+            (wrong_tid, "engineering-chat"),
+            (unmatched_tid, "unrouted-chat"),
+        ):
+            subs = kb.list_notify_subs(conn, task_id)
+            assert len(subs) == 1
+            _, events = kb.unseen_events_for_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id=chat_id,
+                kinds=["completed"],
+            )
+            assert len(events) == 1, "denied delivery must remain retryable"
+    finally:
+        conn.close()
+
+
+def test_primary_adapter_denies_ownerless_subscription_across_route(
+    tmp_path, monkeypatch,
+):
+    """Legacy ownerless rows cannot bypass a destination's profile route."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(
+        board=None,
+        notifier_profile=None,
+    )
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+    runner._kanban_dispatcher_lock_handle = object()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
+
+
+def test_primary_adapter_denies_route_with_missing_guild_anchor(
+    tmp_path, monkeypatch,
+):
+    """Legacy metadata cannot turn an ambiguous guild route into default ownership."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(
+        board=None,
+        notifier_profile="default",
+        include_guild_metadata=False,
+    )
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
+
+
+def test_primary_adapter_denies_thread_like_route_with_missing_parent_anchor(
+    tmp_path, monkeypatch,
+):
+    """A legacy forum row cannot bypass its unknown parent-channel route."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(
+        board=None,
+        notifier_profile="default",
+        chat_id="forum-post-1",
+        chat_type="forum",
+        thread_id=None,
+    )
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id, chat_id="forum-post-1") == 1
+
+
+def test_primary_adapter_denies_default_subscription_reassigned_by_route(
+    tmp_path, monkeypatch,
+):
+    """A route to yuki prevents the default bot from delivering that destination."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(
+        board=None,
+        notifier_profile="default",
+    )
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
+
+
+def test_routed_primary_fallback_denies_profile_with_secondary_registry(
+    tmp_path, monkeypatch,
+):
+    """A partial secondary registry cannot silently fall back to the primary bot."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(board=None)
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter)
+    setattr(
+        runner,
+        "_profile_adapters",
+        {"yuki": {Platform.TELEGRAM: RecordingAdapter()}},
+    )
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
+
+
+def test_routed_profile_primary_adapter_denies_unserved_route_target(
+    tmp_path, monkeypatch,
+):
+    """A matching route cannot wake a profile this gateway does not serve."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "route-unserved.db"))
+    kb.init_db()
+    tid = _create_routed_discord_completion(board=None)
+
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(
+        adapter,
+        served_profiles=("default",),
+    )
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="engineering-chat",
+            kinds=["completed"],
+        )
+    finally:
+        conn.close()
+    assert len(events) == 1
+
+
+def test_true_secondary_adapter_still_owns_its_profile_subscription(
+    tmp_path, monkeypatch,
+):
+    """A live secondary adapter wins; route-aware primary use is only fallback."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "secondary.db"))
+    kb.init_db()
+    tid = _create_routed_discord_completion(
+        board=None,
+        chat_id="secondary-only-chat",
+    )
+
+    primary_adapter = RecordingAdapter()
+    secondary_adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(primary_adapter)
+    runner._profile_adapters = {  # type: ignore[assignment]
+        "yuki": {Platform.DISCORD: secondary_adapter},
+    }
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert primary_adapter.sent == []
+    assert primary_adapter.handled == []
+    assert len(secondary_adapter.sent) == 1
+    assert tid in secondary_adapter.sent[0]["text"]
+    assert len(secondary_adapter.handled) == 1
