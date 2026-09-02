@@ -1,5 +1,7 @@
 """Tests for warn_deprecated_cwd_env_vars() migration warning."""
 
+import io
+
 
 def _write_env(monkeypatch, tmp_path, content):
     hermes_home = tmp_path / ".hermes"
@@ -89,3 +91,66 @@ class TestDeprecatedCwdWarning:
         config_module.warn_deprecated_cwd_env_vars()
 
         assert capsys.readouterr().err == ""
+
+    class _FakeTtyStderr:
+        """A stderr that claims to be a TTY and records what it is written."""
+
+        def __init__(self):
+            self._buf = io.StringIO()
+
+        def isatty(self):
+            return True
+
+        def write(self, s):
+            self._buf.write(s)
+            return len(s)
+
+        def getvalue(self):
+            return self._buf.getvalue()
+
+    def test_color_emitted_on_tty_without_no_color(self, monkeypatch, tmp_path):
+        _write_env(monkeypatch, tmp_path, "TERMINAL_CWD=/legacy/path\n")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+
+        fake = self._FakeTtyStderr()
+        monkeypatch.setattr("sys.stderr", fake)
+
+        from hermes_cli.config import warn_deprecated_cwd_env_vars
+
+        warn_deprecated_cwd_env_vars()
+
+        out = fake.getvalue()
+        assert "TERMINAL_CWD" in out
+        assert "\033[33m" in out  # yellow warning mark
+
+    def test_empty_no_color_disables_color_on_tty(self, monkeypatch, tmp_path):
+        # Per the NO_COLOR spec (https://no-color.org/), the mere presence
+        # of NO_COLOR — even with an empty value — disables color.
+        _write_env(monkeypatch, tmp_path, "TERMINAL_CWD=/legacy/path\n")
+        monkeypatch.setenv("NO_COLOR", "")
+
+        fake = self._FakeTtyStderr()
+        monkeypatch.setattr("sys.stderr", fake)
+
+        from hermes_cli.config import warn_deprecated_cwd_env_vars
+
+        warn_deprecated_cwd_env_vars()
+
+        out = fake.getvalue()
+        assert "TERMINAL_CWD" in out
+        assert "\033[" not in out  # no ANSI escapes leak
+
+    def test_no_color_nonempty_disables_color_on_tty(self, monkeypatch, tmp_path):
+        _write_env(monkeypatch, tmp_path, "TERMINAL_CWD=/legacy/path\n")
+        monkeypatch.setenv("NO_COLOR", "1")
+
+        fake = self._FakeTtyStderr()
+        monkeypatch.setattr("sys.stderr", fake)
+
+        from hermes_cli.config import warn_deprecated_cwd_env_vars
+
+        warn_deprecated_cwd_env_vars()
+
+        out = fake.getvalue()
+        assert "TERMINAL_CWD" in out
+        assert "\033[" not in out

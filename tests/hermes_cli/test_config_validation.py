@@ -1,5 +1,6 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
+import io
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
@@ -7,7 +8,88 @@ from hermes_cli.config import (
     _KNOWN_ROOT_KEYS,
     validate_config_structure,
     ConfigIssue,
+    print_config_warnings,
 )
+
+
+class _FakeStream:
+    """A stream stand-in that reports a fixed TTY status and records output."""
+
+    def __init__(self, tty: bool):
+        self._tty = tty
+        self.buf = io.StringIO()
+
+    def isatty(self):
+        return self._tty
+
+    def write(self, s):
+        self.buf.write(s)
+        return len(s)
+
+
+class TestPrintConfigWarnings:
+    """print_config_warnings() must gate ANSI on the *stderr* stream.
+
+    It writes to stderr, so piped/systemd/gateway stderr (non-TTY) or
+    NO_COLOR must produce plain text — raw ESC sequences would leak as
+    jumbled '?[33m' garbage into logs.
+    """
+
+    _BAD_CONFIG = {
+        # custom_providers as a dict (not a list) -> error issue
+        "custom_providers": {"name": "test", "base_url": "https://example.com/v1"},
+    }
+
+    def test_colored_when_stderr_is_tty(self, monkeypatch):
+        fake = _FakeStream(tty=True)
+        monkeypatch.setattr("sys.stderr", fake)
+
+        print_config_warnings(self._BAD_CONFIG)
+
+        out = fake.buf.getvalue()
+        assert "Config issues detected" in out
+        assert "\033[31m" in out  # red error marker
+        assert "\033[33m" in out  # yellow section header
+
+    def test_plain_when_stderr_piped(self, monkeypatch):
+        fake = _FakeStream(tty=False)
+        monkeypatch.setattr("sys.stderr", fake)
+
+        print_config_warnings(self._BAD_CONFIG)
+
+        out = fake.buf.getvalue()
+        assert "Config issues detected" in out
+        assert "hermes doctor" in out
+        assert "\033[" not in out  # no raw ANSI escapes
+
+    def test_plain_when_stderr_piped_even_if_stdout_is_tty(self, monkeypatch):
+        # The decision must follow stderr, not the (colored) stdout.
+        monkeypatch.setattr("sys.stdout", _FakeStream(tty=True))
+        fake_err = _FakeStream(tty=False)
+        monkeypatch.setattr("sys.stderr", fake_err)
+
+        print_config_warnings(self._BAD_CONFIG)
+
+        assert "Config issues detected" in fake_err.buf.getvalue()
+        assert "\033[" not in fake_err.buf.getvalue()
+
+    def test_no_color_env_disables_color_on_tty(self, monkeypatch):
+        fake = _FakeStream(tty=True)
+        monkeypatch.setattr("sys.stderr", fake)
+        monkeypatch.setenv("NO_COLOR", "1")
+
+        print_config_warnings(self._BAD_CONFIG)
+
+        assert "Config issues detected" in fake.buf.getvalue()
+        assert "\033[" not in fake.buf.getvalue()
+
+    def test_healthy_config_is_silent(self, monkeypatch):
+        fake = _FakeStream(tty=True)
+        monkeypatch.setattr("sys.stderr", fake)
+
+        print_config_warnings({})
+
+        assert fake.buf.getvalue() == ""
 
 
 class TestCustomProvidersValidation:
