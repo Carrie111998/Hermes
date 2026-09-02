@@ -1089,8 +1089,14 @@ DEFAULT_CONFIG = {
     # cache_ttl: "5m" or "1h" (Anthropic-supported tiers). Other non-falsy
     # values are silently ignored. Falsy values (false, null, "off",
     # "disabled", "no", "none") disable prompt caching entirely.
+    # subagent_cache_ttl: TTL override for delegation subagents. "inherit"
+    #   (default) keeps cache_ttl; "5m"/"1h" pin a tier for subagents only;
+    #   a disable synonym turns caching off for subagents only. Lets a 1h
+    #   main-session cache coexist with 5m subagent caches, so short-lived
+    #   children don't pay the 2x 1h cache-write premium.
     "prompt_caching": {
         "cache_ttl": "5m",
+        "subagent_cache_ttl": "inherit",
     },
 
     # OpenRouter-specific settings.

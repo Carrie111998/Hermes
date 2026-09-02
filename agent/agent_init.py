@@ -1003,6 +1003,18 @@ def init_agent(
 
         _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
         _ttl = _pc_cfg.get("cache_ttl", "5m")
+        # Delegation subagents can carry their own tier (inspired by Claude
+        # Code v2.1.243's promptCacheTtl/subagentPromptCacheTtl split): a 1h
+        # cache amortizes across a long main conversation, but a subagent
+        # lives minutes — paying the 2x 1h write premium on every short-lived
+        # child is pure waste. prompt_caching.subagent_cache_ttl overrides
+        # the tier for platform == "subagent" agents; the default "inherit"
+        # (or any unknown value) keeps the main cache_ttl. A disable synonym
+        # ("off"/false/...) disables caching for subagents only.
+        if getattr(agent, "platform", None) == "subagent":
+            _sub_ttl = _pc_cfg.get("subagent_cache_ttl", "inherit")
+            if _sub_ttl in {"5m", "1h"} or cache_ttl_means_disabled(_sub_ttl):
+                _ttl = _sub_ttl
         if _ttl in {"5m", "1h"}:
             agent._cache_ttl = _ttl
         elif cache_ttl_means_disabled(_ttl):

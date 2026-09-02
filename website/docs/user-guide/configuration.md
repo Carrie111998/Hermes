@@ -1218,10 +1218,13 @@ The one explicit knob is the cache TTL tier Hermes requests on Anthropic-style b
 
 ```yaml
 prompt_caching:
-  cache_ttl: "5m"   # "5m" or "1h" (Anthropic-supported tiers); other values are ignored
+  cache_ttl: "5m"           # "5m" or "1h" (Anthropic-supported tiers); other values are ignored
+  subagent_cache_ttl: "inherit"  # optional per-subagent override: "inherit" (default), "5m", "1h", or a disable value
 ```
 
 `cache_ttl` selects the breakpoint TTL Hermes attaches for Claude via the native Anthropic API, OpenRouter, and Nous Portal. Only the two Anthropic-supported tiers (`"5m"`, `"1h"`) are honored — any other value is ignored. Providers with their own caps (e.g. Qwen Cloud, which maxes at 5 minutes) still clamp to what the upstream allows.
+
+`subagent_cache_ttl` gives delegation subagents (`delegate_task` children, including orchestrator batches) their own tier. The 1h tier costs 2x on cache writes and only pays off across a long-lived conversation — a subagent typically lives minutes, so pinning subagents to `"5m"` while the main session runs `"1h"` avoids paying the 1h write premium on every short-lived child. `"inherit"` (the default) keeps the main `cache_ttl`; a disable value (`"off"`, `false`, …) turns prompt caching off for subagents only.
 
 ## Auxiliary Models
 

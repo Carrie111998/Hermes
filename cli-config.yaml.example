@@ -767,6 +767,9 @@ compression:
 #
 prompt_caching:
   cache_ttl: "5m" # use "1h" for long sessions with pauses between turns
+  # subagent_cache_ttl: "inherit"  # "5m"/"1h" pin a tier for delegation
+  #   subagents only (e.g. keep a 1h main-session cache while short-lived
+  #   subagents stay at 5m and skip the 2x 1h write premium)
 
 # =============================================================================
 # Auxiliary Models (Advanced — Experimental)

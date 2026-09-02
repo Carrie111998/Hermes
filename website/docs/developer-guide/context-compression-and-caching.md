@@ -541,6 +541,7 @@ Prompt caching is automatically enabled when:
 # config.yaml — TTL is configurable (must be "5m" or "1h")
 prompt_caching:
   cache_ttl: "5m"
+  subagent_cache_ttl: "inherit"  # per-subagent tier override ("5m"/"1h"/disable); "inherit" keeps cache_ttl
 ```
 
 The CLI shows caching status at startup:
