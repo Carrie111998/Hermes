@@ -295,11 +295,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # Local-ahead: the remote tip is an ancestor of HEAD. Checked against
         # the FRESH upstream SHA (not the possibly stale origin/main tracking
         # ref) so a stale ref can't fake an up-to-date report.
-        ancestor = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", upstream_rev, "HEAD"],
-            capture_output=True, timeout=5, cwd=str(repo_dir),
-        )
-        if ancestor.returncode == 0:
+        # Routed through _git_stdout so a slow or hung git can't raise
+        # TimeoutExpired out of the background update thread and kill it.
+        # Returns "" when HEAD is a descendant, None on non-zero exit,
+        # timeout, or any other subprocess failure.
+        if _git_stdout(["merge-base", "--is-ancestor", upstream_rev, "HEAD"],
+                       cwd=repo_dir) is not None:
             return 0
         # Genuinely behind (or diverged). Recover the exact count via the
         # GitHub compare API; a local-only HEAD 404s there, which safely
@@ -677,8 +678,12 @@ def prefetch_update_check():
     """Kick off update check in a background daemon thread."""
     def _run():
         global _update_result
-        _update_result = check_for_updates()
-        _update_check_done.set()
+        try:
+            _update_result = check_for_updates()
+        except Exception:
+            _update_result = None  # inconclusive; never crash the daemon thread
+        finally:
+            _update_check_done.set()
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 

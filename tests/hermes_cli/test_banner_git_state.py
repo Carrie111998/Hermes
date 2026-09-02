@@ -48,8 +48,6 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
     is an ancestor of HEAD — that is "ahead", and reporting it as behind
     nudges the user into `hermes update`, which can wipe the carried work.
     """
-    from unittest.mock import MagicMock
-
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
@@ -60,13 +58,13 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
             return "b" * 40  # carried commit, differs from upstream tip
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return ""  # exit 0: upstream tip IS an ancestor of HEAD
         raise AssertionError(f"unexpected git call: {args}")
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
-        # merge-base --is-ancestor exits 0: upstream tip IS an ancestor of HEAD
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=0)),
     ):
         behind = banner._check_via_local_git(repo_dir)
 
@@ -75,8 +73,6 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
 
 def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
     """SSH fast path reports the exact count (compare API) when behind."""
-    from unittest.mock import MagicMock
-
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
@@ -87,13 +83,13 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
             return "b" * 40
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return None  # exit 1: not an ancestor -> genuinely behind
         raise AssertionError(f"unexpected git call: {args}")
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
-        # merge-base --is-ancestor exits 1: not an ancestor -> genuinely behind
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=3),
     ):
         behind = banner._check_via_local_git(repo_dir)
@@ -103,8 +99,6 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
 
 def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
     """Behind + compare API unreachable = honest no-count sentinel, never 1."""
-    from unittest.mock import MagicMock
-
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
@@ -115,14 +109,32 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
             return "b" * 40
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return None  # exit 1: not an ancestor -> genuinely behind
         raise AssertionError(f"unexpected git call: {args}")
 
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=None),
     ):
         behind = banner._check_via_local_git(repo_dir)
 
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_prefetch_update_check_survives_exception():
+    """A raising check must not kill the daemon thread or leave waiters hanging.
+
+    ``check_for_updates`` shells out to git; a hung git raises TimeoutExpired.
+    Uncaught, that killed the thread before it set the done event, so every
+    waiter burned its full timeout.
+    """
+    from hermes_cli import banner
+
+    with patch.object(banner, "check_for_updates", side_effect=RuntimeError("boom")):
+        banner._update_check_done.clear()
+        banner.prefetch_update_check()
+        assert banner._update_check_done.wait(timeout=5)
+
+    assert banner._update_result is None
