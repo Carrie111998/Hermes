@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from gateway.hosted_room_driver import TaskIdentity
-from gateway.hosted_room_peer import HostedMemberDispatch, PROTOCOL_VERSION
+from gateway.hosted_room_peer import (
+    HostedMemberDispatch,
+    PROTOCOL_VERSION,
+    attachment_manifest_digest,
+)
 from tui_gateway.hosted_room_driver import (
     ROOM_SESSION_SOURCE,
     HostedRoomBinding,
@@ -44,6 +48,47 @@ class HostedRoomPeerClient(Protocol):
         self,
         *,
         dispatch: Mapping[str, Any],
+        grant: str,
+    ) -> Mapping[str, Any]: ...
+
+    def stage_attachments(
+        self,
+        *,
+        dispatch: Mapping[str, Any],
+        attachments: Sequence[Mapping[str, Any]],
+        grant: str,
+    ) -> Mapping[str, Any]: ...
+
+    def discard_attachments(
+        self,
+        *,
+        task_id: str,
+        execution_generation: int,
+        grant: str,
+    ) -> Mapping[str, Any]: ...
+
+    def read_artifact(
+        self,
+        *,
+        run_id: str,
+        artifact_id: str,
+        grant: str,
+    ) -> bytes: ...
+
+    def acknowledge_artifacts(
+        self,
+        *,
+        run_id: str,
+        artifact_ids: Sequence[str],
+        manifest_digest: str,
+        message_event_id: str,
+        grant: str,
+    ) -> Mapping[str, Any]: ...
+
+    def discard_artifacts(
+        self,
+        *,
+        run_id: str,
         grant: str,
     ) -> Mapping[str, Any]: ...
 
@@ -138,7 +183,9 @@ class FailoverHostedRoomPeerClient:
             try:
                 result = getattr(candidate.client, method)(**kwargs)
             except Exception as exc:
-                if bool(getattr(exc, "ambiguous", False)):
+                if method != "stage_attachments" and bool(
+                    getattr(exc, "ambiguous", False)
+                ):
                     raise
                 if not bool(getattr(exc, "retryable", False)):
                     raise
@@ -155,6 +202,21 @@ class FailoverHostedRoomPeerClient:
 
     def dispatch(self, **kwargs):
         return self._call("dispatch", **kwargs)
+
+    def stage_attachments(self, **kwargs):
+        return self._call("stage_attachments", **kwargs)
+
+    def discard_attachments(self, **kwargs):
+        return self._call("discard_attachments", **kwargs)
+
+    def read_artifact(self, **kwargs):
+        return self._call("read_artifact", **kwargs)
+
+    def acknowledge_artifacts(self, **kwargs):
+        return self._call("acknowledge_artifacts", **kwargs)
+
+    def discard_artifacts(self, **kwargs):
+        return self._call("discard_artifacts", **kwargs)
 
     def history(self, **kwargs):
         return self._call("history", **kwargs)
@@ -185,6 +247,7 @@ class PeerMemberRoute:
     trace_id: str
     grant: str
     execution_policy_digest: str = ""
+    attachments: bool = False
 
 
 class PeerHostedRoomTransport(InternalSessionRPC):
@@ -221,6 +284,8 @@ class PeerHostedRoomTransport(InternalSessionRPC):
                 target_install_id=self.route.target_install_id,
                 target_profile=self.route.target_profile,
             )
+        self._attachment_attempt: tuple[str, int] | None = None
+        self._pending_attachments: list[dict[str, Any]] = []
 
     def _validate_coordinates(self, *, profile: str, source: str) -> None:
         if source != ROOM_SESSION_SOURCE:
@@ -275,6 +340,108 @@ class PeerHostedRoomTransport(InternalSessionRPC):
         self._session_id = session_id
         return session
 
+    def begin_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        """Start one peer-upload batch without admitting the target run."""
+
+        self._validate_coordinates(profile=profile, source=source)
+        if self._session_id not in {None, session_id}:
+            raise ValueError("peer room session changed during attachment staging")
+        if not self.task_id or execution_generation < 1:
+            raise ValueError("peer attachment attempt identity is unavailable")
+        attempt = (self.task_id, int(execution_generation))
+        if self._attachment_attempt not in {None, attempt}:
+            raise ValueError("peer attachment attempt changed during staging")
+        self._attachment_attempt = attempt
+        self._pending_attachments = []
+
+    def stage_attachment(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        attachment: Mapping[str, Any],
+        data: bytes,
+        execution_generation: int,
+    ) -> Mapping[str, Any]:
+        """Buffer verified home-owned bytes for one pre-admission peer push."""
+
+        self._validate_coordinates(profile=profile, source=source)
+        attempt = (str(self.task_id or ""), int(execution_generation))
+        if self._session_id not in {None, session_id} or self._attachment_attempt != attempt:
+            raise ValueError("peer attachment staging is outside its fenced attempt")
+        payload = bytes(data)
+        if int(attachment.get("size") or -1) != len(payload):
+            raise ValueError("peer attachment bytes no longer match their manifest")
+        manifest = {
+            "attachment_id": str(attachment.get("attachment_id") or ""),
+            "kind": str(attachment.get("kind") or ""),
+            "name": str(attachment.get("name") or ""),
+            "size": len(payload),
+            "mime": str(attachment.get("mime") or ""),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "data": payload,
+        }
+        self._pending_attachments.append(manifest)
+        return {"attached": True}
+
+    def commit_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        """Forget local bytes once target run admission becomes authoritative."""
+
+        self._validate_coordinates(profile=profile, source=source)
+        if self._attachment_attempt == (str(self.task_id or ""), int(execution_generation)):
+            self._attachment_attempt = None
+            self._pending_attachments = []
+
+    def _discard_terminal_attachments(self) -> None:
+        dispatch = self._dispatch
+        if dispatch is None or dispatch.attachment_manifest_digest is None:
+            return
+        discard = getattr(self.client, "discard_attachments", None)
+        if not callable(discard):
+            return
+        try:
+            discard(
+                task_id=dispatch.task_id,
+                execution_generation=dispatch.execution_generation,
+                grant=self.route.grant,
+            )
+        except Exception:
+            # Terminal observation retries this cleanup; target TTL and quotas
+            # remain the crash backstop.
+            return
+
+    def rollback_attachment_staging(
+        self,
+        *,
+        profile: str,
+        session_id: str,
+        source: str,
+        execution_generation: int,
+    ) -> None:
+        """Drop local bytes; target-side partial batches expire without admission."""
+
+        self.commit_attachment_staging(
+            profile=profile,
+            session_id=session_id,
+            source=source,
+            execution_generation=execution_generation,
+        )
+
     def submit(
         self,
         *,
@@ -289,6 +456,11 @@ class PeerHostedRoomTransport(InternalSessionRPC):
         self._validate_coordinates(profile=profile, source=source)
         if self._session_id not in {None, session_id}:
             raise ValueError("peer room session changed during admission")
+        pending = list(self._pending_attachments)
+        manifest = [
+            {key: item[key] for key in ("attachment_id", "kind", "name", "size", "mime", "sha256")}
+            for item in pending
+        ]
         dispatch = HostedMemberDispatch.from_mapping({
             "protocol_version": PROTOCOL_VERSION,
             "room_id": task.room_id,
@@ -307,27 +479,86 @@ class PeerHostedRoomTransport(InternalSessionRPC):
             "capability_digest": self.route.capability_digest,
             "execution_policy_digest": self.route.execution_policy_digest,
             "trace_id": self.route.trace_id or f"trace-{uuid.uuid4().hex}",
+            **(
+                {"attachment_manifest_digest": attachment_manifest_digest(manifest)}
+                if manifest
+                else {}
+            ),
         })
         self._dispatch = dispatch
         self._session_id = session_id
-        result = self.client.dispatch(
-            dispatch=dispatch.as_mapping(),
-            grant=self.route.grant,
-        )
+        if pending:
+            try:
+                self.client.stage_attachments(
+                    dispatch=dispatch.as_mapping(),
+                    attachments=pending,
+                    grant=self.route.grant,
+                )
+            except Exception as exc:
+                if (
+                    getattr(exc, "status_code", None) == 413
+                    and not bool(getattr(exc, "retryable", False))
+                ):
+                    # The peer definitively rejected bytes before /v1/runs.
+                    # Settle once instead of re-reading and re-uploading the
+                    # same file forever through the not-admitted retry path.
+                    self._discard_terminal_attachments()
+                    receipt = {
+                        "status": "failed",
+                        "settlement_id": (
+                            f"attachment-rejected:{dispatch.task_id}:"
+                            f"{dispatch.execution_generation}"
+                        ),
+                        "error": (
+                            "A Group Chat file exceeded the peer gateway's "
+                            "upload limit."
+                        ),
+                    }
+                    on_terminal(receipt)
+                    return receipt
+                # Binary staging is idempotent and always precedes /v1/runs.
+                # Even a lost upload response cannot mean the model run was
+                # admitted, so never wedge the room behind the run-admission
+                # ambiguity fence.
+                self._discard_terminal_attachments()
+                try:
+                    exc.not_admitted = True
+                    exc.ambiguous = False
+                except Exception:
+                    pass
+                raise
+        try:
+            result = self.client.dispatch(
+                dispatch=dispatch.as_mapping(),
+                grant=self.route.grant,
+            )
+        except Exception as exc:
+            if bool(getattr(exc, "not_admitted", False)):
+                self._discard_terminal_attachments()
+            raise
         if result.get("status") in {"settled", "failed", "cancelled"}:
             on_terminal(result)
+            self._discard_terminal_attachments()
         return result
 
     def history(
         self, *, profile: str, session_id: str, source: str
     ) -> Sequence[Mapping[str, Any]]:
         self._validate_coordinates(profile=profile, source=source)
-        return self.client.history(
+        history = self.client.history(
             room_id=self.binding.room_id,
             profile=profile,
             session_id=session_id,
             grant=self.route.grant,
         )
+        if any(
+            str(item.get("task_id") or "") == str(self.task_id or "")
+            and item.get("status") in {"cancelled", "failed", "settled"}
+            for item in history
+            if isinstance(item, Mapping)
+        ):
+            self._discard_terminal_attachments()
+        return history
 
     def info(self, *, profile: str, session_id: str, source: str) -> Mapping[str, Any]:
         self._validate_coordinates(profile=profile, source=source)
@@ -362,7 +593,14 @@ class PeerHostedRoomTransport(InternalSessionRPC):
             )
         if dispatch.task_id != expected_task_id:
             return None
-        return self.client.stop(
+        result = self.client.stop(
             dispatch=dispatch.as_mapping(),
             grant=self.route.grant,
         )
+        if isinstance(result, Mapping) and result.get("status") in {
+            "cancelled",
+            "failed",
+            "settled",
+        }:
+            self._discard_terminal_attachments()
+        return result

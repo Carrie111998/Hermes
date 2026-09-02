@@ -175,8 +175,85 @@ def test_superseded_room_authority_cannot_reuse_its_grant(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_grant_revoke_discards_only_matching_output_scope(
+    tmp_path,
+    monkeypatch,
+):
+    from gateway import hosted_rooms
+    from gateway.hosted_room_artifacts import RoomArtifactOutbox, RoomArtifactScope
+    from gateway import hosted_room_peer
+    from gateway.platforms import api_server_room_attachments
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        hosted_rooms,
+        "local_authority_gateway_id",
+        lambda: "install-target",
+    )
+    monkeypatch.setattr(hosted_rooms, "revoke_room_grant_scope", MagicMock())
+    claims = {
+        "room_id": "room-1",
+        "home_install_id": "install-home",
+        "authority_gateway_id": "gateway-home",
+        "authority_epoch": 3,
+        "member_id": "member-reviewer",
+        "target_install_id": "install-target",
+        "target_profile": "default",
+        "expires_at": time.time() + 300,
+        "status_expires_at": time.time() + 600,
+    }
+    monkeypatch.setattr(hosted_room_peer, "decode_room_grant", lambda *_a, **_k: claims)
+    monkeypatch.setattr(
+        api_server_room_attachments,
+        "_default_spool",
+        lambda: MagicMock(discard_scope=MagicMock()),
+    )
+
+    matching = RoomArtifactScope.from_mapping({
+        **{key: claims[key] for key in (
+            "room_id",
+            "home_install_id",
+            "authority_gateway_id",
+            "authority_epoch",
+            "member_id",
+            "target_install_id",
+            "target_profile",
+        )},
+        "task_id": "task-matching",
+        "execution_generation": 1,
+    })
+    other = RoomArtifactScope.from_mapping({
+        **matching.as_mapping(),
+        "task_id": "task-other",
+        "member_id": "member-other",
+    })
+    output = tmp_path / "handoff.md"
+    output.write_text("handoff\n", encoding="utf-8")
+    outbox = RoomArtifactOutbox(tmp_path / "state.db")
+    outbox.put_path(scope=matching, path=output)
+    outbox.put_path(scope=other, path=output)
+
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._read_json_body = AsyncMock(return_value=({}, None))
+    adapter._room_grant_token = MagicMock(return_value="signed-grant")
+    adapter._room_grant_secret = MagicMock(return_value=b"secret")
+    response = await adapter._handle_room_member_grant_revoke(object())
+
+    assert response.status == 200
+    assert outbox.list(matching) == []
+    assert len(outbox.list(other)) == 1
+
+
+@pytest.mark.asyncio
 async def test_capability_handler_uses_legacy_claims_monkeypatch(monkeypatch):
     from gateway import hosted_rooms
+    from gateway.platforms import api_server_room_attachments
+
+    monkeypatch.setattr(
+        api_server_room_attachments,
+        "roomlink_attachments_available",
+        lambda: True,
+    )
 
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     request = object()
@@ -205,6 +282,7 @@ async def test_capability_handler_uses_legacy_claims_monkeypatch(monkeypatch):
     assert response.status == 200
     assert body["object"] == "hermes.room_member.capabilities"
     assert body["target_profile"] == "worker"
+    assert body["catalog"]["attachments"] is True
     adapter._room_grant_claims.assert_called_once_with(
         request,
         permission="status",

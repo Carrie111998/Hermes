@@ -342,6 +342,16 @@ def clear_session_vars(tokens: list) -> None:
         pass
 
 
+def bind_session_source(source: str):
+    """Temporarily override only source without disturbing sibling context."""
+
+    return _SESSION_SOURCE.set(str(source or ""))
+
+
+def reset_session_source(token) -> None:
+    _SESSION_SOURCE.reset(token)
+
+
 def reset_session_vars() -> None:
     """Reset every session context variable to ``_UNSET`` for THIS context.
 
