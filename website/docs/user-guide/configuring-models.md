@@ -47,6 +47,20 @@ Type in the filter box to narrow by provider name, slug, or model ID.
 
 Pick a model, hit **Switch**, and Hermes writes it to `~/.hermes/config.yaml` under the `model` section. **This applies to new sessions only** — any chat tab you already have open keeps running whatever model it started with. To hot-swap the current chat, use the `/model` slash command inside it.
 
+### How Hermes resolves the model
+
+Hermes keeps three model states separate on purpose:
+
+| Layer | Set by | Lifetime |
+|---|---|---|
+| **Profile default** | Dashboard, `hermes model`, config | Used when a new session starts |
+| **Session override** | `/model` inside a conversation | Persists for that conversation until replaced or reset |
+| **Effective turn route** | Primary route or automatic fallback | The model serving the current turn; fallback is restored according to its retry policy |
+
+The profile card and Models page therefore show a **default**, not a promise about every active conversation. A durable session override takes precedence over that default, including after a gateway restart. Automatic fallback does not rewrite either selection; it is runtime failover for the turn. See [Fallback Providers](./features/fallback-providers.md) for the retry and restoration rules.
+
+This separation preserves intentional per-conversation choices and avoids silently resetting prompt caches. If you want the new default immediately, start a new session or use `/model` explicitly in the active conversation.
+
 ### Mid-session switches and context warnings
 
 When you switch models **inside an active session** (Herm TUI model picker, `hermes` CLI, or `/model` on Telegram/Discord), Hermes estimates whether your **next message** will run **preflight context compression** against the new model's window. If the session is already near or above that model's compression threshold (see [Context Compression](./configuration.md#context-compression)), the switch reply includes a warning — the same `warning_message` path used for expensive-model notices. The switch still applies immediately; compression runs on the **first user message after the switch**, before the model answers.
@@ -237,7 +251,7 @@ Older configs used a top-level `custom_providers:` list (with `base_url` instead
 ## When does it take effect?
 
 - **CLI** (`hermes chat`): next `hermes chat` invocation.
-- **Gateway** (Telegram, Discord, Slack, etc.): next *new* session. Existing sessions keep their model. Restart the gateway (`hermes gateway restart`) if you want to force all sessions to pick up the change.
+- **Gateway** (Telegram, Discord, Slack, etc.): next *new* session. Existing sessions keep their model. Restarting the gateway rebuilds unpinned sessions from the profile default, but a durable `/model` override is intentionally rehydrated and continues to win. Use `/new` to start from the default or `/model` to switch that conversation explicitly.
 - **Dashboard chat tab** (`/chat`): next new PTY. The currently-open chat keeps its model — use `/model` inside it to hot-swap.
 
 Changes never invalidate prompt caches on running sessions. That's deliberate: swapping the main model inside a session requires a cache reset (the system prompt contains model-specific content), and we reserve that for the explicit `/model` slash command inside chat.
@@ -250,7 +264,9 @@ Hermes lists a provider only if it has a working credential. Check **Keys** in t
 
 ### Main model didn't change in my running chat
 
-Expected. The dashboard writes `config.yaml`, which new sessions read. The currently-open chat is a live agent process — it keeps whatever model it was spawned with. Use `/model <name>` inside the chat to hot-swap that specific session.
+Expected. The dashboard writes `config.yaml`, which new sessions read. The currently-open chat is a live agent process — it keeps whatever model it was spawned with, and a durable `/model` override survives gateway restarts. Use `/model <name>` inside the chat to hot-swap that specific session, or `/new` to start a conversation from the profile default.
+
+If logs show a third model, check `fallback_providers`: the configured default, a session override, and the model serving a failed-over turn are different layers. Fallback is turn-scoped and does not change the saved profile default.
 
 ### Auxiliary override "didn't take effect"
 

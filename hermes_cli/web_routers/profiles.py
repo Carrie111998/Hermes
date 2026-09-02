@@ -1122,7 +1122,9 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     """Set the main model (``model.default`` + ``model.provider``) for a
     specific profile's config.yaml, without touching the dashboard's own
     active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
-    to the named profile via the HERMES_HOME override.
+    to the named profile via the HERMES_HOME override. This changes the
+    profile default only: durable per-session ``/model`` pins are preserved
+    deliberately so a config edit cannot silently reset active prompt caches.
     """
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
@@ -1134,7 +1136,15 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     except Exception as e:
         _log.exception("PUT /api/profiles/%s/model failed", name)
         raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "provider": provider, "model": model}
+    return {
+        "ok": True,
+        "provider": provider,
+        "model": model,
+        # This endpoint changes the profile default only. Durable /model pins
+        # remain session-scoped by design so an operator cannot silently break
+        # prompt caches in active conversations.
+        "applies_to": "new_sessions",
+    }
 
 
 @router.post("/api/profiles/{name}/describe-auto")

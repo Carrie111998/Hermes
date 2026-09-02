@@ -373,8 +373,13 @@ export const en: Translations = {
     modelInherit: "Inherit from clone / default",
     modelLoading: "Loading models…",
     modelNone: "No authenticated providers — set a key first",
-    editModel: "Change model",
-    modelSaved: "Model updated",
+    editModel: "Change default model",
+    modelSaved: "Default model updated for new sessions",
+    modelExistingSessions:
+      "Existing sessions keep their current model and any /model override.",
+    modelScopeUnconfirmed:
+      "Default model saved; affected session scope unconfirmed",
+    modelDefaultLabel: "Default model",
     modelSelect: "Select a model",
     actions: "Actions",
   },

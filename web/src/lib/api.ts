@@ -706,7 +706,12 @@ export const api = {
       },
     ),
   setProfileModel: (name: string, provider: string, model: string) =>
-    fetchJSON<{ ok: boolean; provider: string; model: string }>(
+    fetchJSON<{
+      ok: boolean;
+      provider: string;
+      model: string;
+      applies_to?: string;
+    }>(
       `/api/profiles/${encodeURIComponent(name)}/model`,
       {
         method: "PUT",
