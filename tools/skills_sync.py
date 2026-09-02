@@ -301,6 +301,33 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _dir_file_stats(directory: Path) -> Tuple[int, int]:
+    """Cheap stats for drift pre-check: file count + total size.
+
+    Used before the expensive _dir_hash(dest) in the fast-path
+    ``bundled_hash == origin_hash`` short-circuit. Counting files and
+    summing sizes is cheaper than hashing every file's content, so a
+    missing ``references/`` or ``LICENSE`` is caught without a full
+    hash. When stats differ we still verify with a full hash to avoid
+    false positives; when stats match we also hash to catch same-size
+    content drift. This is the cheap-verifiable + full-hash compromise
+    suggested in #97791.
+    """
+    count = 0
+    total = 0
+    try:
+        for p in directory.rglob("*"):
+            if p.is_file():
+                count += 1
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return count, total
+
+
 def _safe_rel_install_path(path: Path, base: Path) -> str:
     """Return a normalized relative POSIX path, rejecting traversal/absolute paths."""
     rel = path.relative_to(base)
@@ -883,15 +910,41 @@ def sync_skills(quiet: bool = False) -> dict:
             origin_hash = manifest.get(skill_name, "")
 
             # If the bundled source still matches the version recorded when
-            # it was installed, there is no update to apply. Avoid recursively
-            # hashing the user's copy just to rediscover that fact; when the
-            # bundled source changes, the normal user-modification check below
-            # still protects local edits before any overwrite.
+            # it was installed, verify destination integrity before skipping.
+            # Previous code short-circuited on source==manifest without ever
+            # hashing dest, so curator restores / partial installs / interrupted
+            # syncs left skills permanently frozen (#97791). Now use a
+            # cheap-verifiable + full-hash compromise: first compare file
+            # count/size, then fall back to _dir_hash(dest) to confirm.
             if origin_hash and bundled_hash == origin_hash:
-                skipped += 1
-                continue
-
-            user_hash = _dir_hash(dest)
+                try:
+                    b_count, b_size = _dir_file_stats(skill_src)
+                    d_count, d_size = _dir_file_stats(dest)
+                    if b_count != d_count or b_size != d_size:
+                        # Likely drift (e.g. missing references/LICENSE) — verify with hash
+                        _dest_hash = _dir_hash(dest)
+                        if _dest_hash == bundled_hash:
+                            skipped += 1
+                            continue
+                        user_hash = _dest_hash
+                    else:
+                        # Stats match — still hash to catch same-size content drift
+                        _dest_hash = _dir_hash(dest)
+                        if _dest_hash == bundled_hash:
+                            skipped += 1
+                            continue
+                        user_hash = _dest_hash
+                except Exception:
+                    # On any error, fall back to direct hash check
+                    _dest_hash = _dir_hash(dest)
+                    if _dest_hash == bundled_hash:
+                        skipped += 1
+                        continue
+                    user_hash = _dest_hash
+                # Drift detected (dest != bundled) — don't skip; fall through
+                # to user-modification / self-heal handling below with user_hash already set
+            else:
+                user_hash = _dir_hash(dest)
 
             if not origin_hash:
                 # v1 migration: no origin hash recorded. Set baseline from
@@ -902,6 +955,18 @@ def sync_skills(quiet: bool = False) -> dict:
                 else:
                     # Can't tell if user modified or bundled changed — be safe
                     skipped += 1
+                continue
+
+            # Self-heal stale manifest (second-order bug #97791): if the
+            # user's copy is already byte-identical to the current bundled
+            # version, it is stock, not a user modification — re-baseline
+            # the manifest instead of reporting it as user-modified forever.
+            # The copy may have been repaired manually or via curator restore;
+            # without this, user_hash != stale origin_hash keeps it flagged
+            # as user_modified even though it matches bundled.
+            if user_hash == bundled_hash:
+                manifest[skill_name] = bundled_hash
+                skipped += 1
                 continue
 
             if _is_tracked_user_modification(origin_hash, user_hash):
@@ -1199,7 +1264,21 @@ def list_user_modified_bundled_skills() -> List[dict]:
         dest = _compute_relative_dest(skill_dir, bundled_dir)
         if not dest.exists():
             continue
-        if _is_tracked_user_modification(origin_hash, _dir_hash(dest)):
+        user_hash = _dir_hash(dest)
+        # Self-heal same as sync_skills: if dest already equals bundled, it's stock
+        # — don't report as user-modified. The stale manifest will be re-baselined
+        # on next sync; doing it here too makes list immediately accurate.
+        bundled_hash = _dir_hash(skill_dir)
+        if user_hash == bundled_hash:
+            # Optionally re-baseline now so list and sync agree; best-effort
+            if origin_hash != bundled_hash:
+                try:
+                    manifest[skill_name] = bundled_hash
+                    _write_manifest(manifest)
+                except Exception:
+                    pass
+            continue
+        if _is_tracked_user_modification(origin_hash, user_hash):
             modified.append(
                 {"name": skill_name, "dest": dest, "bundled_src": skill_dir}
             )
