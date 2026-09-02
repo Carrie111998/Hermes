@@ -113,6 +113,9 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# Direct commentary is a fallback for failed stream-consumer setup. It must
+# never become a hard dependency for returning the final response.
+_DIRECT_COMMENTARY_FLUSH_TIMEOUT_SECONDS = 2.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -31824,16 +31827,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Commentary normally runs through the awaited stream consumer. If
             # setup failed it falls back to scheduled direct sends; wait for
-            # those before snapshotting cleanup IDs so successful late sends
-            # cannot escape the callback's deletion set.
+            # those briefly before snapshotting cleanup IDs. A wedged platform
+            # send must not block final delivery; unfinished commentary is left
+            # undeleted rather than turning this fallback into an availability
+            # dependency.
             if _direct_commentary_futures:
-                await asyncio.gather(
-                    *(
-                        asyncio.wrap_future(future)
-                        for future in _direct_commentary_futures
-                    ),
-                    return_exceptions=True,
+                _wrapped_commentary_futures = [
+                    asyncio.wrap_future(future)
+                    for future in _direct_commentary_futures
+                ]
+                _, _pending_commentary = await asyncio.wait(
+                    _wrapped_commentary_futures,
+                    timeout=_DIRECT_COMMENTARY_FLUSH_TIMEOUT_SECONDS,
                 )
+                if _pending_commentary:
+                    logger.warning(
+                        "Timed out waiting for %d direct commentary send(s); "
+                        "continuing with final delivery.",
+                        len(_pending_commentary),
+                    )
             
             # Unconditional abort + bounded wait for the streaming-TTS
             # consumer (#60671 hardening).  Covers cancellation / exception

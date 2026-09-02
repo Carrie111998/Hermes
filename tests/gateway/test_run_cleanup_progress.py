@@ -88,6 +88,19 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class HangingCommentaryAdapter(CleanupCaptureAdapter):
+    """Never completes the direct fallback commentary until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.commentary_release = asyncio.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if content == "Checking the relevant records now.":
+            await self.commentary_release.wait()
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+
 class NoDeleteAdapter(CleanupCaptureAdapter):
     """Adapter that inherits the base no-op delete_message (used to prove
     the cleanup path skips adapters without deletion support)."""
@@ -553,5 +566,61 @@ async def test_direct_commentary_fallback_is_tracked_before_cleanup_snapshot(
         if adapter.deleted:
             break
     assert commentary["message_id"] in {
+        entry["message_id"] for entry in adapter.deleted
+    }
+
+
+@pytest.mark.asyncio
+async def test_hung_direct_commentary_does_not_block_final_delivery(
+    monkeypatch, tmp_path,
+):
+    adapter = HangingCommentaryAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_DIRECT_COMMENTARY_FLUSH_TIMEOUT_SECONDS",
+        0.01,
+    )
+    stream_consumer_module = importlib.import_module("gateway.stream_consumer")
+    monkeypatch.setattr(
+        stream_consumer_module,
+        "GatewayStreamConsumer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("setup failed")),
+    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    _set_final_delivery_state(adapter, session_key, False)
+
+    result = await asyncio.wait_for(
+        runner._run_agent(
+            message="hello", context_prompt="", history=[], source=source,
+            session_id="commentary-direct-hung", session_key=session_key,
+        ),
+        timeout=1.0,
+    )
+
+    assert result["final_response"] == "done"
+    final_send = await adapter.send("-1001", result["final_response"])
+    assert final_send.success is True
+    assert not any(
+        entry["content"] == "Checking the relevant records now."
+        for entry in adapter.sent
+    )
+
+    adapter.commentary_release.set()
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if any(
+            entry["content"] == "Checking the relevant records now."
+            for entry in adapter.sent
+        ):
+            break
+    commentary = next(
+        entry for entry in adapter.sent
+        if entry["content"] == "Checking the relevant records now."
+    )
+    assert commentary["message_id"] not in {
         entry["message_id"] for entry in adapter.deleted
     }
