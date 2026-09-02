@@ -27257,10 +27257,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_cfg in self.config.platforms.items():
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
+                logger.info(
+                    "Home-channel startup notification skipped: %s has no configured home channel",
+                    platform.value,
+                )
                 continue
 
             transport = resolve_delivery_transport(platform, self.config, self.adapters)
             if transport is None:
+                logger.info(
+                    "Home-channel startup notification skipped: %s home channel %s has no live delivery transport",
+                    platform.value,
+                    home.chat_id,
+                )
                 continue
 
             if not platform_cfg.gateway_restart_notification:
