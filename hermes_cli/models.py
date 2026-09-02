@@ -4418,7 +4418,29 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         # safe source for the chat picker, including its empty/failure result.
         return _fetch_deepinfra_models(force_refresh=force_refresh) or []
     if normalized == "ollama-cloud":
-        live = fetch_ollama_cloud_models(force_refresh=force_refresh)
+        # Resolve the credential through the auth-store seam (registry env
+        # vars, preferring ~/.hermes/.env over the inherited process env,
+        # then the credential pool) instead of leaving the probe on
+        # fetch_ollama_cloud_models()'s bare os.environ fallback: desktop and
+        # service processes are launched from the GUI and inherit no shell
+        # exports, so a key the user logged in with never reached the live
+        # probe there and every stale refresh regressed the cache to the
+        # models.dev subset (#98243).
+        ollama_cloud_key = ""
+        ollama_cloud_base = ""
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("ollama-cloud")
+            ollama_cloud_key = str(creds.get("api_key") or "").strip()
+            ollama_cloud_base = str(creds.get("base_url") or "").strip()
+        except Exception:
+            pass
+        live = fetch_ollama_cloud_models(
+            api_key=ollama_cloud_key or None,
+            base_url=ollama_cloud_base or None,
+            force_refresh=force_refresh,
+        )
         if live:
             return live
     if normalized in ("openai", "openai-api"):
@@ -6841,6 +6863,20 @@ def fetch_ollama_cloud_models(
     if live_models or mdev_models:
         seen: set[str] = set()
         merged: list[str] = []
+        if not live_models:
+            # An empty live probe (no resolvable credential, network outage)
+            # means models.dev is the only fresh source here — and it is a
+            # SUBSET of the live catalog. Letting it overwrite a previously
+            # fetched cache would silently drop every model models.dev hasn't
+            # synced yet, and the refreshed cached_at would then hide the
+            # loss from every picker for the next TTL window (#98243). Seed
+            # the merge with the stale entry so a failed probe can only ever
+            # ADD models.
+            stale_entry = _load_ollama_cloud_cache(ignore_ttl=True)
+            for m in (stale_entry or {}).get("models") or []:
+                if m and m not in seen:
+                    seen.add(m)
+                    merged.append(m)
         for m in live_models:
             if m and m not in seen:
                 seen.add(m)

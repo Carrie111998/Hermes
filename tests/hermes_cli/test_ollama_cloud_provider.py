@@ -347,3 +347,123 @@ class TestOllamaCloudSuffixStripping:
         assert _strip_ollama_cloud_suffix("qwen3-coder:480b-cloud") == "qwen3-coder:480b"
         assert _strip_ollama_cloud_suffix("nemotron-3-nano:30b") == "nemotron-3-nano:30b"
         assert _strip_ollama_cloud_suffix("") == ""
+
+
+# ── Credential Resolution & Cache Preservation (#98243) ──
+
+class TestOllamaCloudCredentialResolution:
+    """provider_model_ids must feed the live probe with the auth-store credential.
+
+    Desktop/service processes are launched from the GUI and inherit no shell
+    exports, so an OLLAMA_API_KEY the user logged in with (in ~/.hermes/.env
+    or the credential pool) never reached the probe when it only consulted
+    os.environ — the cache then regressed to the models.dev subset and the
+    picker dropped models the CLI still listed (#98243).
+    """
+
+    def test_provider_model_ids_passes_auth_store_key_to_probe(self, tmp_path, monkeypatch):
+        import os as _os
+
+        from hermes_cli.models import provider_model_ids
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+        # The fake credential lives in the environment, matching how the
+        # auth-store seam surfaces a real key to the resolver.
+        monkeypatch.setenv("MOCK_AUTHSTORE_OLLAMA_KEY", "authstore-key")
+
+        def _fake_resolve(pid):
+            return {
+                "api_key": _os.environ["MOCK_AUTHSTORE_OLLAMA_KEY"],
+                "base_url": "https://ollama.com/v1",
+            }
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            side_effect=_fake_resolve,
+        ) as mock_resolve, \
+             patch("hermes_cli.models.fetch_api_models", return_value=["deepseek-v4-flash:0731"]) as mock_fetch, \
+             patch("agent.models_dev.fetch_models_dev", return_value={}):
+            result = provider_model_ids("ollama-cloud", force_refresh=True)
+
+        mock_resolve.assert_called_once_with("ollama-cloud")
+        assert mock_fetch.call_args.args[0] == "authstore-key"
+        assert "deepseek-v4-flash:0731" in result
+
+    def test_provider_model_ids_survives_auth_resolution_failure(self, tmp_path, monkeypatch):
+        """A failing auth resolution falls back to the env-key path, not an exception."""
+        from hermes_cli.models import provider_model_ids
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "env-key")
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            side_effect=Exception("auth store unreadable"),
+        ), \
+             patch("hermes_cli.models.fetch_api_models", return_value=["glm-5.3"]) as mock_fetch, \
+             patch("agent.models_dev.fetch_models_dev", return_value={}):
+            result = provider_model_ids("ollama-cloud", force_refresh=True)
+
+        assert mock_fetch.call_args.args[0] == "env-key"
+        assert "glm-5.3" in result
+
+
+class TestOllamaCloudFailedProbeCachePreservation:
+    """An empty live probe must not overwrite the cache with the models.dev subset."""
+
+    def test_failed_probe_keeps_cached_models(self, tmp_path, monkeypatch):
+        import json
+        import time as _time
+
+        from hermes_cli.models import fetch_ollama_cloud_models, _ollama_cloud_cache_path
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+
+        cache_path = _ollama_cloud_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({
+            "models": ["deepseek-v4-flash:0731", "mistral-large-3:675b"],
+            "cached_at": _time.time() - 7200,
+        }))
+
+        mock_mdev = {"ollama-cloud": {"models": {"glm-5": {"tool_call": True}}}}
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+            result = fetch_ollama_cloud_models(force_refresh=True)
+
+        assert "glm-5" in result
+        assert "deepseek-v4-flash:0731" in result
+        assert "mistral-large-3:675b" in result
+
+        saved = json.loads(cache_path.read_text())
+        assert "deepseek-v4-flash:0731" in saved["models"]
+        assert "mistral-large-3:675b" in saved["models"]
+
+    def test_successful_probe_still_replaces_cache(self, tmp_path, monkeypatch):
+        """A successful live probe remains authoritative: dropped models stay dropped."""
+        import json
+        import time as _time
+
+        from hermes_cli.models import fetch_ollama_cloud_models, _ollama_cloud_cache_path
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+
+        cache_path = _ollama_cloud_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({
+            "models": ["retired-model"],
+            "cached_at": _time.time() - 7200,
+        }))
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b"]), \
+             patch("agent.models_dev.fetch_models_dev", return_value={}):
+            result = fetch_ollama_cloud_models(force_refresh=True)
+
+        assert result == ["qwen3.5:397b"]
+        assert "retired-model" not in result
+
+        saved = json.loads(cache_path.read_text())
+        assert saved["models"] == ["qwen3.5:397b"]
