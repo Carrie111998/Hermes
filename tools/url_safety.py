@@ -209,6 +209,17 @@ _MAX_SSRF_CONNECT_IPS = 8
 # VPNs, and some cloud internal networks.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+# NAT64 well-known prefix (RFC 6052). IPv6-only networks (carrier mobile
+# data, some enterprise/hotel WLANs) run DNS64, which answers AAAA queries
+# for hosts that only publish A records with synthesized addresses under
+# 64:ff9b::/96 — i.e. how most of the IPv4 internet appears on those
+# networks. CPython classifies the prefix as is_reserved, so treating
+# is_reserved as "internal" here blocks ordinary public websites on any
+# IPv6-only client while the same URLs load fine everywhere else. These
+# addresses are judged by their embedded IPv4 address instead (which may
+# itself be private — a DNS64 answer for an RFC1918 host stays blocked).
+_NAT64_WELLKNOWN_NETWORK = ipaddress.ip_network("64:ff9b::/96")
+
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
 # ---------------------------------------------------------------------------
@@ -296,6 +307,19 @@ def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
                 embedded_ip.is_link_local or embedded_ip.is_reserved or
                 embedded_ip.is_multicast or embedded_ip.is_unspecified or
                 embedded_ip in _CGNAT_NETWORK)
+
+    # DNS64 answers (RFC 6052 ``64:ff9b::/96``): these wrap a public IPv4
+    # destination for IPv6-only clients, not an internal network — CPython
+    # marks the well-known prefix reserved, which would otherwise false-
+    # positive every A-only hostname on IPv6-only networks. Judge the
+    # address by its embedded IPv4 bits instead.
+    if (
+        isinstance(ip, ipaddress.IPv6Address)
+        and ip.version == 6
+        and ip in _NAT64_WELLKNOWN_NETWORK
+    ):
+        embedded_ip = ipaddress.ip_address(ip.packed[-4:])
+        return _is_blocked_ip(embedded_ip)
 
     # Standard IPv4/IPv6 address checking
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
