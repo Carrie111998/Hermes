@@ -9,6 +9,7 @@ from hermes_cli.cli_output import line_input
 import json
 import logging
 import os
+import plistlib
 import shlex
 import shutil
 import signal
@@ -5542,7 +5543,24 @@ def launchd_plist_is_current() -> bool:
     if not plist_path.exists():
         return False
 
-    installed = plist_path.read_text(encoding="utf-8")
+    # macOS launchd commonly rewrites installed plists to binary format on
+    # bootstrap (and ``launchctl`` may also normalize XML plists back to binary).
+    # The previous ``read_text(encoding="utf-8")`` crashed on the binary header
+    # byte (``bplist00`` starts with ``0xd8``), throwing ``UnicodeDecodeError``
+    # out of every ``gateway status`` / ``gateway install`` / auto-refresh path
+    # once the plist was binary (issue #90606).
+    #
+    # ``plistlib`` transparently handles both binary and XML; re-emit as XML so
+    # the existing text normalizer can compare against the generated plist.  A
+    # corrupt or unparseable plist reports "not current" so the auto-refresh
+    # path self-heals by rewriting the plist instead of crashing with a
+    # different error (the original bug class).
+    try:
+        with plist_path.open("rb") as _f:
+            _installed_data = plistlib.load(_f)
+    except Exception:
+        return False
+    installed = plistlib.dumps(_installed_data, fmt=plistlib.FMT_XML).decode("utf-8")
     expected = generate_launchd_plist()
     return _normalize_launchd_plist_for_comparison(
         installed
