@@ -3152,11 +3152,11 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
                     try:
+                        t.cancel()
                         await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                    except (asyncio.CancelledError, RuntimeError, Exception):
+                        pass  # RuntimeError: Event loop is closed — benign shutdown race
 
         if self._shutdown_event.is_set():
             self._fail_inflight_calls("shutdown")
@@ -3200,11 +3200,11 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
                     try:
+                        t.cancel()
                         await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                    except (asyncio.CancelledError, RuntimeError, Exception):
+                        pass  # RuntimeError: Event loop is closed — benign shutdown race
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()
