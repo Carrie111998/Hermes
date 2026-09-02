@@ -20,6 +20,14 @@ import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
 import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
+import {
+  encodeRealtimeVoiceDelegationProgress,
+  encodeRealtimeVoiceDelegationResult,
+  parseRealtimeVoiceEvent,
+  parseRealtimeVoicePhase,
+  type RealtimeVoicePhase,
+  type RealtimeVoiceTranscript
+} from '../domain/realtimeVoice.js'
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -203,10 +211,13 @@ export function useMainApp(gw: GatewayClient) {
   const [voiceRecording, setVoiceRecording] = useState(false)
   const [voiceProcessing, setVoiceProcessing] = useState(false)
   const [realtimeVoiceConnecting, setRealtimeVoiceConnecting] = useState(false)
+  const [realtimeVoicePhase, setRealtimeVoicePhase] = useState<RealtimeVoicePhase | null>(null)
+  const [realtimeVoiceTranscript, setRealtimeVoiceTranscript] = useState<RealtimeVoiceTranscript | null>(null)
   const [realtimeVoiceVisualizer, setRealtimeVoiceVisualizer] = useState<'orb' | 'waveform'>('orb')
   const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false)
   const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
   const realtimeVoiceRef = useRef<ChildProcess | null>(null)
+  const realtimeVoiceDelegationRef = useRef<null | { child: ChildProcess; id: string }>(null)
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
   const [dashboardFreshSessionId, setDashboardFreshSessionId] = useState<null | string>(null)
   const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
@@ -503,30 +514,85 @@ export function useMainApp(gw: GatewayClient) {
 
       const child = spawn(python, ['-u', resolve(sourceRoot, 'hermes'), 'talk'], {
         cwd: process.cwd(),
-        env: process.env,
-        stdio: ['ignore', 'pipe', 'pipe']
+        env: { ...process.env, HERMES_TALK_EVENT_STREAM: 'jsonl' },
+        stdio: ['pipe', 'pipe', 'pipe']
       })
       realtimeVoiceRef.current = child
       setRealtimeVoiceActive(true)
       setRealtimeVoiceConnecting(true)
       setVoiceEnabled(true)
       setVoiceRecording(false)
+      setRealtimeVoicePhase(null)
+      setRealtimeVoiceTranscript(null)
       setVoiceProcessing(false)
       sys('Connecting native realtime voice…')
 
       let errorText = ''
 
       let readyText = ''
+      let stdoutBuffer = ''
+      let ready = false
       child.stdout?.setEncoding('utf8')
       const onStdout = (chunk: string) => {
         readyText = `${readyText}${chunk}`.slice(-2048)
+        stdoutBuffer += chunk
+        const lines = stdoutBuffer.split('\n')
+        stdoutBuffer = lines.pop() ?? ''
+        for (const line of lines) {
+          const phase = parseRealtimeVoicePhase(line)
 
-        if (!readyText.includes('talk: connected (') || realtimeVoiceRef.current !== child) {
+          if (phase && realtimeVoiceRef.current === child) {
+            setRealtimeVoicePhase(phase)
+            setVoiceRecording(phase === 'listening')
+            setVoiceProcessing(phase !== 'listening')
+            continue
+          }
+
+          const event = parseRealtimeVoiceEvent(line)
+
+          if (!event || realtimeVoiceRef.current !== child) {
+            continue
+          }
+
+          if (event.type === 'transcript') {
+            setRealtimeVoiceTranscript(event)
+
+            if (event.role === 'assistant' && event.final && event.text.trim()) {
+              appendMessage({ role: 'assistant', text: event.text.trim() })
+            }
+
+            continue
+          }
+
+
+          if (event.type === 'error') {
+            errorText = `${errorText}\n${event.message}`.slice(-4000)
+            sys(`Native realtime voice error: ${event.message}`)
+            continue
+          }
+          const pending = realtimeVoiceDelegationRef.current
+
+          if (pending) {
+            child.stdin?.write(
+              encodeRealtimeVoiceDelegationResult(event.id, 'A Hermes text-agent request is already running.')
+            )
+            continue
+          }
+
+          realtimeVoiceDelegationRef.current = { child, id: event.id }
+          setRealtimeVoicePhase('solving')
+          setVoiceRecording(false)
+          setVoiceProcessing(true)
+          submitRef.current(event.request)
+        }
+
+        if (ready || !readyText.includes('talk: connected (') || realtimeVoiceRef.current !== child) {
           return
         }
 
-        child.stdout?.off('data', onStdout)
+        ready = true
         setRealtimeVoiceConnecting(false)
+        setRealtimeVoicePhase('listening')
         setVoiceRecording(true)
         sys('Native realtime voice ready · listening · Ctrl+B to end')
       }
@@ -543,7 +609,10 @@ export function useMainApp(gw: GatewayClient) {
         realtimeVoiceRef.current = null
         setRealtimeVoiceActive(false)
         setVoiceRecording(false)
+        setRealtimeVoicePhase(null)
         setVoiceEnabled(false)
+        setRealtimeVoiceTranscript(null)
+        realtimeVoiceDelegationRef.current = null
         sys(`Native realtime voice failed: ${error.message}`)
         setRealtimeVoiceConnecting(false)
       })
@@ -556,6 +625,9 @@ export function useMainApp(gw: GatewayClient) {
         setRealtimeVoiceActive(false)
         setVoiceRecording(false)
         setVoiceProcessing(false)
+        setRealtimeVoicePhase(null)
+        setRealtimeVoiceTranscript(null)
+        realtimeVoiceDelegationRef.current = null
         setVoiceEnabled(false)
         const detail = errorText.trim().split('\n').at(-1)
         setRealtimeVoiceConnecting(false)
@@ -567,7 +639,7 @@ export function useMainApp(gw: GatewayClient) {
         }
       })
     },
-    [sys]
+    [appendMessage, sys]
   )
 
   useEffect(
@@ -1013,8 +1085,43 @@ export function useMainApp(gw: GatewayClient) {
 
   onEventRef.current = onEvent
 
+  const finishRealtimeVoiceDelegation = useCallback((ev: GatewayEvent) => {
+    const pending = realtimeVoiceDelegationRef.current
+
+    if (!pending || realtimeVoiceRef.current !== pending.child) {
+      return
+    }
+
+    if (ev.type === 'message.interim') {
+      const progress = String(ev.payload?.text ?? '').trim()
+
+      if (progress) {
+        pending.child.stdin?.write(encodeRealtimeVoiceDelegationProgress(pending.id, progress))
+      }
+      return
+    }
+
+    if (ev.type !== 'message.complete') {
+      return
+    }
+
+    const output = String(ev.payload?.text ?? ev.payload?.rendered ?? '').trim()
+
+
+    pending.child.stdin?.write(
+      encodeRealtimeVoiceDelegationResult(
+        pending.id,
+        output || 'The Hermes text agent completed without a visible response.'
+      )
+    )
+    realtimeVoiceDelegationRef.current = null
+  }, [])
+
   useEffect(() => {
-    const handler = (ev: GatewayEvent) => onEventRef.current(ev)
+    const handler = (ev: GatewayEvent) => {
+      onEventRef.current(ev)
+      finishRealtimeVoiceDelegation(ev)
+    }
 
     const exitHandler = () => {
       turnController.reset()
@@ -1059,7 +1166,7 @@ export function useMainApp(gw: GatewayClient) {
       gw.off('event', handler)
       gw.off('exit', exitHandler)
     }
-  }, [gw, sys])
+  }, [finishRealtimeVoiceDelegation, gw, sys])
 
   useLongRunToolCharms()
 
@@ -1391,6 +1498,8 @@ export function useMainApp(gw: GatewayClient) {
             ? '◉ STT'
             : `voice ${voiceEnabled ? 'on' : 'off'}${voiceTts ? ' [tts]' : ''}`,
       realtimeVoiceConnecting,
+      realtimeVoicePhase,
+      realtimeVoiceTranscript,
       realtimeVoiceVisualizer,
       voiceProcessing,
       voiceRecording
@@ -1404,6 +1513,8 @@ export function useMainApp(gw: GatewayClient) {
       stickyPrompt,
       turnStartedAt,
       realtimeVoiceConnecting,
+      realtimeVoicePhase,
+      realtimeVoiceTranscript,
       realtimeVoiceVisualizer,
       ui,
       voiceEnabled,

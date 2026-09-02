@@ -37,4 +37,12 @@ describe('renderVoiceWaveform', () => {
     expect(voiceVisualizationFooter('waiting')).toBe('Waiting for realtime voice…')
     expect(voiceVisualizationFooter('listening')).toBe('Listening · press the voice key to stop')
   })
+
+  it('preserves distinct solving and composing phases', () => {
+    expect(voiceVisualizationFooter('solving')).toBe('Solving…')
+    expect(voiceVisualizationFooter('composing')).toBe('Speaking…')
+    expect(renderVoiceVisualization('orb', 19, 3, 'solving')).not.toEqual(
+      renderVoiceVisualization('orb', 19, 3, 'composing')
+    )
+  })
 })

@@ -2,6 +2,7 @@ import type { MouseTrackingMode, ScrollBoxHandle } from '@hermes/ink'
 import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'react'
 
 import type { PasteEvent } from '../components/textInput.js'
+import type { RealtimeVoicePhase, RealtimeVoiceTranscript } from '../domain/realtimeVoice.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type {
   BillingCardInfo,
@@ -612,6 +613,8 @@ export interface AppLayoutStatusProps {
   turnStartedAt: null | number
   voiceLabel: string
   realtimeVoiceConnecting: boolean
+  realtimeVoicePhase: RealtimeVoicePhase | null
+  realtimeVoiceTranscript: RealtimeVoiceTranscript | null
   realtimeVoiceVisualizer: 'orb' | 'waveform'
   voiceProcessing: boolean
   voiceRecording: boolean

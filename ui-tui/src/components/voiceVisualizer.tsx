@@ -2,12 +2,14 @@ import { Box, Text } from '@hermes/ink'
 import { renderTuiOrb } from 'thinking-orbs/tui'
 import { useEffect, useMemo, useState } from 'react'
 
+import type { RealtimeVoicePhase, RealtimeVoiceTranscript } from '../domain/realtimeVoice.js'
 import type { Theme } from '../theme.js'
 
 export interface VoiceVisualizerProps {
   columns: number
-  mode: 'listening' | 'thinking' | 'waiting'
+  mode: RealtimeVoicePhase | 'waiting'
   t: Theme
+  transcript?: RealtimeVoiceTranscript | null
   visualizer: 'orb' | 'waveform'
 }
 
@@ -48,7 +50,7 @@ export function renderVoiceVisualization(
     return renderVoiceWaveform(width, frame, active)
   }
 
-  const orbState = mode === 'waiting' ? 'connecting' : active ? 'listening' : 'solving'
+  const orbState = mode === 'waiting' ? 'connecting' : mode
 
   return renderTuiOrb(orbState, {
     columns: width,
@@ -60,14 +62,16 @@ export function renderVoiceVisualization(
 }
 
 export function voiceVisualizationFooter(mode: VoiceVisualizerProps['mode']): string {
-  return mode === 'waiting'
-    ? 'Waiting for realtime voice…'
-    : mode === 'listening'
-      ? 'Listening · press the voice key to stop'
-      : 'Transcribing…'
+  if (mode === 'waiting') {
+    return 'Waiting for realtime voice…'
+  }
+  if (mode === 'listening') {
+    return 'Listening · press the voice key to stop'
+  }
+  return mode === 'composing' ? 'Speaking…' : 'Solving…'
 }
 
-export function VoiceVisualizer({ columns, mode, t, visualizer }: VoiceVisualizerProps) {
+export function VoiceVisualizer({ columns, mode, t, transcript, visualizer }: VoiceVisualizerProps) {
   const [frame, setFrame] = useState(0)
 
   useEffect(() => {
@@ -79,7 +83,6 @@ export function VoiceVisualizer({ columns, mode, t, visualizer }: VoiceVisualize
   const panelWidth = Math.max(24, columns - 2)
   const innerWidth = panelWidth - 2
   const orbColumns = Math.min(ORB_COLUMNS, Math.max(6, innerWidth))
-  const orbPadding = Math.max(0, Math.floor((innerWidth - orbColumns) / 2))
   const active = mode === 'listening'
   const renderWidth = visualizer === 'orb' ? orbColumns : innerWidth
   const lines = useMemo(
@@ -92,9 +95,15 @@ export function VoiceVisualizer({ columns, mode, t, visualizer }: VoiceVisualize
     <Box borderColor={t.color.border} borderStyle="single" flexDirection="column" width={panelWidth}>
       {lines.map((line, index) => (
         <Text color={visualizer === 'orb' ? t.color.accent : active ? t.color.ok : t.color.warn} key={index}>
-          {visualizer === 'orb' ? `${' '.repeat(orbPadding)}${line}` : line}
+          {line}
         </Text>
       ))}
+      {transcript?.text.trim() ? (
+        <Text color={transcript.role === 'user' ? t.color.text : t.color.accent}>
+          {transcript.role === 'user' ? 'you › ' : 'voice › '}
+          {transcript.text.trim()}
+        </Text>
+      ) : null}
       <Text color={t.color.muted}>{footer}</Text>
     </Box>
   )

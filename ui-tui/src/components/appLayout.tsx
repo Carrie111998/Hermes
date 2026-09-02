@@ -282,11 +282,8 @@ const ComposerPane = memo(function ComposerPane({
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
   const voiceMode = status.realtimeVoiceConnecting
     ? 'waiting'
-    : status.voiceRecording
-      ? 'listening'
-      : status.voiceProcessing
-        ? 'thinking'
-        : null
+    : status.realtimeVoicePhase ??
+      (status.voiceRecording ? 'listening' : status.voiceProcessing ? 'solving' : null)
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -396,6 +393,7 @@ const ComposerPane = memo(function ComposerPane({
               columns={composer.cols}
               mode={voiceMode}
               t={ui.theme}
+              transcript={status.realtimeVoiceTranscript}
               visualizer={status.realtimeVoiceVisualizer}
             />
           ) : (
