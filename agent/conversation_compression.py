@@ -51,6 +51,7 @@ thread, not the conversation thread. Extension authors must assume:
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import copy
 import inspect
@@ -1058,6 +1059,41 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
     except concurrent.futures.CancelledError:
         # Never started; nothing can be in flight.
         return True
+    except Exception:
+        # The worker raised — it exited. The exception is intentionally
+        # swallowed here: the host already chose the fallback result, and the
+        # fence prevents the failed attempt from touching session state.
+        logger.debug(
+            "cancelled compression worker exited with an exception",
+            exc_info=True,
+        )
+        return True
+
+
+async def _join_cancelled_worker_async(future: Any, grace_seconds: float) -> bool:
+    """Async-safe counterpart to :func:`_join_cancelled_worker`.
+
+    For a host that drives a fence-cancelled compression worker via
+    ``loop.run_in_executor`` inside a coroutine (e.g. gateway session
+    hygiene) instead of blocking a thread on
+    ``concurrent.futures.Future.result``. Same contract: returns True when
+    the worker future settled within ``grace_seconds``, False if it is still
+    running. Uses ``asyncio.shield`` so a timeout here never cancels the
+    underlying future — a caller that still needs to await/observe it
+    afterward (e.g. deferred cleanup) sees the same object in the same
+    state as if this join had never happened.
+    """
+    try:
+        grace = max(float(grace_seconds), 0.0)
+    except (TypeError, ValueError):
+        grace = 0.0
+    try:
+        await asyncio.wait_for(asyncio.shield(future), timeout=grace)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    except asyncio.CancelledError:
+        raise
     except Exception:
         # The worker raised — it exited. The exception is intentionally
         # swallowed here: the host already chose the fallback result, and the

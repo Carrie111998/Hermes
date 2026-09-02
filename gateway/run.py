@@ -50,6 +50,8 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
+    _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS,
+    _join_cancelled_worker_async,
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -22406,11 +22408,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # successful compaction as a timeout.
                                             _compressed, _ = await _hyg_future
                                         else:
-                                            # Release an inactivity-timed-out
-                                            # worker's holder-qualified lease
-                                            # promptly. Total-ceiling attempts
-                                            # retained it above, so this is a
-                                            # no-op until worker cleanup there.
+                                            # #97488 teardown (total-ceiling path
+                                            # only): mirror the CLI's bounded-grace
+                                            # join (agent.conversation_compression.
+                                            # _join_cancelled_worker) before releasing
+                                            # the lease early. A worker that exits
+                                            # within grace proves no provider call is
+                                            # still in flight, so the lease can be
+                                            # freed immediately instead of staying
+                                            # retained for the rest of the process's
+                                            # lifetime. Inactivity timeouts skip the
+                                            # join and fall straight through to the
+                                            # release below, matching the established
+                                            # behavior for a provider call that may
+                                            # never return.
+                                            if _hyg_total_exhausted:
+                                                _hyg_grace = min(
+                                                    _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS,
+                                                    _hyg_total_ceiling_seconds,
+                                                )
+                                                _hyg_worker_exited = await _join_cancelled_worker_async(
+                                                    _hyg_future, _hyg_grace
+                                                )
+                                                if _hyg_worker_exited:
+                                                    _hyg_commit_fence.allow_cancelled_lock_release()
+                                                else:
+                                                    logger.warning(
+                                                        "Cancelled session hygiene "
+                                                        "compression worker for session "
+                                                        "%s did not exit within %.1fs "
+                                                        "grace — orphaning it behind the "
+                                                        "poison fence (late result will "
+                                                        "be discarded); retaining the "
+                                                        "session compression lease until "
+                                                        "it exits so no new attempt "
+                                                        "overlaps it",
+                                                        session_entry.session_id,
+                                                        _hyg_grace,
+                                                    )
+                                            # Release an inactivity-timed-out worker's
+                                            # holder-qualified lease promptly. A
+                                            # total-ceiling worker that exited within
+                                            # grace above is released here too; one
+                                            # that didn't stays retained until its own
+                                            # eventual cleanup.
                                             _hyg_commit_fence.release_cancelled_compression_lock()
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
