@@ -1191,6 +1191,31 @@ def _tenv_read(name: str, default: str = "") -> str:
     return terminal_env(name, default)
 
 
+def _cleanup_probe_environment(env) -> None:
+    """Tear down the throwaway environment created for a backend probe.
+
+    Docker's cleanup defaults to persist-mode (leaves the container running),
+    so the probe must force-remove; other backends stop/terminate on a plain
+    cleanup() and don't accept force_remove. Best-effort: a cleanup failure
+    must never break system-prompt building.
+    """
+    if env is None:
+        return
+    cleanup = getattr(env, "cleanup", None)
+    if not callable(cleanup):
+        return
+    try:
+        cleanup(force_remove=True)
+    except TypeError:
+        # Backend cleanup() without the force_remove kwarg (non-docker).
+        try:
+            cleanup()
+        except Exception as e:
+            logger.debug("Backend probe cleanup failed: %s", e)
+    except Exception as e:
+        logger.debug("Backend probe cleanup failed: %s", e)
+
+
 def _probe_remote_backend(env_type: str) -> str | None:
     """Run a tiny introspection command inside the active terminal backend.
 
@@ -1281,7 +1306,15 @@ def _probe_remote_backend(env_type: str) -> str | None:
             "\"$(uname -r 2>/dev/null || echo unknown)\" "
             "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
         )
-        result = env.execute(probe_cmd, timeout=4)
+        try:
+            result = env.execute(probe_cmd, timeout=4)
+        finally:
+            # The probe creates a REAL backend environment to introspect it, so
+            # for a docker backend in persist-mode (the default) it would leave
+            # a `sleep infinity` container running forever — one per probe,
+            # never reclaimed since the orphan reaper only removes `exited`
+            # containers. Force-remove the probe's own throwaway container.
+            _cleanup_probe_environment(env)
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""
