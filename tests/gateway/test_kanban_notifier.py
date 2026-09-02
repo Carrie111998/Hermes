@@ -926,6 +926,10 @@ def test_routed_profile_uses_primary_discord_adapter_on_secondary_board_once(
 
     adapter = RecordingAdapter()
     runner = _make_routed_discord_runner(adapter)
+    # Multiplex startup creates an empty registry map even when a routed
+    # profile has no independently connected adapters.  An empty map is not a
+    # credential boundary and must not block its exact primary route.
+    runner._profile_adapters = {"yuki": {}}  # type: ignore[assignment]
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1

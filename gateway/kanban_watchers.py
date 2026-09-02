@@ -219,11 +219,12 @@ class GatewayKanbanWatchersMixin:
     ) -> Any:
         """Authorize the primary transport for one stamped subscription.
 
-        A profile with any secondary-adapter registry entry owns its credential
-        boundary and can never fall back to the primary bot. Otherwise the
-        destination's best profile route is authoritative. A route match must
-        target the stamped, served profile; an unrouted destination may use the
-        primary adapter only for the active/default runtime profile.
+        A profile with any connected secondary adapter owns its credential
+        boundary and can never fall back to the primary bot. An empty registry
+        map is only a multiplex-startup placeholder, so the destination's exact
+        profile route remains authoritative. A route match must target the
+        stamped, served profile; an unrouted destination may use the primary
+        adapter only for the active/default runtime profile.
         """
         profile_name = str(owner_profile or "").strip()
         if not profile_name:
@@ -232,9 +233,13 @@ class GatewayKanbanWatchersMixin:
         adapter = adapters.get(platform)
         if adapter is None:
             return None
-        # An entry means this profile has its own credential boundary. Missing
-        # one platform is a denial, not permission to borrow the primary bot.
-        if profile_name in (getattr(self, "_profile_adapters", None) or {}):
+        # A non-empty entry means this profile has its own credential boundary.
+        # Multiplex startup also leaves empty maps for served profiles with no
+        # connected adapters; those may still use an exact primary route below.
+        profile_adapters = (getattr(self, "_profile_adapters", None) or {}).get(
+            profile_name
+        )
+        if profile_adapters:
             return None
 
         config = getattr(self, "config", None)
