@@ -400,7 +400,7 @@ class SignalAdapter(BasePlatformAdapter):
                 return False
 
             self._running = True
-            self._last_sse_activity = time.time()
+            self._last_sse_activity = time.monotonic()
             self._sse_task = asyncio.create_task(self._sse_listener())
             self._health_monitor_task = asyncio.create_task(self._health_monitor())
 
@@ -466,7 +466,7 @@ class SignalAdapter(BasePlatformAdapter):
                 ) as response:
                     self._sse_response = response
                     backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
-                    self._last_sse_activity = time.time()
+                    self._last_sse_activity = time.monotonic()
                     logger.info("Signal SSE: connected")
 
                     buffer = ""
@@ -483,14 +483,14 @@ class SignalAdapter(BasePlatformAdapter):
                             # is alive — update activity so the health monitor
                             # doesn't report false idle warnings.
                             if line.startswith(":"):
-                                self._last_sse_activity = time.time()
+                                self._last_sse_activity = time.monotonic()
                                 continue
                             # Parse SSE data lines
                             if line.startswith("data:"):
                                 data_str = line[5:].strip()
                                 if not data_str:
                                     continue
-                                self._last_sse_activity = time.time()
+                                self._last_sse_activity = time.monotonic()
                                 try:
                                     data = json.loads(data_str)
                                     await self._handle_envelope(data)
@@ -527,7 +527,7 @@ class SignalAdapter(BasePlatformAdapter):
             if not self._running:
                 break
 
-            elapsed = time.time() - self._last_sse_activity
+            elapsed = time.monotonic() - self._last_sse_activity
             if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
                 logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
                 try:
@@ -537,7 +537,7 @@ class SignalAdapter(BasePlatformAdapter):
                     if resp.status_code == 200:
                         # Daemon is alive but SSE is idle — update activity to
                         # avoid repeated warnings (connection may just be quiet)
-                        self._last_sse_activity = time.time()
+                        self._last_sse_activity = time.monotonic()
                         logger.debug("Signal: daemon healthy, SSE idle")
                     else:
                         logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
