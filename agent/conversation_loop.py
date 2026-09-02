@@ -246,10 +246,30 @@ def _restore_user_after_reference_handoff(
 ) -> bool:
     """Re-append this turn's real user ask when compaction left only a handoff.
 
-    Returns True when a restore append happened. The caller has already
-    established that a reference-only handoff would drive the next model
-    call (#80622); this helper only decides whether a restorable ask exists.
+    Returns True when a restore append happened. A completed turn and a live
+    tool exchange need the same invariant: the latest compaction handoff must
+    have a real user turn after it before another model call (#80622, #100818).
     """
+    from agent.context_compressor import (
+        is_compaction_summary_message,
+        user_originated_turn_view,
+    )
+
+    last_handoff_idx = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if is_compaction_summary_message(messages[index])
+        ),
+        -1,
+    )
+    if last_handoff_idx < 0:
+        return False
+    if any(
+        user_originated_turn_view(message) is not None
+        for message in messages[last_handoff_idx:]
+    ):
+        return False
     if user_message is None:
         return False
     if isinstance(user_message, str):
@@ -279,11 +299,13 @@ def _should_skip_model_call_for_reference_handoff(
     """Guard post-compaction continues against sole-handoff active turns (#80622)."""
     from agent.context_compressor import reference_handoff_would_drive_next_model_call
 
-    if not reference_handoff_would_drive_next_model_call(messages):
-        return False
     if _restore_user_after_reference_handoff(messages, user_message):
-        # The restored ask is an actionable non-synthetic user row appended
-        # after the handoff — by construction the handoff no longer drives.
+        # Compression can leave an in-flight tool exchange after the handoff.
+        # Tool rows keep the loop live, but they do not replace the active user
+        # ask. Restore it before deciding whether the synthetic handoff would
+        # otherwise drive the next model call (#100818).
+        return False
+    if not reference_handoff_would_drive_next_model_call(messages):
         return False
     return True
 

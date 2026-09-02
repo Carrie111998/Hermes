@@ -233,6 +233,45 @@ class TestSkipGuardRestoresRealUser:
         ]
         assert _should_skip_model_call_for_reference_handoff(messages, None) is True
 
+    def test_restores_pending_cron_prompt_during_mid_tool_loop(self):
+        """A tool result keeps the loop live but does not replace its user ask."""
+        messages = [
+            _standalone_handoff("prepare the scheduled briefing"),
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+
+        assert _should_skip_model_call_for_reference_handoff(
+            messages, "prepare the scheduled briefing"
+        ) is False
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "prepare the scheduled briefing"
+
+    def test_mid_tool_loop_keeps_existing_user_after_handoff(self):
+        messages = [
+            _standalone_handoff(),
+            {"role": "user", "content": "current ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+
+        assert _should_skip_model_call_for_reference_handoff(
+            messages, "current ask"
+        ) is False
+        assert [
+            message
+            for message in messages
+            if user_originated_turn_view(message) is not None
+        ] == [{"role": "user", "content": "current ask"}]
+
 
 class TestUserOriginatedTurnPredicate:
     def test_standalone_handoff_not_user_originated_even_with_has_user_turn(self):
