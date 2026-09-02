@@ -823,7 +823,11 @@ export function useSessionActions({
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir, undefined, undefined, workspaceScope)
-        patchSessionTile(stored, { runtimeId: created.session_id })
+        // Pin the workspace so a bot chat whose stored id collides with a
+        // twin in another bot workspace (#92454-class: restored backup,
+        // copied state.db) doesn't have its runtime id assigned to the
+        // wrong tile.
+        patchSessionTile(stored, { runtimeId: created.session_id }, workspaceScope.workspaceOwnerKey)
 
         if (dir === 'center' && runtimeInfo?.cwd) {
           setCurrentCwdTransient(runtimeInfo.cwd)

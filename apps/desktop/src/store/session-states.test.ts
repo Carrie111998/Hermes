@@ -22,6 +22,8 @@ import {
   blankDraftTile,
   clearAllSessionStates,
   closeAllOpenSessionTiles,
+  closeSessionTile,
+  discardSessionTile,
   focusedSessionNeedsRoute,
   focusOpenSession,
   focusWorkspaceOwnerSessionTile,
@@ -548,6 +550,110 @@ describe('focusWorkspaceOwnerSessionTile', () => {
       expect(focusWorkspaceOwnerSessionTile('bot:a')).toBe('bot-chat')
       expect($sessionTiles.get().map(t => t.storedSessionId)).toEqual(['bot-chat'])
     })
+  })
+})
+
+describe('patchSessionTile / sessionTileOwnerRoute resolve bot-workspace twins (#92454-class)', () => {
+  afterEach(() => {
+    $sessionTiles.set([])
+  })
+
+  // Two DIFFERENT bot workspaces can persist a tile with the SAME
+  // storedSessionId (a restored backup, a copied state.db) — this is the
+  // same collision class #95895 fixed for the sidebar's session rows, but
+  // for the shared __bots_workspace__ tile bucket, which is never filtered
+  // by profile at all, so both twins are simultaneously present in
+  // $sessionTiles.
+  const twinA: SessionTile = {
+    ownerRoute: { connectionId: 'conn-a', mode: 'remote', profile: 'oxcoder', targetProfile: 'oxcoder' },
+    runtimeId: 'runtime-a',
+    storedSessionId: 'twin',
+    workspaceMode: 'bots',
+    workspaceOwnerKey: 'bot:a'
+  }
+  const twinB: SessionTile = {
+    ownerRoute: { connectionId: 'conn-b', mode: 'remote', profile: 't2oracle', targetProfile: 't2oracle' },
+    runtimeId: 'runtime-b',
+    storedSessionId: 'twin',
+    workspaceMode: 'bots',
+    workspaceOwnerKey: 'bot:b'
+  }
+
+  it('patchSessionTile only touches the tile matching the given workspaceOwnerKey, leaving its twin untouched', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    patchSessionTile('twin', { runtimeId: 'runtime-a-recovered' }, 'bot:a')
+
+    const [a, b] = $sessionTiles.get()
+
+    expect(a).toMatchObject({ runtimeId: 'runtime-a-recovered', workspaceOwnerKey: 'bot:a' })
+    expect(b).toMatchObject({ runtimeId: 'runtime-b', workspaceOwnerKey: 'bot:b' })
+  })
+
+  it('patchSessionTile without a workspaceOwnerKey patches only the first match, never both twins', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    patchSessionTile('twin', { runtimeId: 'runtime-ambiguous' })
+
+    const [a, b] = $sessionTiles.get()
+
+    expect(a).toMatchObject({ runtimeId: 'runtime-ambiguous' })
+    // The second twin must never receive the same patch — the pre-fix
+    // `.map()` over every bare-id match assigned this runtime id to BOTH.
+    expect(b).toMatchObject({ runtimeId: 'runtime-b' })
+  })
+
+  it('sessionTileOwnerRoute resolves the exact twin when given its workspaceOwnerKey', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    expect(sessionTileOwnerRoute('twin', 'bot:b')).toEqual(twinB.ownerRoute)
+    expect(sessionTileOwnerRoute('twin', 'bot:a')).toEqual(twinA.ownerRoute)
+  })
+
+  it('closeSessionTile with a workspaceOwnerKey removes only the matching twin, leaving its twin open', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    closeSessionTile('twin', 'bot:a')
+
+    const remaining = $sessionTiles.get()
+
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ workspaceOwnerKey: 'bot:b' })
+  })
+
+  it('closeSessionTile without a workspaceOwnerKey closes only the first match, never both twins', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    closeSessionTile('twin')
+
+    // The pre-fix `.filter(t => t.storedSessionId !== id)` dropped every
+    // bare-id match at once — both twins vanished from a single close of one.
+    const remaining = $sessionTiles.get()
+
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ workspaceOwnerKey: 'bot:b' })
+  })
+
+  it('discardSessionTile with a workspaceOwnerKey removes only the matching twin, leaving its twin intact', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    discardSessionTile('twin', 'bot:a')
+
+    const remaining = $sessionTiles.get()
+
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ workspaceOwnerKey: 'bot:b' })
+  })
+
+  it('discardSessionTile without a workspaceOwnerKey discards only the first match, never both twins', () => {
+    $sessionTiles.set([twinA, twinB])
+
+    discardSessionTile('twin')
+
+    const remaining = $sessionTiles.get()
+
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]).toMatchObject({ workspaceOwnerKey: 'bot:b' })
   })
 })
 

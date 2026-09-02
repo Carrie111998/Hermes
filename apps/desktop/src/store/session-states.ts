@@ -862,8 +862,16 @@ function loadTilesByProfile(): Record<string, StoredTile[]> {
   }
 
   if (byProfile[BOTS_TILE_BUCKET]?.length) {
+    // Keyed by (workspaceOwnerKey, storedSessionId), not the bare id: two
+    // DIFFERENT bot chats in different bot workspaces can legitimately share
+    // a stored id (a restored backup, a copied state.db) — collapsing them
+    // by bare id here silently drops one tile's persisted state on every
+    // load/restart. A missing workspaceOwnerKey still collapses by bare id,
+    // matching the historical shape for tiles that predate the field.
     byProfile[BOTS_TILE_BUCKET] = [
-      ...new Map(byProfile[BOTS_TILE_BUCKET].map(tile => [tile.storedSessionId, tile])).values()
+      ...new Map(
+        byProfile[BOTS_TILE_BUCKET].map(tile => [`${tile.workspaceOwnerKey ?? ''}::${tile.storedSessionId}`, tile])
+      ).values()
     ]
   }
 
@@ -930,12 +938,49 @@ if (!isSecondaryWindow() && !isBrowserWindow()) {
   })
 }
 
-export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>) {
-  saveTiles($sessionTiles.get().map(t => (t.storedSessionId === storedSessionId ? { ...t, ...patch } : t)))
+/** Locate a tile by storedSessionId. Two bot workspaces can legitimately
+ * persist the same storedSessionId (a restored backup, a copied state.db) —
+ * when the caller knows its own workspaceOwnerKey, prefer the twin that
+ * matches BOTH fields so a patch/read never lands on the wrong workspace's
+ * tile. Falls back to the first bare-id match when no key is given (existing
+ * callers, or a legacy tile that predates the field). */
+function findSessionTileIndex(
+  tiles: readonly SessionTile[],
+  storedSessionId: string,
+  workspaceOwnerKey?: string
+): number {
+  if (workspaceOwnerKey !== undefined) {
+    const scoped = tiles.findIndex(
+      t => t.storedSessionId === storedSessionId && t.workspaceOwnerKey === workspaceOwnerKey
+    )
+
+    if (scoped !== -1) {
+      return scoped
+    }
+  }
+
+  return tiles.findIndex(t => t.storedSessionId === storedSessionId)
 }
 
-export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | undefined {
-  return $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.ownerRoute
+export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>, workspaceOwnerKey?: string) {
+  const tiles = $sessionTiles.get()
+  const idx = findSessionTileIndex(tiles, storedSessionId, workspaceOwnerKey)
+
+  if (idx === -1) {
+    return
+  }
+
+  saveTiles(tiles.map((t, i) => (i === idx ? { ...t, ...patch } : t)))
+}
+
+export function sessionTileOwnerRoute(
+  storedSessionId: string,
+  workspaceOwnerKey?: string
+): SessionOwnerRoute | undefined {
+  const tiles = $sessionTiles.get()
+  const idx = findSessionTileIndex(tiles, storedSessionId, workspaceOwnerKey)
+
+  return idx === -1 ? undefined : tiles[idx].ownerRoute
 }
 
 /**
@@ -1612,7 +1657,7 @@ export function focusWorkspaceOwnerSessionTile(
     })
 
     for (const tile of stale) {
-      discardSessionTile(tile.storedSessionId)
+      discardSessionTile(tile.storedSessionId, workspaceOwnerKey)
     }
 
     owned = allOwned.filter(tile => !stale.includes(tile))
@@ -1680,7 +1725,7 @@ export function reuseBlankDraftTile(
     return false
   }
 
-  discardSessionTile(tile.storedSessionId)
+  discardSessionTile(tile.storedSessionId, workspaceScope.workspaceOwnerKey)
   openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before, workspaceScope)
   revealTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`)
 
@@ -1693,14 +1738,15 @@ export function reuseBlankDraftTile(
 const closedTilesByProfile: Record<string, SessionTile[]> = {}
 const closedStack = (): SessionTile[] => (closedTilesByProfile[profileKey()] ??= [])
 
-export function closeSessionTile(storedSessionId: string) {
-  const tile = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)
+export function closeSessionTile(storedSessionId: string, workspaceOwnerKey?: string) {
+  const tiles = $sessionTiles.get()
+  const idx = findSessionTileIndex(tiles, storedSessionId, workspaceOwnerKey)
+  const tile = idx === -1 ? undefined : tiles[idx]
 
   if (tile) {
     closedStack().push(toStored(tile))
+    saveTiles(tiles.filter((_, i) => i !== idx))
   }
-
-  saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
 
   // A settled session may never publish again, so the publish-time eviction
   // in publishSessionState can't reach it — drop its cached state here. A
@@ -1740,14 +1786,21 @@ export function closeAllOpenSessionTiles(paneId: string): void {
  *  backend (resume 404s). Unlike close, it leaves no ⌘⇧T undo (resurrecting it
  *  would just 404 again) and evicts any cached state. This is what clears the
  *  "Session not found" resume spam from stale/cross-profile persisted tiles. */
-export function discardSessionTile(storedSessionId: string) {
-  const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
+export function discardSessionTile(storedSessionId: string, workspaceOwnerKey?: string) {
+  const tiles = $sessionTiles.get()
+  const idx = findSessionTileIndex(tiles, storedSessionId, workspaceOwnerKey)
+
+  if (idx === -1) {
+    return
+  }
+
+  const runtimeId = tiles[idx].runtimeId
 
   if (runtimeId) {
     dropSessionState(runtimeId)
   }
 
-  saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
+  saveTiles(tiles.filter((_, i) => i !== idx))
 }
 
 /**
