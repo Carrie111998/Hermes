@@ -500,7 +500,7 @@ def _post_provision(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -580,7 +580,7 @@ def _resolve_relay_identity_token() -> str:
             headers={"Accept": "application/json, text/plain"},
         )
         with urllib.request.urlopen(req, timeout=15.0) as resp:
-            body = resp.read().decode().strip()
+            body = resp.read().decode("utf-8", errors="replace").strip()
         token = ""
         if body.startswith("{"):
             try:
@@ -633,7 +633,7 @@ def _resolve_relay_identity_token() -> str:
         },
     )
     with urllib.request.urlopen(req, timeout=15.0) as resp:
-        payload = json.loads(resp.read().decode())
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     access_token = (payload or {}).get("access_token")
     if not isinstance(access_token, str) or not access_token.strip():
         raise RuntimeError("IdP client_credentials response had no access_token")

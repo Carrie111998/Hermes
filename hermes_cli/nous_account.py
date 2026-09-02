@@ -637,7 +637,7 @@ def _fetch_nous_account_info(
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=8) as resp:
-        payload = json.loads(resp.read().decode())
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     return payload if isinstance(payload, dict) else {}
 
 
