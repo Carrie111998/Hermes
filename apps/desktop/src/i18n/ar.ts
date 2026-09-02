@@ -2599,6 +2599,8 @@ export const ar = defineLocale({
     },
     tool: {
       copyCode: 'نسخ الكود',
+      wordWrap: 'التفاف الأسطر',
+      toggleWordWrap: 'تبديل التفاف الأسطر',
       renderingImage: 'جار عرض الصورة...',
       copyOutput: 'نسخ الإخراج',
       copyCommand: 'نسخ الأمر',
