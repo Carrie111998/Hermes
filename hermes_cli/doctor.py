@@ -2215,20 +2215,47 @@ def run_doctor(args):
         try:
             wal_size = wal_path.stat().st_size
             if wal_size > 50 * 1024 * 1024:  # 50 MB
-                check_warn(
-                    f"WAL file is large ({wal_size // (1024*1024)} MB)",
-                    "(may indicate missed checkpoints)"
-                )
-                if should_fix:
+                # Check if WAL is fully checkpointed before flagging as issue
+                try:
                     import sqlite3
                     conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                     conn.close()
-                    new_size = wal_path.stat().st_size if wal_path.exists() else 0
-                    check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
-                    fixed_count += 1
-                else:
-                    issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
+                    # result: (busy, log, checkpointed)
+                    # If all frames checkpointed (log == checkpointed), WAL is healthy
+                    if result and result[1] == result[2]:
+                        check_info(f"WAL file is {wal_size // (1024*1024)} MB (fully checkpointed, healthy)")
+                    else:
+                        check_warn(
+                            f"WAL file is large ({wal_size // (1024*1024)} MB)",
+                            "(may indicate missed checkpoints)"
+                        )
+                        if should_fix:
+                            import sqlite3
+                            conn = sqlite3.connect(str(state_db_path))
+                            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                            conn.close()
+                            new_size = wal_path.stat().st_size if wal_path.exists() else 0
+                            check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
+                            fixed_count += 1
+                        else:
+                            issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
+                except Exception:
+                    # If we can't check, assume it's an issue
+                    check_warn(
+                        f"WAL file is large ({wal_size // (1024*1024)} MB)",
+                        "(may indicate missed checkpoints)"
+                    )
+                    if should_fix:
+                        import sqlite3
+                        conn = sqlite3.connect(str(state_db_path))
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        conn.close()
+                        new_size = wal_path.stat().st_size if wal_path.exists() else 0
+                        check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
+                        fixed_count += 1
+                    else:
+                        issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
         except Exception:
@@ -2291,10 +2318,16 @@ def run_doctor(args):
                 # It's a regular file, not a symlink — possibly a wrapper script
                 check_ok(f"{_cmd_link_display}/hermes exists (non-symlink)")
             else:
-                check_fail(
-                    f"{_cmd_link_display}/hermes not found",
-                    "(hermes command may not work outside the venv)"
-                )
+                # Check if hermes is already available on PATH from another location
+                import shutil
+                _hermes_on_path = shutil.which("hermes")
+                if _hermes_on_path:
+                    check_ok(f"hermes found on PATH ({_hermes_on_path})")
+                else:
+                    check_fail(
+                        f"{_cmd_link_display}/hermes not found",
+                        "(hermes command may not work outside the venv)"
+                    )
                 if should_fix:
                     _cmd_link_dir.mkdir(parents=True, exist_ok=True)
                     _cmd_link.symlink_to(_venv_bin)
