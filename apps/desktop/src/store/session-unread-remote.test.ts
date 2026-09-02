@@ -60,12 +60,18 @@ describe('markSessionUnread', () => {
 })
 
 describe('clearUnreadOnOpen', () => {
-  it('no-ops for a session that is already read', async () => {
-    $sessions.set([row('a', { unread: false })])
+  // Always stamps `last_read_at` on open, even when the backend already
+  // believes the session is read: `SessionDB.session_unread()` returns
+  // False for rows whose `last_read_at` is NULL, so without an unconditional
+  // write the watermark is never seeded and the renderer-side gap keeps
+  // painting green dots after every cold start.
+  it('PATCHes read for an already-read session to seed the backend watermark', async () => {
+    $sessions.set([row('a', { profile: 'p1', unread: false })])
 
     await clearUnreadOnOpen('a')
 
-    expect(patch).not.toHaveBeenCalled()
+    expect(patch).toHaveBeenCalledWith('a', false, 'p1')
+    expect($sessions.get().find(s => s.id === 'a')?.unread).toBe(false)
   })
 
   it('PATCHes read for an unread session, using its owning profile', async () => {
@@ -75,6 +81,17 @@ describe('clearUnreadOnOpen', () => {
 
     expect(patch).toHaveBeenCalledWith('a', false, 'p2')
     expect($sessions.get().find(s => s.id === 'a')?.unread).toBe(false)
+  })
+
+  // The `!row` early-return is what keeps a brand-new chat (no persisted
+  // backend row yet) from issuing a doomed PATCH — guard against
+  // regression.
+  it('no-ops for a runtime-only session with no persisted row', async () => {
+    $sessions.set([])
+
+    await clearUnreadOnOpen('ghost')
+
+    expect(patch).not.toHaveBeenCalled()
   })
 
   it('swallows a failed PATCH (the next honest refresh heals the dot)', async () => {

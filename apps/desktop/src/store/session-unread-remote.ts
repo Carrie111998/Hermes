@@ -63,18 +63,35 @@ export async function markSessionUnread(storedId: string, unread: boolean): Prom
 }
 
 /** Opening a session clears its persisted unread flag (auto-mark-read).
- *  Best-effort: a failed PATCH is healed by the next honest refresh. */
+ *  Best-effort: a failed PATCH is healed by the next honest refresh.
+ *
+ *  NOTE: the previous gate `row.unread !== true` short-circuited the
+ *  watermark write whenever the backend already believed the session was
+ *  read — which it does for every row whose `sessions.last_read_at` is NULL,
+ *  because `SessionDB.session_unread()` returns False for that case
+ *  (NULL watermark = never tracked = read). The renderer-side
+ *  `message_count` watermark, in contrast, seeds at the first sight and
+ *  keeps painting a green dot from the gap between it and the live count.
+ *  Result: opening a previously-unread conversation never stamped the
+ *  backend, so the next cold start re-lit the same rows from the stale
+ *  local watermark. Always stamp on open so the two layers converge from
+ *  the user's first interaction. The backend `set_session_read` is itself
+ *  idempotent for the read=True path (see `SessionDB.set_session_read`),
+ *  so rapid sidebar navigation does not amplify into SQLite write churn.
+ */
 export async function clearUnreadOnOpen(storedId: string): Promise<void> {
   const row = rowFor(storedId)
 
-  if (!row || row.unread !== true) {
+  if (!row) {
+    // No persisted row yet (a brand-new chat with no row on the backend)
+    // — there is nothing to stamp and nothing to keep in sync.
     return
   }
 
   try {
     await markSessionUnread(storedId, false)
   } catch {
-    // Ignore: the dot simply returns until a refresh reconciles.
+    // Ignore: a failed PATCH is healed by the next honest refresh.
   }
 }
 

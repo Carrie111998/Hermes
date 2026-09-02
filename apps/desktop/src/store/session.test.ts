@@ -1223,13 +1223,16 @@ describe('unread finished sessions', () => {
     expect(setUnreadRemote).toHaveBeenCalledWith('s1', false, undefined)
   })
 
-  it('does not PATCH a read row when it is opened', async () => {
+  // Always stamps `last_read_at` on open so the backend watermark converges
+  // with the renderer-side `message_count` watermark from the user's first
+  // interaction. See clearUnreadOnOpen in session-unread-remote.ts.
+  it('stamps the backend watermark when a read row is opened', async () => {
     $sessions.set([session({ id: 's1', unread: false })])
 
     setSelectedStoredSessionId('s1')
 
     await Promise.resolve()
-    expect(setUnreadRemote).not.toHaveBeenCalled()
+    expect(setUnreadRemote).toHaveBeenCalledWith('s1', false, undefined)
   })
 })
 

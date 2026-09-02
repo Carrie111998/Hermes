@@ -11649,7 +11649,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_read(self, session_id: str, read: bool = True) -> bool:
+    def set_session_read(
+        self,
+        session_id: str,
+        read: bool = True,
+        stamp_at: Optional[float] = None,
+    ) -> bool:
         """Mark a session read or unread (and its whole compression lineage).
 
         Read state is a watermark, not a flag: ``last_read_at`` records when
@@ -11668,7 +11673,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         whole compression chain is stamped as a unit, so reading the surfaced
         tip clears the root (and vice-versa) no matter which id the caller
         holds. Returns True when at least one row changed.
+
+        Marking **read** is idempotent on the lineage: rows whose
+        ``last_read_at`` already postdates the new stamp are left untouched,
+        so rapid sidebar navigation in the desktop client doesn't translate
+        into SQLite write churn. The caller may pass an explicit ``stamp_at``
+        (epoch seconds) to coordinate the stamp with its own clock; the
+        default is ``time.time()`` at call time. Marking **unread**
+        (``read=False``, ``last_read_at = 0``) is NOT idempotent — it is a
+        deliberate user action that should always land even if the row is
+        already at 0.
         """
+        new_value = 0.0 if not read else (stamp_at if stamp_at is not None else time.time())
         def _do(conn):
             cursor = conn.execute(
                 """
@@ -11699,8 +11715,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 UPDATE sessions
                 SET last_read_at = ?
                 WHERE id IN (SELECT id FROM lineage)
+                  AND (
+                    ? = 0.0
+                    OR last_read_at IS NULL
+                    OR last_read_at < ?
+                  )
                 """,
-                (session_id, session_id, time.time() if read else 0.0),
+                (session_id, session_id, new_value, new_value, new_value),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
