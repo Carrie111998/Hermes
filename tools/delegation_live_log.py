@@ -24,7 +24,9 @@ Design constraints:
 * **Side-channel only.** Nothing here touches message content, so prompt
   caching is unaffected.
 * **No config knobs.** Retention is a module constant (7 days), pruned
-  opportunistically on each new dispatch.
+  opportunistically on each new dispatch — against the same root that
+  dispatch writes to, so stale dirs under other profiles' pinned roots are
+  left to those profiles' own dispatches.
 """
 
 from __future__ import annotations
@@ -58,11 +60,19 @@ _KICKOFF_MAX = 500
 _STREAM_BUFFER_FLUSH_CHARS = 4000
 
 
-def live_transcript_root() -> Path:
-    """Root directory for live transcripts (profile-safe, never ~/.hermes)."""
+def live_transcript_root(home: Optional[Path] = None) -> Path:
+    """Root directory for live transcripts (profile-safe, never ~/.hermes).
+
+    Pass ``home`` when the caller holds stable parent-owned profile state
+    (e.g. the parent agent's SessionDB path). Ambient ``get_hermes_home()``
+    consults a ContextVar that raw ``threading.Thread`` boundaries drop, so
+    in a multi-profile process an ambient resolve can land transcripts under
+    whatever profile the process-wide ``HERMES_HOME`` names at that moment
+    (#91996).
+    """
     from hermes_constants import get_hermes_dir
 
-    return get_hermes_dir("cache/delegation", "delegation_cache") / "live"
+    return get_hermes_dir("cache/delegation", "delegation_cache", home=home) / "live"
 
 
 def new_live_delegation_id() -> str:
@@ -315,46 +325,55 @@ def create_live_transcripts(
     delegation_id: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    home: Optional[Path] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """Create one pre-headered writer per task + a manifest.json.
 
     Returns ``(delegation_id, writers, paths)``. On any top-level failure
     returns ``(None, [None]*n, [])`` so delegation proceeds untouched.
     Also opportunistically prunes stale live dirs (retention).
+
+    ``home`` pins every transcript and the manifest to one explicit profile
+    home instead of an ambient resolve that raw thread boundaries can strip
+    of its ContextVar override (#91996). Retention pruning runs against the
+    same resolved root, so pinned homes clean their own stale dirs.
     """
     n = len(task_list)
     try:
-        prune_stale_live_dirs()
+        prune_stale_live_dirs(root=live_transcript_root(home))
     except Exception:
         pass
     try:
         deleg_id = delegation_id or new_live_delegation_id()
+        root = live_transcript_root(home)
         writers: List[Optional[LiveTranscriptWriter]] = []
         paths: List[str] = []
         for i, t in enumerate(task_list):
             w = LiveTranscriptWriter(
                 deleg_id, i, str(t.get("goal", "")),
                 context=t.get("context") or context,
+                root=root,
             )
             writers.append(w if w.path is not None else None)
             if w.path is not None:
                 paths.append(str(w.path))
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider, home=home)
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)
         return None, [None] * n, []
 
 
-def _manifest_path(delegation_id: str) -> Path:
-    return live_transcript_root() / delegation_id / "manifest.json"
+def _manifest_path(delegation_id: str, home: Optional[Path] = None) -> Path:
+    return live_transcript_root(home) / delegation_id / "manifest.json"
 
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    provider: Optional[str] = None,
+                    home: Optional[Path] = None) -> None:
     try:
         manifest = {
             "delegation_id": delegation_id,
@@ -377,7 +396,7 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 for i, t in enumerate(task_list)
             ],
         }
-        _manifest_path(delegation_id).write_text(
+        _manifest_path(delegation_id, home).write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     except Exception as exc:
@@ -385,12 +404,13 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
 
 
 def update_manifest_statuses(delegation_id: Optional[str],
-                             results: List[Dict[str, Any]]) -> None:
+                             results: List[Dict[str, Any]],
+                             home: Optional[Path] = None) -> None:
     """Best-effort per-task status update once the batch has aggregated."""
     if not delegation_id:
         return
     try:
-        mp = _manifest_path(delegation_id)
+        mp = _manifest_path(delegation_id, home)
         manifest = json.loads(mp.read_text(encoding="utf-8"))
         by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
         for task in manifest.get("tasks", []):
@@ -406,18 +426,23 @@ def update_manifest_statuses(delegation_id: Optional[str],
         logger.debug("Live transcript manifest update failed: %s", exc)
 
 
-def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:
+def prune_stale_live_dirs(
+    max_age_days: int = LIVE_RETENTION_DAYS, root: Optional[Path] = None
+) -> int:
     """Remove live/<delegation_id> dirs older than the retention window.
 
-    Returns how many were removed. Fully best-effort.
+    Returns how many were removed. Fully best-effort. ``root`` defaults to
+    the ambient resolve; callers that pin transcripts to an explicit home
+    pass the same root so the prune sweeps where the writes actually land
+    (stale dirs under other profiles' roots stay those profiles' business).
     """
     removed = 0
     try:
-        root = live_transcript_root()
-        if not root.is_dir():
+        root_dir = root if root is not None else live_transcript_root()
+        if not root_dir.is_dir():
             return 0
         cutoff = time.time() - max_age_days * 86400
-        for child in root.iterdir():
+        for child in root_dir.iterdir():
             try:
                 if child.is_dir() and child.stat().st_mtime < cutoff:
                     shutil.rmtree(child, ignore_errors=True)
