@@ -105,19 +105,23 @@ def test_elevenlabs_available_reflects_key(monkeypatch):
     assert ts.ElevenLabsStreamer.available() is False
 
 
-def test_openai_available_reflects_audio_key_resolution(monkeypatch):
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "")
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "voice-key")
+def test_openai_available_reflects_audio_backend(monkeypatch):
+    monkeypatch.setattr(ts, "_has_openai_audio_backend", lambda: True)
     assert ts.OpenAIStreamer.available() is True
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(ts, "_has_openai_audio_backend", lambda: False)
     assert ts.OpenAIStreamer.available() is False
-    # tts.openai.api_key from config.yaml counts too
-    monkeypatch.setattr(ts, "_openai_config_api_key", lambda: "cfg-key")
-    assert ts.OpenAIStreamer.available() is True
 
 
-def test_openai_streamer_prefers_configured_api_key(monkeypatch):
-    captured = {}
+def _patch_openai_stream(monkeypatch):
+    """Patch openai.OpenAI and the resolver so stream() can be exercised.
+
+    ``_has_openai_audio_backend`` is stubbed True so ``resolve_streaming_provider``
+    constructs the streamer; ``_resolve_openai_audio_client_config`` is stubbed by
+    each test to shape the credential route. Both client kwargs and create()
+    kwargs are recorded in the returned dict.
+    """
+    captured = {"client": None, "requests": []}
+    monkeypatch.setattr(ts, "_has_openai_audio_backend", lambda: True)
 
     class _Response:
         def __enter__(self):
@@ -132,6 +136,7 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     class _StreamingCreate:
         @staticmethod
         def create(**kwargs):
+            captured["requests"].append(kwargs)
             return _Response()
 
     class _OpenAI:
@@ -140,19 +145,76 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
             self.audio = MagicMock()
             self.audio.speech.with_streaming_response = _StreamingCreate()
 
-    monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
-    monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
     monkeypatch.setattr("openai.OpenAI", _OpenAI)
+    return captured
+
+
+def test_openai_stream_uses_resolver_for_direct_credentials(monkeypatch):
+    captured = _patch_openai_stream(monkeypatch)
+
+    def _fake_resolve():
+        return "direct-key", "https://api.openai.com/v1", False
+
+    monkeypatch.setattr(ts, "_resolve_openai_audio_client_config", _fake_resolve)
+
+    streamer = ts.resolve_streaming_provider({"provider": "openai", "openai": {}})
+
+    assert streamer is not None
+    assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
+    assert captured["client"]["api_key"] == "direct-key"
+    assert captured["client"]["base_url"] == "https://api.openai.com/v1"
+
+
+def test_openai_stream_coerces_unsupported_model_on_managed_gateway(monkeypatch):
+    """Regression: the managed gateway proxies only gpt-4o-mini-tts.
+
+    A model set for direct OpenAI (e.g. tts-1-hd) 400s on the gateway, so the
+    streaming path must coerce it to the default like the sync path does.
+    """
+    captured = _patch_openai_stream(monkeypatch)
+
+    def _fake_resolve():
+        return "gateway-token", "https://gateway.example/v1", True
+
+    monkeypatch.setattr(ts, "_resolve_openai_audio_client_config", _fake_resolve)
+
+    streamer = ts.resolve_streaming_provider(
+        {"provider": "openai", "openai": {"model": "tts-1-hd"}}
+    )
+
+    assert streamer is not None
+    assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
+    assert captured["requests"][0]["model"] == ts.DEFAULT_OPENAI_MODEL
+    assert captured["client"]["api_key"] == "gateway-token"
+    assert captured["client"]["base_url"] == "https://gateway.example/v1"
+
+
+def test_openai_stream_honors_config_base_url_on_managed_gateway(monkeypatch):
+    """Regression: an explicit tts.openai.base_url bypasses gateway coercion.
+
+    When the user redirects base_url to their own endpoint, the model must be
+    respected as-is rather than coerced to the gateway default.
+    """
+    captured = _patch_openai_stream(monkeypatch)
+
+    def _fake_resolve():
+        return "gateway-token", "https://gateway.example/v1", True
+
+    monkeypatch.setattr(ts, "_resolve_openai_audio_client_config", _fake_resolve)
 
     config = {
         "provider": "openai",
-        "openai": {"api_key": "cfg-key", "base_url": "http://local-tts.example/v1"},
+        "openai": {
+            "model": "tts-1-hd",
+            "base_url": "http://self-hosted.example/v1",
+        },
     }
     streamer = ts.resolve_streaming_provider(config)
 
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
-    assert captured["client"]["api_key"] == "cfg-key"
+    assert captured["requests"][0]["model"] == "tts-1-hd"  # not coerced
+    assert captured["client"]["base_url"] == "http://self-hosted.example/v1"
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
