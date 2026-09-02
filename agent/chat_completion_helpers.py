@@ -2752,15 +2752,37 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # see #22548, #70893, #62984. Do not re-implement comparisons here.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
 
+    # Credential fingerprints (#91077): two explicit different keys under one
+    # provider+model+URL are two deployments (per-account quota plans), so
+    # the failed primary's key and the entry's key must both reach the
+    # predicate. Both sides contribute RESOLVED static keys only: an
+    # unresolvable side (entry key_env not set, or ``agent.api_key`` being
+    # callable on the Entra ID path) contributes no fingerprint
+    # (non-distinguishing). KNOWN LIMITATION (review on #91078): with a
+    # callable ``agent.api_key`` the primary side never fingerprints, so two
+    # Entra accounts behind one endpoint still collapse into one deployment;
+    # per-account fallback pools require static keys today.
+    from agent.backend_identity import credential_fingerprint
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    _current_key = getattr(agent, "api_key", "")
+    _current_cred = _current_key if isinstance(_current_key, str) else ""
+    # RESOLVED keys only: an unresolvable entry contributes no fingerprint
+    # (unknown = non-distinguishing) rather than hashing the key_env NAME,
+    # which mixes two namespaces on one axis and made skip decisions
+    # unstable across evaluations (review finding on iteration 1).
+    _fb_cred = resolve_entry_api_key(fb) or ""
     current_ident = BackendIdentity.build(
         provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""),
         base_url=str(getattr(agent, "base_url", "") or ""),
+        credential=credential_fingerprint(_current_cred),
     )
     fb_ident = BackendIdentity.build(
         provider=fb_provider,
         model=fb_model,
         base_url=(fb.get("base_url") or ""),
+        credential=credential_fingerprint(_fb_cred),
     )
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(
