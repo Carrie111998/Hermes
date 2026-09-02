@@ -359,14 +359,20 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 
 _REQUEST_OPTION_MISSING = object()
-# Full internal ladder + "none": the API server accepts what /reasoning and
-# config.yaml accept (hermes_constants.VALID_REASONING_EFFORTS); wire-level
-# clamping to each provider's vocabulary happens downstream in the
-# transports/profiles via agent.reasoning_effort. Rejecting "max"/"ultra"
-# here made API/browser clients second-class citizens of the ladder
-# (#78216's api_server observation).
-_REASONING_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+# Canonical low→high ladder (with "none" as the disabled lower bound) shared
+# by request validation and /v1/capabilities. This contract is deliberately
+# server-wide: it lists values the model_options parser accepts before
+# downstream per-model/provider wire clamping, not levels every model supports
+# verbatim. Future model-specific discovery must be advertised separately.
+_REASONING_EFFORTS: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
 )
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
@@ -3472,6 +3478,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "session_resources": True,
                 "model_options": True,
+                # Server-wide parser vocabulary in canonical low→high order;
+                # this does not claim model/provider-specific wire support.
+                "reasoning_efforts": list(_REASONING_EFFORTS),
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
