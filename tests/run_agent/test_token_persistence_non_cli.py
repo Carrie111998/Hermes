@@ -1,5 +1,6 @@
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
+import base64
 import json
 import sys
 
@@ -54,6 +55,28 @@ def test_run_conversation_persists_tokens_for_telegram_sessions():
     # (queue_token_counts) rather than written inline on the turn thread.
     session_db.queue_token_counts.assert_called_once()
     assert session_db.queue_token_counts.call_args.args[0] == "telegram-session"
+
+
+def test_run_conversation_attributes_codex_tokens_to_account():
+    payload = base64.urlsafe_b64encode(json.dumps({
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-real"}
+    }).encode()).decode().rstrip("=")
+    token = f"header.{payload}.signature"
+    session_db = MagicMock()
+    agent = _make_agent(session_db, platform="telegram")
+    agent.provider = "openai-codex"
+    agent.api_key = token
+
+    result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    kwargs = session_db.queue_token_counts.call_args.kwargs
+    from agent.account_token_usage import codex_account_identity
+    identity = codex_account_identity(token)
+    assert identity is not None
+    assert kwargs["account_key"] == identity.account_key
+    assert token not in repr(kwargs)
+
 
 
 

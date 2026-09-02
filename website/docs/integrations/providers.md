@@ -91,6 +91,17 @@ Don't have a subscription yet? Get one at [portal.nousresearch.com/manage-subscr
 The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
 
 If a token refresh fails with a terminal error (HTTP 4xx, `invalid_grant`, revoked grant, etc.), Hermes marks the refresh token as dead and stops replaying it so you don't see a flood of identical auth failures. The next request surfaces a typed re-auth message instead. Run `hermes auth add openai-codex` (or `hermes model` → **ChatGPT or Codex Subscription**) to start a fresh device-code login; the quarantine clears on the next successful exchange.
+
+To inspect forward-only Hermes token usage attributed to each signed-in Codex account, run:
+
+```bash
+hermes auth token-usage openai-codex
+hermes auth token-usage openai-codex --json
+```
+
+Accounting starts when this feature is installed; it cannot reconstruct earlier usage, and pruning a session also removes that session's account-usage rows. Duplicate credential slots for the same ChatGPT account are grouped by the account ID in the OAuth token. The account-usage table persists only a one-way hash of that ID; email is decoded transiently from current pool credentials for display, while OAuth credentials remain stored separately in `~/.hermes/auth.json`. Provider quota remains separate because ChatGPT subscription limits are not a token-to-percentage conversion.
+
+Account attribution is deliberately fail-closed. Hermes currently attributes the standard Codex Responses path and Codex auxiliary-adapter responses whose serving credential is known. Codex app-server turns, MoA usage, and background-review calls remain in session/model totals but are omitted from per-account totals until those paths expose an authoritative per-request account identity.
 :::
 
 :::warning

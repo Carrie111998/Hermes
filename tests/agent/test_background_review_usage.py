@@ -184,6 +184,30 @@ def test_spawn_reuses_provided_task_cfg_without_rereading():
         assert prompt  # built-in skill-review prompt selected
         assert callable(_target)
 
+
+def test_background_review_target_suppresses_account_attribution():
+    agent = type("A", (), {})()
+    observed = []
+
+    def fake_run(*_args, **_kwargs):
+        from agent.aux_accounting import _account_attribution_suppressed
+
+        observed.append(_account_attribution_suppressed.get())
+
+    with patch.object(background_review, "_run_review_in_thread", side_effect=fake_run):
+        target, _prompt = background_review.spawn_background_review_thread(
+            agent,
+            messages_snapshot=[{"role": "user", "content": "hi"}],
+            review_skills=True,
+            task_cfg={"enabled": True},
+        )
+        target()
+
+    from agent.aux_accounting import _account_attribution_suppressed
+
+    assert observed == [True]
+    assert _account_attribution_suppressed.get() is False
+
 def test_log_review_completion_emits_thread_tag(caplog):
     with caplog.at_level(logging.INFO, logger="agent.background_review"):
         background_review._log_review_completion(

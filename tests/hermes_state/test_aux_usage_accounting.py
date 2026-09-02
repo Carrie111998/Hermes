@@ -96,6 +96,32 @@ class TestRecordAuxiliaryUsage:
         tasks = sorted(r["task"] for r in rows)
         assert tasks == ["", "title_generation"]
 
+    def test_records_auxiliary_usage_against_provider_account(self, db):
+        db.create_session("s1", source="cli")
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="gpt-5.6-sol",
+            billing_provider="openai-codex",
+            account_key="openai-codex:test-account",
+            input_tokens=80,
+            output_tokens=20,
+            cache_read_tokens=300,
+            reasoning_tokens=5,
+            api_call_count=2,
+        )
+
+        totals = db.account_usage_totals(
+            provider="openai-codex",
+            account_key="openai-codex:test-account",
+        )
+        assert len(totals) == 1
+        assert totals[0]["api_call_count"] == 2
+        assert totals[0]["input_tokens"] == 80
+        assert totals[0]["cache_read_tokens"] == 300
+        assert totals[0]["output_tokens"] == 20
+        assert totals[0]["total_tokens"] == 400
+
 
 
 
@@ -188,6 +214,80 @@ class TestAmbientAccountingContext:
         assert rows[0]["model"] == "aux-m"
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
+
+    def test_record_aux_usage_prefers_authoritative_response_account_route(self, db):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        response = _mk_response(model="gpt-5.6-sol", prompt=100, completion=20)
+        response.usage.prompt_tokens_details = SimpleNamespace(cached_tokens=80)
+        response.usage.completion_tokens_details = SimpleNamespace(
+            reasoning_tokens=5
+        )
+        response._hermes_account_key = "openai-codex:test-account"
+        response._hermes_billing_provider = "openai-codex"
+        response._hermes_billing_base_url = "https://chatgpt.com/backend-api/codex"
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                response,
+                "compression",
+                # Simulate a fallback whose caller still has the original route.
+                provider="gemini",
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+            )
+        finally:
+            reset_accounting_context(token)
+
+        totals = db.account_usage_totals(
+            provider="openai-codex",
+            account_key="openai-codex:test-account",
+        )
+        assert len(totals) == 1
+        assert totals[0]["total_tokens"] == 120
+        assert totals[0]["input_tokens"] == 20
+        assert totals[0]["cache_read_tokens"] == 80
+        assert totals[0]["output_tokens"] == 20
+        assert totals[0]["reasoning_tokens"] == 5
+        assert db.account_usage_totals(provider="gemini") == []
+
+    def test_account_attribution_suppression_keeps_model_usage(self, db):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_account_attribution_suppressed,
+            reset_accounting_context,
+            set_account_attribution_suppressed,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        response = _mk_response(model="gpt-5.6-sol", prompt=100, completion=20)
+        response.usage.prompt_tokens_details = SimpleNamespace(cached_tokens=80)
+        response.usage.completion_tokens_details = SimpleNamespace(
+            reasoning_tokens=5
+        )
+        response._hermes_account_key = "openai-codex:test-account"
+        response._hermes_billing_provider = "openai-codex"
+        response._hermes_billing_base_url = "https://chatgpt.com/backend-api/codex"
+        accounting_token = set_accounting_context(db, "s1")
+        suppression_token = set_account_attribution_suppressed()
+        try:
+            record_aux_usage(response, "compression", provider="openai-codex")
+        finally:
+            reset_account_attribution_suppressed(suppression_token)
+            reset_accounting_context(accounting_token)
+
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        assert rows[0]["input_tokens"] == 20
+        assert rows[0]["cache_read_tokens"] == 80
+        assert rows[0]["output_tokens"] == 20
+        assert rows[0]["reasoning_tokens"] == 5
+        assert db.account_usage_totals(provider="openai-codex") == []
 
 
     def test_moa_tasks_excluded(self, db):

@@ -10060,7 +10060,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
-        "billing_provider", "billing_base_url", "billing_mode",
+        "billing_provider", "billing_base_url", "billing_mode", "account_key",
     )
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -10328,6 +10328,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        account_key: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
     ) -> None:
@@ -10478,7 +10479,125 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cost_source=cost_source,
                     api_call_count=api_call_count,
                 )
+            if record_model_usage and account_key:
+                self._record_account_usage(
+                    conn,
+                    session_id,
+                    account_key=account_key,
+                    model=model,
+                    billing_provider=billing_provider,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    api_call_count=api_call_count,
+                )
         self._execute_write(_do)
+
+    def _record_account_usage(
+        self,
+        conn,
+        session_id: str,
+        *,
+        account_key: str,
+        model: Optional[str],
+        billing_provider: Optional[str],
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        reasoning_tokens: int,
+        api_call_count: int,
+    ) -> None:
+        """Accumulate a forward-only, secret-safe provider-account delta."""
+        row = conn.execute(
+            "SELECT model, billing_provider FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        eff_model = model or (row["model"] if row is not None else None) or "unknown"
+        eff_provider = (
+            billing_provider
+            or (row["billing_provider"] if row is not None else None)
+            or ""
+        )
+        now = time.time()
+        conn.execute(
+            """INSERT INTO session_account_usage (
+                   session_id, account_key, billing_provider, model,
+                   api_call_count, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                   first_seen, last_seen
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, account_key, billing_provider, model)
+               DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   last_seen = excluded.last_seen""",
+            (
+                session_id,
+                account_key,
+                eff_provider,
+                eff_model,
+                api_call_count or 0,
+                input_tokens or 0,
+                output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_write_tokens or 0,
+                reasoning_tokens or 0,
+                now,
+                now,
+            ),
+        )
+
+    def account_usage_totals(
+        self,
+        *,
+        provider: Optional[str] = None,
+        account_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return forward-only token totals grouped by stable provider account."""
+        self.flush_token_counts()
+        clauses: List[str] = []
+        params: List[Any] = []
+        if provider:
+            clauses.append("billing_provider = ?")
+            params.append(provider)
+        if account_key:
+            clauses.append("account_key = ?")
+            params.append(account_key)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                """SELECT account_key, billing_provider,
+                          SUM(api_call_count) AS api_call_count,
+                          SUM(input_tokens) AS input_tokens,
+                          SUM(output_tokens) AS output_tokens,
+                          SUM(cache_read_tokens) AS cache_read_tokens,
+                          SUM(cache_write_tokens) AS cache_write_tokens,
+                          SUM(reasoning_tokens) AS reasoning_tokens,
+                          MIN(first_seen) AS first_seen,
+                          MAX(last_seen) AS last_seen
+                     FROM session_account_usage"""
+                + where
+                + " GROUP BY account_key, billing_provider ORDER BY last_seen DESC",
+                tuple(params),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["total_tokens"] = (
+                int(item.get("input_tokens") or 0)
+                + int(item.get("cache_read_tokens") or 0)
+                + int(item.get("cache_write_tokens") or 0)
+                + int(item.get("output_tokens") or 0)
+            )
+            result.append(item)
+        return result
 
     def _record_model_usage(
         self,
@@ -10601,6 +10720,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model: Optional[str] = None,
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
+        account_key: Optional[str] = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         cache_read_tokens: int = 0,
@@ -10614,9 +10734,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Auxiliary calls (vision, compression, title_generation, web_extract,
         session_search, ...) historically discarded their usage, leaving the
         dashboard's per-model analytics blind to aux model spend. This writes
-        a per-(model, provider, task) delta into ``session_model_usage`` —
-        the same table the main loop's ``update_token_counts`` feeds — WITHOUT
-        touching the ``sessions`` summary row. That separation is deliberate:
+        a per-(model, provider, task) delta into ``session_model_usage`` and,
+        when ``account_key`` is available, the same non-overlapping token delta
+        into ``session_account_usage`` in one transaction. It does not touch the
+        ``sessions`` summary row. That separation is deliberate:
         the gateway overwrites session counters with absolute main-loop totals,
         so folding aux tokens into the summary row would either be clobbered
         or double-counted. Insights/analytics read the union of both.
@@ -10635,6 +10756,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # initial create_session() can fail under concurrent SQLite locking).
         self._insert_session_row(session_id, "unknown")
 
+        effective_api_calls = 1 if api_call_count is None else int(api_call_count)
+
         def _do(conn):
             self._record_model_usage(
                 conn,
@@ -10652,11 +10775,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 actual_cost_usd=None,
                 cost_status=None,
                 cost_source=None,
-                api_call_count=(
-                    1 if api_call_count is None else int(api_call_count)
-                ),
+                api_call_count=effective_api_calls,
                 task=task,
             )
+            if account_key:
+                self._record_account_usage(
+                    conn,
+                    session_id,
+                    account_key=account_key,
+                    model=model,
+                    billing_provider=billing_provider,
+                    input_tokens=input_tokens or 0,
+                    output_tokens=output_tokens or 0,
+                    cache_read_tokens=cache_read_tokens or 0,
+                    cache_write_tokens=cache_write_tokens or 0,
+                    reasoning_tokens=reasoning_tokens or 0,
+                    api_call_count=effective_api_calls,
+                )
         self._execute_write(_do)
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:

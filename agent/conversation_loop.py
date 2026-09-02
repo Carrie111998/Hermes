@@ -26,6 +26,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.account_token_usage import account_key_for_agent as _account_key_for_usage
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -4838,6 +4839,10 @@ def run_conversation(
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
+                                account_key=_account_key_for_usage(
+                                    agent,
+                                    request_client=_moa_client,
+                                ),
                                 model=agent.model,
                                 api_call_count=1,
                             )

@@ -57,6 +57,13 @@ def _make_codex_jwt(account_id: str = "acct-test-123") -> str:
 
 class TestCodexCloudflareHeaders:
 
+    def test_public_account_id_extractor_matches_required_header(self):
+        from agent.codex_headers import extract_chatgpt_account_id
+
+        token = _make_codex_jwt("acct-shared-helper")
+        assert extract_chatgpt_account_id(token) == "acct-shared-helper"
+        assert extract_chatgpt_account_id("not-a-jwt") is None
+
     def test_user_agent_advertises_hermes_version(self):
         from agent.auxiliary_client import _codex_cloudflare_headers
         headers = _codex_cloudflare_headers(_make_codex_jwt())

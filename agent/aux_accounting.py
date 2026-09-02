@@ -37,6 +37,13 @@ _accounting: ContextVar[Optional[tuple]] = ContextVar(
     "aux_accounting_context", default=None
 )
 
+# Background-review workers inherit the foreground session context so their
+# model usage remains visible, but their aggregate/forked requests do not have
+# authoritative per-request account provenance.
+_account_attribution_suppressed: ContextVar[bool] = ContextVar(
+    "aux_account_attribution_suppressed", default=False
+)
+
 # Aux tasks whose usage is already accounted by the main loop — recording
 # them here would double-count. MoA advisor/aggregator usage is folded into
 # conversation_loop's update_token_counts delta (tokens AND cost).
@@ -68,6 +75,19 @@ def get_accounting_context() -> Optional[tuple]:
     return _accounting.get()
 
 
+def set_account_attribution_suppressed():
+    """Suppress only account attribution while retaining model accounting."""
+    return _account_attribution_suppressed.set(True)
+
+
+def reset_account_attribution_suppressed(token) -> None:
+    """Restore the previous account-attribution suppression state."""
+    try:
+        _account_attribution_suppressed.reset(token)
+    except Exception:
+        _account_attribution_suppressed.set(False)
+
+
 def record_aux_usage(
     response: Any,
     task: Optional[str],
@@ -86,8 +106,9 @@ def record_aux_usage(
     * the response carries no usage object.
 
     The model is read from ``response.model`` (accurate even after the aux
-    client's provider-fallback chains); *provider*/*base_url* reflect the
-    originally-resolved route and are best-effort.
+    client's provider-fallback chains). *provider*/*base_url* are best-effort
+    caller hints unless a response carries authoritative account-route
+    metadata for the credential that actually served it.
     """
     try:
         if not task or task in _EXCLUDED_TASKS:
@@ -99,6 +120,28 @@ def record_aux_usage(
         raw_usage = getattr(response, "usage", None)
         if raw_usage is None:
             return
+
+        # A successful adapter response is authoritative about the credential
+        # and route that actually served it. Caller hints can describe the
+        # pre-fallback route, so prefer the response metadata whenever an
+        # account key is present.
+        response_account_key = getattr(response, "_hermes_account_key", None)
+        if response_account_key:
+            response_provider = str(
+                getattr(response, "_hermes_billing_provider", "") or ""
+            ).strip()
+            response_base_url = str(
+                getattr(response, "_hermes_billing_base_url", "") or ""
+            ).strip()
+            if response_provider:
+                provider = response_provider
+            if response_base_url:
+                base_url = response_base_url
+        account_key = (
+            None
+            if _account_attribution_suppressed.get()
+            else response_account_key
+        )
 
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
@@ -127,6 +170,7 @@ def record_aux_usage(
             model=model,
             billing_provider=provider,
             billing_base_url=base_url,
+            account_key=account_key,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
