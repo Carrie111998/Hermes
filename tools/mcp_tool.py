@@ -2965,6 +2965,15 @@ class MCPServerTask:
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
             toolset_name = f"mcp-{self.name}"
+            # The server may have changed annotations or introduced a
+            # normalized-name collision. Drop every old execute_code
+            # classification before examining the new list; successful
+            # registrations restore only the exact current read-only set.
+            # Registry handlers remain in place until the normal refresh logic
+            # settles, so model-visible MCP calls have no missing-tool window.
+            for tool_name in old_tool_names:
+                if registry.get_toolset_for_tool(tool_name) == toolset_name:
+                    _forget_mcp_tool_server(tool_name)
             stale_tool_names = old_tool_names - {
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
@@ -5576,12 +5585,18 @@ _parallel_safe_servers: set = set()
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Exact discovery-time read-only classification for each registered MCP tool
+# name. Kept alongside provenance so generated utility tools and stale raw-name
+# annotations can never be mistaken for an exposed read-only tool.
+_mcp_tool_read_only: Dict[str, bool] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# _parallel_safe_servers, _mcp_tool_server_names, _mcp_tool_read_only, and
+# _stdio_pids.
 _lock = threading.Lock()
 
 
@@ -7471,16 +7486,20 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact raw MCP server that registered *tool_name*."""
+def _track_mcp_tool_server(
+    tool_name: str, server_name: str, *, read_only: bool = False
+) -> None:
+    """Remember exact provenance and read-only status for *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        _mcp_tool_read_only[tool_name] = read_only is True
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_read_only.pop(tool_name, None)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -7640,6 +7659,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, mcp_tool.name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "read_only": _annotation_read_only_hint(mcp_tool),
             }
         )
 
@@ -7663,6 +7683,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                # Generated resources/prompts utilities have no MCP Tool
+                # annotation. They fail closed for execute_code exposure.
+                "read_only": False,
             }
         )
 
@@ -7762,6 +7785,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 )
             continue
 
+        # A list_changed refresh may replace this server's existing handler.
+        # Drop the old execute_code classification before replacement so a
+        # readOnlyHint true→false transition has no writable race window.
+        if existing_toolset == toolset_name:
+            _forget_mcp_tool_server(registry_name)
+
         registry.register(
             name=registry_name,
             toolset=toolset_name,
@@ -7785,7 +7814,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(
+            registry_name, name, read_only=candidate["read_only"]
+        )
         registered_names.append(registry_name)
 
     if registered_names:
@@ -7920,6 +7951,8 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
                 name, registry_name, existing_toolset,
             )
             continue
+        if existing_toolset == toolset_name:
+            _forget_mcp_tool_server(registry_name)
         registry.register(
             name=registry_name,
             toolset=toolset_name,
@@ -7932,7 +7965,15 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        annotations = raw.get("annotations")
+        _track_mcp_tool_server(
+            registry_name,
+            name,
+            read_only=(
+                isinstance(annotations, dict)
+                and annotations.get("readOnlyHint") is True
+            ),
+        )
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -8398,6 +8439,26 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
         return bool(server_name and server_name in _parallel_safe_servers)
+
+
+def get_read_only_mcp_tools() -> Dict[str, str]:
+    """Return ``{registry_name: raw_server_name}`` for read-only MCP tools.
+
+    This is the discovery-time, fail-closed view used by ``execute_code``.
+    A tool is included only when its MCP annotation carried the exact boolean
+    ``readOnlyHint=True`` and the tool is still registered. Generated MCP
+    utility tools have no server annotation and are therefore excluded.
+
+    The classification is stored against the exact registry name only after
+    the registry accepts ownership, so normalized-name collisions, generated
+    utilities, and stale raw annotations all fail closed.
+    """
+    with _lock:
+        return {
+            tool_name: server_name
+            for tool_name, server_name in _mcp_tool_server_names.items()
+            if _mcp_tool_read_only.get(tool_name) is True
+        }
 
 
 def get_mcp_status() -> List[dict]:

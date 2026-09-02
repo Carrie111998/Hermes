@@ -73,6 +73,7 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MAX_MCP_TOOL_CALLS = 10
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
@@ -482,17 +483,92 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
     return None
 
 
+def _sandbox_mcp_tools(enabled_tools, config: Optional[dict] = None) -> frozenset:
+    """Resolve MCP tools that may be exposed inside ``execute_code``.
+
+    Exposure is off by default. ``expose_mcp_tools: true`` enables every
+    session-visible MCP tool whose discovery annotation carried the exact
+    boolean ``readOnlyHint=True``. A string/list may instead select exact raw
+    server names or exact provider-safe registry tool names. Missing or
+    malformed annotations fail closed in ``get_read_only_mcp_tools``.
+    """
+    available = set(enabled_tools or ())
+    if not available:
+        return frozenset()
+
+    cfg = _load_config() if config is None else config
+    exposure = cfg.get("expose_mcp_tools", False)
+    if exposure is False or exposure is None:
+        return frozenset()
+
+    selectors = None
+    if exposure is not True:
+        if isinstance(exposure, str):
+            selectors = {exposure}
+        elif isinstance(exposure, (list, tuple, set, frozenset)):
+            selectors = {str(item) for item in exposure if str(item)}
+        else:
+            logger.warning(
+                "code_execution.expose_mcp_tools must be false, true, or a "
+                "list of MCP server/tool names; disabling MCP exposure"
+            )
+            return frozenset()
+
+    try:
+        from tools.mcp_tool import get_read_only_mcp_tools
+
+        read_only = get_read_only_mcp_tools()
+    except Exception:
+        logger.debug("Could not resolve read-only MCP tools", exc_info=True)
+        return frozenset()
+
+    return frozenset(
+        tool_name
+        for tool_name, server_name in read_only.items()
+        if tool_name in available
+        and (
+            selectors is None
+            or tool_name in selectors
+            or server_name in selectors
+        )
+    )
+
+
+def _max_mcp_tool_calls(config: dict) -> int:
+    """Return the non-negative per-cell MCP sub-budget."""
+    raw = config.get("max_mcp_tool_calls", DEFAULT_MAX_MCP_TOOL_CALLS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "code_execution.max_mcp_tool_calls must be an integer; using %d",
+            DEFAULT_MAX_MCP_TOOL_CALLS,
+        )
+        return DEFAULT_MAX_MCP_TOOL_CALLS
+    if value < 0:
+        logger.warning(
+            "code_execution.max_mcp_tool_calls cannot be negative; using %d",
+            DEFAULT_MAX_MCP_TOOL_CALLS,
+        )
+        return DEFAULT_MAX_MCP_TOOL_CALLS
+    return value
+
+
 def generate_hermes_tools_module(enabled_tools: List[str],
-                                 transport: str = "uds") -> str:
+                                 transport: str = "uds",
+                                 mcp_tools: Optional[List[str]] = None) -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
+    Built-in stubs require membership in both ``SANDBOX_ALLOWED_TOOLS`` and
+    ``enabled_tools``. MCP stubs require explicit membership in ``mcp_tools``;
+    callers pass only the gated, read-only set resolved for this session.
 
     Args:
         enabled_tools: Tool names enabled in the current session.
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
+        mcp_tools: Gated read-only MCP registry names to expose.
     """
     tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
 
@@ -508,6 +584,18 @@ def generate_hermes_tools_module(enabled_tools: List[str],
             f"    return _call({func_name!r}, {args_expr})\n"
         )
         export_names.append(func_name)
+
+    for tool_name in sorted(set(mcp_tools or ()) & set(enabled_tools)):
+        # MCP registry names are normalized to provider/Python-safe identifiers
+        # when registered (mcp__<server>__<tool>). Keep these stubs deliberately
+        # generic: the model already has the full model-visible tool schema.
+        if not tool_name.startswith("mcp__") or not tool_name.isidentifier():
+            continue
+        stub_functions.append(
+            f"def {tool_name}(**kwargs):\n"
+            f"    return _call({tool_name!r}, kwargs)\n"
+        )
+        export_names.append(tool_name)
 
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
@@ -720,6 +808,53 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns"}
 
 
+def _rpc_policy_error(
+    tool_name: str,
+    *,
+    allowed_tools: frozenset,
+    mcp_tools: frozenset,
+    tool_calls_made: int,
+    max_tool_calls: int,
+    mcp_tool_calls_made: int,
+    max_mcp_tool_calls: int,
+) -> Optional[str]:
+    """Return a teaching error when an RPC request violates sandbox policy.
+
+    MCP classification is rechecked for every request, not trusted solely
+    because a stub was generated when the kernel started. If a server refresh
+    removes ``readOnlyHint=True`` or the operator disables exposure, the next
+    raw RPC call fails closed even in an already-running persistent kernel.
+    """
+    if tool_name not in allowed_tools:
+        available = ", ".join(sorted(allowed_tools))
+        return tool_error(
+            f"Tool '{tool_name}' is not available in execute_code. "
+            f"Available: {available}"
+        )
+
+    is_mcp = tool_name in mcp_tools
+    if is_mcp and tool_name not in _sandbox_mcp_tools(mcp_tools):
+        return tool_error(
+            f"MCP tool '{tool_name}' is no longer exposed in execute_code. "
+            "It must remain enabled by code_execution.expose_mcp_tools and "
+            "carry discovery-time readOnlyHint=true."
+        )
+
+    if is_mcp and mcp_tool_calls_made >= max_mcp_tool_calls:
+        return tool_error(
+            f"MCP tool call limit reached ({max_mcp_tool_calls}) before "
+            f"'{tool_name}'. No more MCP calls are allowed in this execution."
+        )
+
+    if tool_calls_made >= max_tool_calls:
+        subject = f"MCP tool '{tool_name}'" if is_mcp else f"Tool '{tool_name}'"
+        return tool_error(
+            f"{subject} was not called: total tool call limit reached "
+            f"({max_tool_calls}). No more tool calls are allowed in this execution."
+        )
+    return None
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -730,6 +865,10 @@ def _rpc_server_loop(
     stop_event: threading.Event,
     rpc_token: str,
     dispatch=None,
+    *,
+    mcp_tools: frozenset = frozenset(),
+    mcp_tool_call_counter: Optional[list] = None,
+    max_mcp_tool_calls: int = DEFAULT_MAX_MCP_TOOL_CALLS,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -743,6 +882,9 @@ def _rpc_server_loop(
     freeze the first cell's context.
     """
     from model_tools import handle_function_call
+
+    if mcp_tool_call_counter is None:
+        mcp_tool_call_counter = [0]
 
     if dispatch is None:
         def dispatch(tool_name, tool_args):
@@ -799,22 +941,17 @@ def _rpc_server_loop(
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
 
-                # Enforce the allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    resp = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
-                    conn.sendall((resp + "\n").encode())
-                    continue
-
-                # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
-                    resp = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
+                policy_error = _rpc_policy_error(
+                    tool_name,
+                    allowed_tools=allowed_tools,
+                    mcp_tools=mcp_tools,
+                    tool_calls_made=tool_call_counter[0],
+                    max_tool_calls=max_tool_calls,
+                    mcp_tool_calls_made=mcp_tool_call_counter[0],
+                    max_mcp_tool_calls=max_mcp_tool_calls,
+                )
+                if policy_error is not None:
+                    resp = policy_error
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -834,12 +971,16 @@ def _rpc_server_loop(
                     result = tool_error(str(exc))
 
                 tool_call_counter[0] += 1
+                is_mcp = tool_name in mcp_tools
+                if is_mcp:
+                    mcp_tool_call_counter[0] += 1
                 call_duration = time.monotonic() - call_start
 
                 # Log for observability
                 args_preview = str(tool_args)[:80]
                 tool_call_log.append({
                     "tool": tool_name,
+                    "source": "mcp" if is_mcp else "built-in",
                     "args_preview": args_preview,
                     "duration": round(call_duration, 2),
                 })
@@ -1011,6 +1152,10 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    *,
+    mcp_tools: frozenset = frozenset(),
+    mcp_tool_call_counter: Optional[list] = None,
+    max_mcp_tool_calls: int = DEFAULT_MAX_MCP_TOOL_CALLS,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1019,6 +1164,9 @@ def _rpc_poll_loop(
     script-execution thread.
     """
     from model_tools import handle_function_call
+
+    if mcp_tool_call_counter is None:
+        mcp_tool_call_counter = [0]
 
     poll_interval = 0.1  # 100 ms
 
@@ -1081,19 +1229,17 @@ def _rpc_poll_loop(
                 res_file = f"{rpc_dir}/res_{seq_str}"
                 quoted_res_file = shlex.quote(res_file)
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
+                policy_error = _rpc_policy_error(
+                    tool_name,
+                    allowed_tools=allowed_tools,
+                    mcp_tools=mcp_tools,
+                    tool_calls_made=tool_call_counter[0],
+                    max_tool_calls=max_tool_calls,
+                    mcp_tool_calls_made=mcp_tool_call_counter[0],
+                    max_mcp_tool_calls=max_mcp_tool_calls,
+                )
+                if policy_error is not None:
+                    tool_result = policy_error
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -1112,9 +1258,13 @@ def _rpc_poll_loop(
                         tool_result = tool_error(str(exc))
 
                     tool_call_counter[0] += 1
+                    is_mcp = tool_name in mcp_tools
+                    if is_mcp:
+                        mcp_tool_call_counter[0] += 1
                     call_duration = time.monotonic() - call_start
                     tool_call_log.append({
                         "tool": tool_name,
+                        "source": "mcp" if is_mcp else "built-in",
                         "args_preview": str(tool_args)[:80],
                         "duration": round(call_duration, 2),
                     })
@@ -1187,6 +1337,7 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
         "status": kernel_result.get("status", "error"),
         "output": stdout_text,
         "tool_calls_made": kernel_result.get("tool_calls_made", 0),
+        "mcp_tool_calls_made": kernel_result.get("mcp_tool_calls_made", 0),
         "duration_seconds": duration,
         "kernel": kernel_result.get("kernel", {"remote": True}),
     }
@@ -1226,11 +1377,14 @@ def _execute_remote(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    max_mcp_tool_calls = _max_mcp_tool_calls(_cfg)
 
     session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    builtin_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+    if not builtin_tools:
+        builtin_tools = SANDBOX_ALLOWED_TOOLS
+    mcp_tools = _sandbox_mcp_tools(session_tools, _cfg)
+    sandbox_tools = frozenset(builtin_tools | mcp_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1243,6 +1397,7 @@ def _execute_remote(
 
     tool_call_log: list = []
     tool_call_counter = [0]
+    mcp_tool_call_counter = [0]
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
@@ -1262,6 +1417,7 @@ def _execute_remote(
                     "remote backends."
                 ),
                 "tool_calls_made": 0,
+                "mcp_tool_calls_made": 0,
                 "duration_seconds": 0,
             })
 
@@ -1279,8 +1435,10 @@ def _execute_remote(
                 env_type=env_type,
                 task_env_id=effective_task_id,
                 sandbox_tools=frozenset(sandbox_tools),
+                mcp_tools=frozenset(mcp_tools),
                 timeout=timeout,
                 max_tool_calls=max_tool_calls,
+                max_mcp_tool_calls=max_mcp_tool_calls,
                 reset=bool(reset),
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
             )
@@ -1309,7 +1467,7 @@ def _execute_remote(
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file",
+            list(sandbox_tools), transport="file", mcp_tools=list(mcp_tools),
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -1324,6 +1482,11 @@ def _execute_remote(
                 tool_call_log, tool_call_counter, max_tool_calls,
                 sandbox_tools, stop_event, rpc_token,
             ),
+            kwargs={
+                "mcp_tools": mcp_tools,
+                "mcp_tool_call_counter": mcp_tool_call_counter,
+                "max_mcp_tool_calls": max_mcp_tool_calls,
+            },
             daemon=True,
         )
         rpc_thread.start()
@@ -1367,6 +1530,7 @@ def _execute_remote(
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
+            "mcp_tool_calls_made": mcp_tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)
 
@@ -1406,6 +1570,7 @@ def _execute_remote(
         "output": stdout_text,
         "exit_code": exit_code,
         "tool_calls_made": tool_call_counter[0],
+        "mcp_tool_calls_made": mcp_tool_call_counter[0],
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
@@ -1613,6 +1778,7 @@ def execute_code(
             "status": "error",
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
             "tool_calls_made": 0,
+            "mcp_tool_calls_made": 0,
             "duration_seconds": 0,
         }, ensure_ascii=False)
 
@@ -1638,13 +1804,15 @@ def execute_code(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    max_mcp_tool_calls = _max_mcp_tool_calls(_cfg)
 
     # Determine which tools the sandbox can call
     session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    builtin_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+    if not builtin_tools:
+        builtin_tools = SANDBOX_ALLOWED_TOOLS
+    mcp_tools = _sandbox_mcp_tools(session_tools, _cfg)
+    sandbox_tools = frozenset(builtin_tools | mcp_tools)
 
     if _get_kernel_mode() == "session":
         # Session kernels keep one interpreter alive across calls; the guards
@@ -1660,8 +1828,10 @@ def execute_code(
             child_python=_resolve_child_python(_mode),
             child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
             sandbox_tools=frozenset(sandbox_tools),
+            mcp_tools=frozenset(mcp_tools),
             timeout=timeout,
             max_tool_calls=max_tool_calls,
+            max_mcp_tool_calls=max_mcp_tool_calls,
             reset=bool(reset),
             is_interrupted=_is_interrupted,
         )
@@ -1690,6 +1860,7 @@ def execute_code(
 
     tool_call_log: list = []
     tool_call_counter = [0]  # mutable so the RPC thread can increment
+    mcp_tool_call_counter = [0]
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
@@ -1705,7 +1876,9 @@ def execute_code(
         # Python source files are decoded as UTF-8 by default (PEP 3120).
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
-        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        tools_src = generate_hermes_tools_module(
+            list(sandbox_tools), mcp_tools=list(mcp_tools)
+        )
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
@@ -1743,6 +1916,11 @@ def execute_code(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
             ),
+            kwargs={
+                "mcp_tools": mcp_tools,
+                "mcp_tool_call_counter": mcp_tool_call_counter,
+                "max_mcp_tool_calls": max_mcp_tool_calls,
+            },
             daemon=True,
         )
         rpc_thread.start()
@@ -1937,6 +2115,7 @@ def execute_code(
             "output": stdout_text,
             "exit_code": exit_code,
             "tool_calls_made": tool_call_counter[0],
+            "mcp_tool_calls_made": mcp_tool_call_counter[0],
             "duration_seconds": duration,
         }
         result.update(stdout_metadata)
@@ -1987,6 +2166,7 @@ def execute_code(
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
+            "mcp_tool_calls_made": mcp_tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)
 
@@ -2343,7 +2523,8 @@ _TOOL_DOC_LINES = [
 
 
 def build_execute_code_schema(enabled_sandbox_tools: set = None,
-                              mode: str = None) -> dict:
+                              mode: str = None,
+                              enabled_mcp_tools: set = None) -> dict:
     """Build the execute_code schema with description listing only enabled tools.
 
     When tools are disabled via ``hermes tools`` (e.g. web is turned off),
@@ -2358,18 +2539,33 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     """
     if enabled_sandbox_tools is None:
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    if enabled_mcp_tools is None:
+        enabled_mcp_tools = set()
     if mode is None:
         mode = _get_execution_mode()
 
     # Build tool documentation lines for only the enabled tools
-    tool_lines = "\n".join(
+    builtin_tool_lines = "\n".join(
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
+    tool_sections = [builtin_tool_lines] if builtin_tool_lines else []
+    if enabled_mcp_tools:
+        # Keep this intentionally name-only. The full MCP schemas are already
+        # model-visible; repeating their descriptions/parameters here would
+        # multiply prompt cost for users with large MCP servers.
+        mcp_names = ", ".join(
+            f"{name}(**kwargs)" for name in sorted(enabled_mcp_tools)
+        )
+        tool_sections.append(
+            "  Read-only MCP tools (same keyword args as their model-visible "
+            f"schemas):\n    {mcp_names}"
+        )
+    tool_lines = "\n".join(tool_sections)
 
     # Build example import list from enabled tools
     import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
     if not import_examples:
-        import_examples = sorted(enabled_sandbox_tools)[:2]
+        import_examples = sorted(enabled_sandbox_tools | enabled_mcp_tools)[:2]
     if import_examples:
         import_str = ", ".join(import_examples) + ", ..."
     else:
@@ -2410,7 +2606,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "loses that state.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
+        "Limits: 5-minute timeout, max 50 tool calls per call; read-only MCP "
+        "calls also have a separate configurable sub-limit. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file "
         "whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"

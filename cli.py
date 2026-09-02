@@ -527,6 +527,10 @@ def load_cli_config() -> Dict[str, Any]:
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
             "max_tool_calls": 50,  # Max RPC tool calls per execution
+            # Off by default. true exposes every readOnlyHint=true MCP tool;
+            # a list selects exact MCP server names or registry tool names.
+            "expose_mcp_tools": False,
+            "max_mcp_tool_calls": 10,  # Separate MCP sub-budget per execution
         },
         "auxiliary": {
             "vision": {

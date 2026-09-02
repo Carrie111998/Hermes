@@ -3016,6 +3016,12 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # MCP tools remain unavailable inside execute_code unless explicitly
+        # enabled. true exposes all discovery-time readOnlyHint=true tools;
+        # a list narrows that set to exact raw server/registry tool names.
+        "expose_mcp_tools": False,
+        # Separate per-cell sub-budget within the overall 50-call RPC cap.
+        "max_mcp_tool_calls": 10,
         # Kernel lifetime:
         #   per-call (default) — a fresh child process per execute_code call;
         #     no state carries over. Today's behavior.
