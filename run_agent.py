@@ -3527,6 +3527,7 @@ class AIAgent:
         message: Optional[str] = None,
         *,
         hard_cancel: bool = False,
+        stop_kind: Optional[str] = None,
         tool_reason: Optional[str] = None,
         require_generation: Optional[int] = None,
     ) -> bool:
@@ -3550,6 +3551,11 @@ class AIAgent:
                          deferred until after the claim survives, so a
                          declined abort never cancels a legitimate pending
                          compression.
+            stop_kind: Optional structured provenance for the interrupt —
+                         "user_stop" for a deliberate stop/redirect, or
+                         "client_disconnect" when the transport dropped
+                         mid-turn. Recorded on ``_interrupt_stop_kind`` for
+                         user-facing wording; leaves ``message`` untouched.
             tool_reason: Trusted fixed category safe to expose in tool output.
                          Arbitrary diagnostic or caller text belongs in message.
             require_generation: Optional activity-generation claim (#95663).
@@ -3674,6 +3680,7 @@ class AIAgent:
         def _publish_interrupt_state() -> None:
             self._interrupt_requested = True
             self._interrupt_message = message
+            self._interrupt_stop_kind = stop_kind
             self._tool_interrupt_reason = tool_interrupt_reason
             if hard_cancel:
                 _hard_event = getattr(
@@ -3820,7 +3827,14 @@ class AIAgent:
                         tool_reason=tool_interrupt_reason,
                     )
                 else:
+                    child.interrupt(message, stop_kind=stop_kind)
+            except TypeError:
+                # Legacy-ABI third-party agents override interrupt(message=None)
+                # without the keyword-only stop_kind argument (#84207).
+                try:
                     child.interrupt(message)
+                except Exception as e:
+                    logger.debug("Failed to propagate interrupt to child agent: %s", e)
             except Exception as e:
                 logger.debug("Failed to propagate interrupt to child agent: %s", e)
         if not self.quiet_mode:
@@ -3831,12 +3845,16 @@ class AIAgent:
         self,
         message: Optional[str] = None,
         *,
+        stop_kind: Optional[str] = None,
         tool_reason: Optional[str] = None,
     ) -> None:
         """Request an explicit stop while preserving ``interrupt()`` ABI.
 
         Frontends can feature-detect this method and fall back to the legacy
         ``interrupt()`` signature for synthetic or third-party agents.
+        ``stop_kind`` carries the structured interrupt provenance (#84207);
+        ``request_hard_interrupt`` also stamps it directly for legacy agents
+        whose ``hard_interrupt`` predates the parameter.
         """
         # Deliberately bypass dynamic dispatch: subclasses written against the
         # legacy interrupt(message=None) ABI may override interrupt without the
@@ -3845,6 +3863,7 @@ class AIAgent:
             self,
             message,
             hard_cancel=True,
+            stop_kind=stop_kind,
             tool_reason=tool_reason,
         )
 
