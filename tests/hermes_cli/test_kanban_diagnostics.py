@@ -120,6 +120,32 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert d.detail.endswith("…") or len(d.detail) < 700
 
 
+def test_repeated_crashes_clears_after_explicit_unblock():
+    """An explicit recovery clears stale alarms while the retry is pending."""
+    task = _task(status="ready")
+    runs = [
+        {**_run(outcome="crashed", run_id=1), "ended_at": 100},
+        {**_run(outcome="crashed", run_id=2), "ended_at": 200},
+    ]
+    events = [_event("unblocked", ts=300)]
+
+    assert not kd._rule_repeated_crashes(task, events, runs, now=400, cfg={})
+
+
+def test_repeated_crashes_after_unblock_still_alerts():
+    """The recovery boundary does not hide a new crash."""
+    task = _task(status="ready")
+    runs = [
+        {**_run(outcome="crashed", run_id=1), "ended_at": 100},
+        {**_run(outcome="crashed", run_id=2), "ended_at": 400},
+    ]
+    events = [_event("unblocked", ts=300)]
+
+    diagnostics = kd._rule_repeated_crashes(task, events, runs, now=500, cfg={})
+    assert len(diagnostics) == 1
+    assert diagnostics[0].kind == "repeated_crashes"
+
+
 # ---------------------------------------------------------------------------
 # Severity sorting
 # ---------------------------------------------------------------------------
