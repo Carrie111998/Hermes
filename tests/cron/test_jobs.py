@@ -699,6 +699,16 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error="")
         assert get_job(job["id"])["last_status"] == "ok"
 
+    def test_silent_success_can_preserve_previous_delivery_error(self, tmp_cron_dir):
+        job = create_job(prompt="Monitor", schedule="every 1h")
+        mark_job_run(job["id"], True, delivery_error="send failed: 502")
+
+        mark_job_run(job["id"], True, preserve_delivery_error=True)
+
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["last_delivery_error"] == "send failed: 502"
+
     def test_agent_failure_still_error_with_delivery_error(self, tmp_cron_dir):
         """An agent failure outranks delivery: still "error", still a streak."""
         job = create_job(prompt="Report", schedule="every 1h")

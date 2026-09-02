@@ -786,3 +786,53 @@ def test_multiplex_missing_secondary_does_not_fall_back_to_shared(tmp_path):
     assert default_ad is shared
     assert sec_ad is not shared
     assert not sec_ad
+
+
+def test_multiplex_secondary_receives_target_scoped_primary_route_context(tmp_path):
+    """Primary transport stays separate from the satellite adapter map."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    satellite_home = tmp_path / "fitness"
+    for home in (default_home, satellite_home):
+        (home / "cron").mkdir(parents=True)
+
+    shared = {"kind": "primary"}
+    primary_config = object()
+    captured = []
+    stop = threading.Event()
+
+    def _capture(*_args, **kwargs):
+        captured.append(kwargs)
+        if len(captured) >= 2:
+            stop.set()
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=_capture), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **_kw: None):
+        thread = threading.Thread(
+            target=InProcessCronScheduler().start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": [
+                    ("default", default_home),
+                    ("fitness", satellite_home),
+                ],
+                "adapters": shared,
+                "profile_adapters": {},
+                "default_profile": "default",
+                "primary_gateway_config": primary_config,
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert captured[0]["profile_route_context"] is None
+    context = captured[1]["profile_route_context"]
+    assert context.profile == "fitness"
+    assert context.config is primary_config
+    assert context.adapters is shared
+    assert captured[1]["adapters"] == {}

@@ -33734,6 +33734,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 # cron through the default bot (even before its adapter connects,
                 # when profile_adapters[name] is still absent/empty).
                 cron_start_kwargs["default_profile"] = "default"
+                # The satellite still owns execution and secret scope. The
+                # primary config is carried only as a target-scoped transport
+                # authority for exact profile_routes matches during delivery.
+                cron_start_kwargs["primary_gateway_config"] = runner.config
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

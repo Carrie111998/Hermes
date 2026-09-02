@@ -560,6 +560,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
         profile_adapters=None,
         default_profile=None,
+        primary_gateway_config=None,
     ):
         import logging
         from cron.scheduler import CronTickYielded
@@ -590,6 +591,7 @@ class InProcessCronScheduler(CronScheduler):
                 can_dispatch=can_dispatch,
                 profile_adapters=profile_adapters,
                 default_profile=default_profile,
+                primary_gateway_config=primary_gateway_config,
             )
             return
 
@@ -670,6 +672,7 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None,
         profile_adapters=None,
         default_profile=None,
+        primary_gateway_config=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -743,14 +746,27 @@ class InProcessCronScheduler(CronScheduler):
                                 # — it simply does not deliver this tick.
                                 if _pname is None or _pname == default_profile:
                                     _tick_adapters = adapters
+                                    _route_context = None
                                 else:
                                     _tick_adapters = (profile_adapters or {}).get(_pname) or {}
+                                    _route_context = None
+                                    if primary_gateway_config is not None:
+                                        from cron.scheduler import (
+                                            ProfileRouteDeliveryContext,
+                                        )
+
+                                        _route_context = ProfileRouteDeliveryContext(
+                                            profile=_pname,
+                                            config=primary_gateway_config,
+                                            adapters=adapters or {},
+                                        )
                                 cron_tick(
                                     verbose=False,
                                     adapters=_tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    profile_route_context=_route_context,
                                 )
                         except CronTickYielded as e:
                             # This profile is served stale and a fresh

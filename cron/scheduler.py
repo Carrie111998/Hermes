@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -62,6 +63,20 @@ from agent.delegation_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProfileRouteDeliveryContext:
+    """Primary transport available to one multiplexed satellite profile.
+
+    The job still executes under the satellite profile's home and secret scope.
+    This context only carries the already-connected primary gateway transport;
+    it never copies credentials into the satellite profile.
+    """
+
+    profile: str
+    config: Any
+    adapters: Any
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -3141,7 +3156,13 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
         )
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    profile_route_context: Optional[ProfileRouteDeliveryContext] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3354,6 +3375,41 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         from gateway.delivery import resolve_delivery_transport
 
         transport = resolve_delivery_transport(platform, config, adapters)
+        transport_config = config
+        transport_adapters = adapters
+        primary_route_owned = False
+        if transport is None and profile_route_context is not None and chat_id:
+            from gateway.profile_routing import match_profile_route
+
+            primary_config = profile_route_context.config
+            matched_route = match_profile_route(
+                getattr(primary_config, "profile_routes", None) or [],
+                platform=platform_name.lower(),
+                chat_id=str(chat_id),
+                thread_id=str(thread_id) if thread_id is not None else None,
+            )
+            # Only a concrete chat route proves that this exact cron target is
+            # owned by the satellite. Platform- and guild-only routes cannot be
+            # safely resolved from a platform:chat_id delivery token.
+            if (
+                matched_route is not None
+                and matched_route.profile == profile_route_context.profile
+                and matched_route.chat_id
+            ):
+                primary_route_owned = True
+                transport_config = primary_config
+                transport_adapters = profile_route_context.adapters
+                transport = resolve_delivery_transport(
+                    platform, transport_config, transport_adapters
+                )
+                if transport is None:
+                    msg = (
+                        f"profile-routed delivery to {platform_name}:{chat_id} "
+                        "has no primary live adapter"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3644,7 +3700,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 elif text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(transport_config, transport_adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -3771,7 +3827,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     f"returned unconfirmed result ({shape}, error={err})"
                                 )
-                                if transport is not None and transport.is_relay:
+                                if primary_route_owned or (
+                                    transport is not None and transport.is_relay
+                                ):
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
                                     logger.warning(
@@ -3806,7 +3864,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
-                        logical_home = config.get_home_channel(platform)
+                        logical_home = transport_config.get_home_channel(platform)
                         if logical_home is not None and logical_home.chat_id == chat_id:
                             if logical_home.user_id:
                                 routed_media_metadata["user_id"] = logical_home.user_id
@@ -3928,7 +3986,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
-                if transport is not None and transport.is_relay:
+                if primary_route_owned or (
+                    transport is not None and transport.is_relay
+                ):
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
                     logger.warning(
@@ -3937,13 +3997,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
-            if transport is not None and transport.is_relay:
-                # Relay owns the logical destination and its connector owns the
-                # platform credential. A native retry could duplicate delivery
-                # and cannot be authenticated correctly, so fail closed.
+            if primary_route_owned or (transport is not None and transport.is_relay):
+                # Relay and a primary profile-route transport own their logical
+                # destination credentials. Retrying under the satellite's
+                # standalone sender could duplicate delivery and cannot be
+                # authenticated correctly, so fail closed.
                 if not target_errors:
+                    owner = "primary profile-route" if primary_route_owned else "relay"
                     target_errors.append(
-                        f"relay delivery to {platform_name}:{chat_id} failed"
+                        f"{owner} delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
                 continue
@@ -7240,6 +7302,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    profile_route_context: Optional[ProfileRouteDeliveryContext] = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -7293,6 +7356,7 @@ def run_one_job(
                     else lost_ownership
                 ),
                 execution_token=execution_token,
+                profile_route_context=profile_route_context,
             ),
         )
     finally:
@@ -7313,6 +7377,7 @@ def _run_one_job_body(
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    profile_route_context: Optional[ProfileRouteDeliveryContext] = None,
 ) -> bool:
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -7570,6 +7635,7 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
+            silent_success = False
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False
@@ -7582,6 +7648,7 @@ def _run_one_job_body(
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
+                silent_success = True
 
             if should_deliver and _fire_claim_ownership_lost():
                 should_deliver = False
@@ -7605,6 +7672,7 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            profile_route_context=profile_route_context,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7680,6 +7748,8 @@ def _run_one_job_body(
             return True
 
         mark_kwargs = {"delivery_error": delivery_error}
+        if silent_success:
+            mark_kwargs["preserve_delivery_error"] = True
         if fire_owner is not None:
             mark_kwargs["expected_fire_owner"] = fire_owner
         if blocked_config:
@@ -7775,6 +7845,7 @@ def _run_one_job_body(
                         + _failure_streak_nudge(job),
                         adapters=adapters,
                         loop=loop,
+                        profile_route_context=profile_route_context,
                     )
                 except Exception as delivery_exc:
                     delivery_error = str(delivery_exc)
@@ -8003,6 +8074,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    profile_route_context: Optional[ProfileRouteDeliveryContext] = None,
 ):
     """
     Check and run all due jobs.
@@ -8246,6 +8318,7 @@ def tick(
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                profile_route_context=profile_route_context,
             )
 
         # Workdir is task-scoped, so every job uses the normal parallel lane.

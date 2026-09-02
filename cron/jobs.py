@@ -2921,6 +2921,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    preserve_delivery_error: bool = False,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2932,6 +2933,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            preserve_delivery_error=preserve_delivery_error,
         )
 
 
@@ -3026,6 +3028,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    preserve_delivery_error: bool = False,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -3104,8 +3107,11 @@ def _mark_job_run_locked(
                     job["failure_streak"] = 0
                 else:
                     job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
-                # Track delivery failures separately — cleared on successful delivery
-                job["last_delivery_error"] = delivery_error
+                # A [SILENT] monitor tick does not attempt delivery, so it cannot
+                # prove that the previous transport failure healed. Other runs
+                # retain the historical clear-on-success behavior.
+                if not preserve_delivery_error:
+                    job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None

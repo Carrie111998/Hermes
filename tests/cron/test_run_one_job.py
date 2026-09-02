@@ -29,7 +29,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(
+        job, content, adapters=None, loop=None, profile_route_context=None
+    ):
         calls.append(("deliver", job["id"]))
         return None
 
@@ -76,6 +78,32 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_silent_success_preserves_previous_delivery_error(monkeypatch):
+    """A monitor's [SILENT] tick did not retry delivery and cannot heal it."""
+    marked = []
+    _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: marked.append((args, kwargs)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "silent-monitor",
+            "name": "monitor",
+            "last_delivery_error": "Discord standalone send failed",
+        }
+    ) is True
+
+    assert marked == [
+        (
+            ("silent-monitor", True, None),
+            {"delivery_error": None, "preserve_delivery_error": True},
+        )
+    ]
 
 
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
