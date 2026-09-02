@@ -66,7 +66,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
-from hermes_constants import agent_browser_runnable, get_hermes_home
+from hermes_constants import agent_browser_runnable, get_hermes_home, get_effective_temp_dir
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -1379,7 +1379,7 @@ def _socket_safe_tmpdir() -> str:
     """
     if sys.platform == "darwin":
         return "/tmp"
-    return tempfile.gettempdir()
+    return get_effective_temp_dir()
 
 
 # Track active sessions per "session key".

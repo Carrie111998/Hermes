@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from hermes_constants import get_effective_temp_dir
 
 logger = logging.getLogger(__name__)
 
@@ -677,7 +678,7 @@ class ProcessRegistry:
                     return temp_dir.rstrip("/") or "/"
             except Exception as exc:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
-        return "/tmp"
+        return get_effective_temp_dir()
 
     def spawn_local(
         self,

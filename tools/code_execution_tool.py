@@ -48,6 +48,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
 
 from tools.thread_context import propagate_context_to_thread
+from hermes_constants import get_effective_temp_dir
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
@@ -757,7 +758,7 @@ def _env_temp_dir(env: Any) -> str:
     candidate = tempfile.gettempdir()
     if isinstance(candidate, str) and candidate.startswith("/"):
         return candidate.rstrip("/") or "/"
-    return "/tmp"
+    return get_effective_temp_dir()
 
 
 def _rpc_poll_loop(

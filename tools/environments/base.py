@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import IO, Callable, Protocol
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_effective_temp_dir
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
 
@@ -308,7 +308,7 @@ class BaseEnvironment(ABC):
         LocalEnvironment overrides this on platforms like Termux where ``/tmp``
         may be missing and ``TMPDIR`` is the portable writable location.
         """
-        return "/tmp"
+        return get_effective_temp_dir()
 
     def __init__(self, cwd: str, timeout: int, env: dict = None):
         self.cwd = cwd

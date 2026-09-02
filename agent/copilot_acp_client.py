@@ -13,6 +13,8 @@ import os
 import queue
 import re
 import shlex
+
+from hermes_constants import get_effective_temp_dir
 import subprocess
 import threading
 import time
@@ -93,10 +95,8 @@ def _resolve_home_dir() -> str:
     except Exception:
         pass
 
-    # Last resort: /tmp (writable on any POSIX system). Avoids crashing the
-    # subprocess with no HOME; callers can set HERMES_HOME explicitly if they
-    # need a different writable dir.
-    return "/tmp"
+    # Last resort: writable temp dir (handles Termux, Windows, etc.).
+    return get_effective_temp_dir()
 
 
 def _build_subprocess_env() -> dict[str, str]:
