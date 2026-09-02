@@ -99,6 +99,27 @@ def _ensure_file_checkpoint(
     resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
     work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
     agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+    # Periodic checkpoint hook for long-running sessions (#99869):
+    # fires every checkpoint_interval file mutations regardless of the
+    # per-turn dedup, so a multi-hour sweep still persists progress.
+    try:
+        agent._checkpoint_mgr.maybe_periodic_checkpoint(
+            work_dir, f"periodic before {function_name}"
+        )
+    except Exception:
+        pass
+
+
+def _maybe_periodic_terminal_checkpoint(
+    agent, working_dir: str, command: str
+) -> None:
+    """Periodic checkpoint for destructive terminal commands (#99869)."""
+    try:
+        agent._checkpoint_mgr.maybe_periodic_checkpoint(
+            working_dir, f"periodic before terminal: {command[:60]}"
+        )
+    except Exception:
+        pass
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -1091,6 +1112,7 @@ def _begin_tool_execution(
                 agent._checkpoint_mgr.ensure_checkpoint(
                     cwd, f"before terminal: {command[:60]}"
                 )
+                _maybe_periodic_terminal_checkpoint(agent, cwd, command)
         except Exception:
             pass
 

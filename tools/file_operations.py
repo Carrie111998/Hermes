@@ -1344,11 +1344,20 @@ class ShellFileOperations(FileOperations):
             '[ -n "$m" ] && chmod "$m" "$tmp" 2>/dev/null || true; '
             "fi; "
             'cat > "$tmp"; '
+            # Ensure durable write before atomic rename — fsync temp file
+            # (#99869 proposal 1: write to <file>.tmp -> fsync -> rename).
+            # Best-effort: sync available on GNU coreutils/macOS/busybox;
+            # fall back to global sync or a no-op so behavior is unchanged
+            # where sync is absent (e.g. minimal containers).
+            'sync "$tmp" 2>/dev/null || sync 2>/dev/null || true; '
             # new file: umask-default perms instead of mktemp's 0600 (#70856).
             # Runs AFTER cat so a write-masking umask can't EACCES the stream;
             # quoted "=rw" so zsh doesn't =word-expand it.
             'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
             'mv -f "$tmp" "$t"; '
+            # Best-effort fsync of the target and parent dir after rename so
+            # a power loss immediately after mv doesn't lose the new inode.
+            'sync "$t" 2>/dev/null || sync 2>/dev/null || true; '
             "trap - EXIT"
         )
         return self._exec(script, stdin_data=content)
