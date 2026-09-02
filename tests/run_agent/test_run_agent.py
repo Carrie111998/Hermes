@@ -1993,7 +1993,7 @@ class TestTerminalRateLimitGuidance:
         assert result["failure_reason"] == "rate_limit"
         assert "minimax/minimax-m3:FREE" in final
         assert "free tier" in final.lower()
-        assert "minimax/minimax-m3" in final
+        assert "`/model minimax/minimax-m3 --provider openrouter`" in final
         assert "quota resets" in final.lower()
 
     def test_paid_model_rate_limit_has_backoff_and_quota_guidance(self, agent):
