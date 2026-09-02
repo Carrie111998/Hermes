@@ -22,6 +22,9 @@ class RealtimeEventType(str, Enum):
     TURN_ENDED = "turn_ended"
     ERROR = "error"
 
+    SESSION_READY = "session_ready"
+    WARNING = "warning"
+
 
 @dataclass(frozen=True)
 class HeardAudioBoundary:
@@ -44,6 +47,7 @@ class RealtimeEvent:
     item_id: str | None = None
     role: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
+    session_id: str | None = None
 
     @classmethod
     def audio(cls, pcm: bytes, *, item_id: str | None = None) -> "RealtimeEvent":
