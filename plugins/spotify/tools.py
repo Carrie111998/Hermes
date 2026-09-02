@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 from hermes_cli.auth import get_auth_status
 from plugins.spotify.client import (
@@ -13,6 +13,7 @@ from plugins.spotify.client import (
     normalize_spotify_id,
     normalize_spotify_uri,
     normalize_spotify_uris,
+    spotify_uri_type,
 )
 from tools.registry import tool_error, tool_result
 
@@ -64,6 +65,40 @@ def _as_list(raw: Any) -> List[str]:
     return [str(raw).strip()] if str(raw).strip() else []
 
 
+def _coerce_spotify_uri(value: str, expected_type: Optional[str] = None) -> str:
+    """Normalize a Spotify URI/URL/ID into a canonical ``spotify:<type>:<id>`` URI.
+
+    Delegates to ``normalize_spotify_uri`` from the Spotify client so behavior
+    stays in lock-step with the existing, tested normalizer. Accepts bare IDs
+    when ``expected_type`` is None (preserving the prior passthrough behavior
+    required by the queue handler for search-result IDs).
+    """
+    return normalize_spotify_uri(str(value or ""), expected_type)
+
+
+# Item types Spotify's queue endpoint accepts.
+_QUEUEABLE_TYPES = {"track", "episode"}
+
+
+def _coerce_queueable_spotify_uri(value: str) -> str:
+    """Normalize a queue target into ``spotify:track:<id>`` or ``spotify:episode:<id>``.
+
+    Spotify's ``POST /v1/me/player/queue`` accepts tracks *and* episodes, so the
+    type is inferred per input rather than forced to "track": typed URIs and
+    ``open.spotify.com/<type>/<id>`` urls keep their own type (and are still
+    canonicalized, never forwarded as a raw url), while a bare id — the
+    search-result case — defaults to a track. Types Spotify cannot queue are
+    rejected here instead of coming back as a "Bad URI" from the API.
+    """
+    item_type = spotify_uri_type(value) or "track"
+    if item_type.lower() not in _QUEUEABLE_TYPES:
+        raise SpotifyError(f"Spotify can only queue a track or an episode, got {item_type}.")
+    # Pass the canonical lower-case type on: Spotify's own types are lower-case, so
+    # an oddly-cased one has to fail here with a clear message rather than be
+    # forwarded as `spotify:EPISODE:<id>` for the API to reject as a Bad URI.
+    return _coerce_spotify_uri(value, item_type.lower())
+
+
 def _describe_empty_playback(payload: Any, *, action: str) -> dict | None:
     if not isinstance(payload, dict) or not payload.get("empty"):
         return None
@@ -86,6 +121,19 @@ def _describe_empty_playback(payload: Any, *, action: str) -> dict | None:
     return None
 
 
+def _has_active_device(client: SpotifyClient) -> bool:
+    """Return True only when a device is currently *active* for playback.
+
+    Distinguishes the active device from merely-listed devices (Spotify's API
+    requires the currently active device when ``device_id`` is omitted). Lookup
+    failures are deliberately NOT swallowed here: the caller's top-level
+    ``except`` surfaces them via ``_spotify_tool_error`` instead of masking the
+    real cause behind a misleading "no active device" message.
+    """
+    devices = client.get_devices() or {}
+    return any(bool(d.get("is_active")) for d in devices.get("devices") or [])
+
+
 def _handle_spotify_playback(args: dict, **kw) -> str:
     action = str(args.get("action") or "get_state").strip().lower()
     client = _spotify_client()
@@ -98,13 +146,21 @@ def _handle_spotify_playback(args: dict, **kw) -> str:
             payload = client.get_currently_playing(market=args.get("market"))
             empty_result = _describe_empty_playback(payload, action=action)
             return tool_result(empty_result or payload)
+        if action in {"play", "pause", "next", "previous", "seek", "set_repeat", "set_shuffle", "set_volume"}:
+            if not args.get("device_id") and not _has_active_device(client):
+                return tool_error(
+                    "No active Spotify playback device is available. Use `spotify_devices` to list devices, "
+                    "then transfer playback before retrying."
+                )
         if action == "play":
             offset = args.get("offset")
             if isinstance(offset, dict):
                 payload_offset = {k: v for k, v in offset.items() if v is not None}
             else:
                 payload_offset = None
-            uris = normalize_spotify_uris(_as_list(args.get("uris")), "track") if args.get("uris") else None
+            uris = None
+            if args.get("uris"):
+                uris = normalize_spotify_uris(_as_list(args.get("uris")), "track")
             context_uri = None
             if args.get("context_uri"):
                 raw_context = str(args.get("context_uri"))
@@ -115,7 +171,7 @@ def _handle_spotify_playback(args: dict, **kw) -> str:
                     context_type = "playlist"
                 elif raw_context.startswith("spotify:artist:") or "/artist/" in raw_context:
                     context_type = "artist"
-                context_uri = normalize_spotify_uri(raw_context, context_type)
+                context_uri = _coerce_spotify_uri(raw_context, context_type)
             result = client.start_playback(
                 device_id=args.get("device_id"),
                 context_uri=context_uri,
@@ -191,7 +247,12 @@ def _handle_spotify_queue(args: dict, **kw) -> str:
         if action == "get":
             return tool_result(client.get_queue())
         if action == "add":
-            uri = normalize_spotify_uri(str(args.get("uri") or ""), None)
+            if not args.get("device_id") and not _has_active_device(client):
+                return tool_error(
+                    "No active Spotify playback device is available. Use `spotify_devices` to list devices, "
+                    "then transfer playback before retrying."
+                )
+            uri = _coerce_queueable_spotify_uri(str(args.get("uri") or ""))
             result = client.add_to_queue(uri=uri, device_id=args.get("device_id"))
             return tool_result({"success": True, "action": action, "uri": uri, "result": result})
         return tool_error(f"Unknown spotify_queue action: {action}")
