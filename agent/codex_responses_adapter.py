@@ -704,6 +704,17 @@ def _chat_messages_to_responses_input(
                         item_sources.append(msg)
                         replayed_message_items += 1
 
+                tool_calls = msg.get("tool_calls")
+                has_tool_calls = False
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        _fn_name = (tc.get("function") or {}).get("name")
+                        if isinstance(_fn_name, str) and _fn_name.strip():
+                            has_tool_calls = True
+                            break
+
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
@@ -712,16 +723,22 @@ def _chat_messages_to_responses_input(
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
                     item_sources.append(msg)
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not has_tool_calls:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
+                    # content AND no tool calls, emit an empty assistant message
+                    # as the required following item.
+                    #
+                    # When tool calls exist, the function_call items emitted
+                    # below already satisfy the following-item rule, so the
+                    # empty stub is skipped. Gateways that translate Responses
+                    # input to the Anthropic Messages API reject the stub with
+                    # HTTP 400 "messages: text content blocks must be non-empty"
+                    # (observed on ai.corp.ts.net with claude-* models).
                     items.append({"role": "assistant", "content": ""})
                     item_sources.append(msg)
 
-                tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
                     for tc in tool_calls:
                         if not isinstance(tc, dict):
