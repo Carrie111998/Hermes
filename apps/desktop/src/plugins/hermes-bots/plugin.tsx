@@ -37,6 +37,7 @@ import {
   $lastRoster,
   botHandle,
   botMentionTag,
+  botRelayTarget,
   cachedUnionRoster,
   isActiveRosterBot,
   migrateBotMeta,
@@ -734,7 +735,7 @@ export default {
               botRosterMeta(bot, $botMeta.get())?.title || bot.ui_meta?.['hermes-bots']?.title || bot.title || ''
             ).trim()
 
-            const target = bot.remoteSource && bot.connectionId ? `${handle}@${bot.connectionId}` : handle
+            const target = botRelayTarget(bot)
 
             const where = bot.remoteSource
               ? ` — on ${bot.connectionLabel || bot.connectionId} (message_agent target: "${target}")`
