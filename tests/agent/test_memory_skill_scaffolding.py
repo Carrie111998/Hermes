@@ -10,6 +10,8 @@ See: agent.skill_commands.extract_user_instruction_from_skill_message and
 MemoryManager._strip_skill_scaffolding.
 """
 
+from pathlib import Path
+
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -124,4 +126,105 @@ class TestMemoryManagerStripsScaffolding:
         mgr.sync_all(_BARE_SKILL_TURN, "Done.")
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
+
+
+# ---------------------------------------------------------------------------
+# Gateway channel/topic auto-loaded turns (#92036)
+# ---------------------------------------------------------------------------
+
+_AUTO_LOAD_NOTE = (
+    '[IMPORTANT: The "example-skill" skill is auto-loaded. '
+    "Follow its instructions for this session.]"
+)
+
+_INSTRUCTION_MARKER = (
+    "The user has provided the following instruction alongside the skill invocation: "
+)
+
+_AUTO_LOAD_SINGLE = (
+    f"{_AUTO_LOAD_NOTE}\n\n"
+    "# Example Skill\n\n"
+    "Framework-injected procedure text that must never reach memory.\n\n"
+    f"{_INSTRUCTION_MARKER}remember only this sentence"
+)
+
+_AUTO_LOAD_MULTI = (
+    f"{_AUTO_LOAD_NOTE}\n\n"
+    "# Example Skill\n\n"
+    "First injected body.\n\n"
+    f'{_AUTO_LOAD_NOTE.replace("example-skill", "second-skill")}\n\n'
+    "# Second Skill\n\n"
+    "Second injected body.\n\n"
+    f"{_INSTRUCTION_MARKER}remember only this sentence"
+)
+
+_BARE_AUTO_LOAD = (
+    f"{_AUTO_LOAD_NOTE}\n\n# Example Skill\n\nInjected body, no user text."
+)
+
+
+class TestGatewayAutoLoadScaffolding:
+    def test_single_auto_load_extraction(self):
+        assert (
+            extract_user_instruction_from_skill_message(_AUTO_LOAD_SINGLE)
+            == "remember only this sentence"
+        )
+
+    def test_multi_auto_load_extraction(self):
+        assert (
+            extract_user_instruction_from_skill_message(_AUTO_LOAD_MULTI)
+            == "remember only this sentence"
+        )
+
+    def test_bare_auto_load_returns_none(self):
+        assert extract_user_instruction_from_skill_message(_BARE_AUTO_LOAD) is None
+
+    def test_ordinary_message_unchanged(self):
+        assert (
+            extract_user_instruction_from_skill_message("remember only this sentence")
+            == "remember only this sentence"
+        )
+
+    def test_prefetch_all_strips_auto_load(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.prefetch_all(_AUTO_LOAD_SINGLE)
+        assert provider.prefetched == ["remember only this sentence"]
+
+    def test_sync_all_strips_auto_load(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all(_AUTO_LOAD_SINGLE, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == ["remember only this sentence"]
+
+    def test_sync_all_skips_bare_auto_load(self):
+        mgr, provider = _manager_with_recorder()
+        mgr.sync_all(_BARE_AUTO_LOAD, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == []
+
+    def test_quoted_prefix_without_continuation_falls_through(self):
+        # A user turn that merely begins with the auto-load opening (e.g. a
+        # pasted note) must stay intact instead of silently vanishing from
+        # every memory provider.
+        quoted = '[IMPORTANT: The "quoted" note the user pasted verbatim'
+        assert extract_user_instruction_from_skill_message(quoted) == quoted
+
+
+def test_auto_load_discriminator_tracks_gateway_builder():
+    # The extractor regex and the gateway note literal live in different
+    # modules; drift would reintroduce the #92036 leak with no signal, so pin
+    # the source literal against the regex directly.
+    import re as _re
+
+    from agent.skill_commands import _AUTO_LOAD_NOTE_RE
+
+    source = (
+        Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    ).read_text()
+    literal = _re.search(
+        r"'\[IMPORTANT: The \"\{[^}]+\}\" skill is auto-loaded\.", source
+    )
+    assert literal, "auto-load note literal moved or changed in gateway/run.py"
+    note = literal.group(0)[1:].replace("{_display_name}", "example-skill")
+    assert _AUTO_LOAD_NOTE_RE.match(note) is not None
 
