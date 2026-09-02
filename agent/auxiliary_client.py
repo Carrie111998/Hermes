@@ -5035,6 +5035,24 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     )
 
 
+def _is_statusless_structured_provider_error(exc: Exception) -> bool:
+    """Detect a structured provider failure that has no HTTP status.
+
+    OpenAI-compatible relays may commit SSE with status 200, then send an
+    OpenAI-style ``error`` event. The SDK raises a status-less ``APIError`` and
+    preserves the event only on ``exc.body``. Any non-empty structured error in
+    that status-less shape is a route failure; ordinary HTTP errors keep their
+    existing status-based classifiers, and message text alone is insufficient.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status is not None:
+        return False
+    body = getattr(exc, "body", None)
+    return isinstance(body, dict) and bool(body.get("error"))
+
+
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
@@ -10705,6 +10723,7 @@ def _call_llm_impl(
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
                     or _is_auth_error(retry_err)
+                    or _is_statusless_structured_provider_error(retry_err)
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
                 ):
@@ -10738,6 +10757,7 @@ def _call_llm_impl(
                         _is_payment_error(retry_err)
                         or _is_connection_error(retry_err)
                         or _is_auth_error(retry_err)
+                        or _is_statusless_structured_provider_error(retry_err)
                         or "max_tokens" in str(retry_err)
                         or "unsupported_parameter" in str(retry_err)
                     ):
@@ -10774,7 +10794,12 @@ def _call_llm_impl(
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or _is_statusless_structured_provider_error(retry_err)
+                ):
                     raise
                 first_err = retry_err
 
@@ -11009,6 +11034,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_statusless_structured_provider_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -11032,6 +11058,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_statusless_structured_provider_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -11051,6 +11078,8 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_statusless_structured_provider_error(first_err):
+                reason = "structured provider error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -11505,6 +11534,7 @@ async def _async_call_llm_impl(
                     _is_payment_error(retry_err)
                     or _is_connection_error(retry_err)
                     or _is_auth_error(retry_err)
+                    or _is_statusless_structured_provider_error(retry_err)
                     or "max_tokens" in retry_err_str
                     or "unsupported_parameter" in retry_err_str
                 ):
@@ -11539,6 +11569,7 @@ async def _async_call_llm_impl(
                         _is_payment_error(retry_err)
                         or _is_connection_error(retry_err)
                         or _is_auth_error(retry_err)
+                        or _is_statusless_structured_provider_error(retry_err)
                         or "max_tokens" in str(retry_err)
                         or "unsupported_parameter" in str(retry_err)
                     ):
@@ -11575,7 +11606,12 @@ async def _async_call_llm_impl(
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                    or _is_statusless_structured_provider_error(retry_err)
+                ):
                     raise
                 first_err = retry_err
 
@@ -11776,6 +11812,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_statusless_structured_provider_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -11791,6 +11828,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_statusless_structured_provider_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -11806,6 +11844,8 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_statusless_structured_provider_error(first_err):
+                reason = "structured provider error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
