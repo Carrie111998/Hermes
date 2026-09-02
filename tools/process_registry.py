@@ -593,6 +593,12 @@ class ProcessRegistry:
                         # Promote to notify_on_complete so the agent still gets
                         # exactly one notification when the process actually ends.
                         session.notify_on_complete = True
+                        # Undo any consume-mark wait()/read_log() may already have
+                        # applied while the flag was still False — a promoted
+                        # notify_on_complete must still deliver even if the agent
+                        # consumed a completion under the old flag (AI review on
+                        # #93368, point 1).
+                        self._completion_consumed.discard(session.id)
                         should_disable = True
                 return_early = True
             else:
@@ -2204,7 +2210,7 @@ class ProcessRegistry:
             "total_lines": total_lines,
             "showing": f"{len(selected)} lines",
         }
-        if session.exited and observed_completion_output:
+        if session.exited and observed_completion_output and not session.notify_on_complete:
             self._completion_consumed.add(session_id)
         return result
 
@@ -2266,7 +2272,17 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                # A process started with notify_on_complete=True made an explicit
+                # promise to surface a completion notification on exit. The
+                # synchronous wait() result is the *agent's* copy of that outcome;
+                # marking it _completion_consumed here would ALSO suppress the
+                # autonomous user-facing delivery (the desktop/tui poller checks
+                # only is_completion_consumed, not _drain_should_skip), so the
+                # user never learns the long task finished. Honour the flag: only
+                # suppress the autonomous turn when the caller did NOT ask to be
+                # notified on completion.
+                if not session.notify_on_complete:
+                    self._completion_consumed.add(session_id)
                 result = {
                     "status": "exited",
                     "command": session.command,
