@@ -841,7 +841,10 @@ def _scan_gateway_pids(
             # inside the windowless pythonw.exe gateway/desktop backend, so a
             # bare wmic/powershell spawn would flash a conhost window on every
             # watchdog probe.
-            from hermes_cli._subprocess_compat import bounded_probe_run
+            from hermes_cli._subprocess_compat import (
+                bounded_probe_run,
+                windows_probe_encoding,
+            )
 
             wmic_path = shutil.which("wmic")
             result = None
@@ -855,6 +858,7 @@ def _scan_gateway_pids(
                         "/FORMAT:LIST",
                     ],
                     timeout=10,
+                    encoding=windows_probe_encoding(),
                     errors="ignore",
                 )
             if result is None or result.returncode != 0 or not (result.stdout or ""):
@@ -874,6 +878,7 @@ def _scan_gateway_pids(
                 result = bounded_probe_run(
                     [powershell, "-NoProfile", "-Command", ps_cmd],
                     timeout=15,
+                    encoding=windows_probe_encoding(),
                     errors="ignore",
                 )
                 if result is None:
