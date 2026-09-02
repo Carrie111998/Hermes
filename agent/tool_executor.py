@@ -2172,6 +2172,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 target = next_args.get("target", "memory")
                 operations = next_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
+                provenance = agent._build_memory_write_metadata(
+                    task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", None),
+                )
                 result = _memory_tool(
                     action=next_args.get("action"),
                     target=target,
@@ -2179,6 +2183,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    provenance=provenance,
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager
@@ -2187,10 +2192,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._memory_manager.notify_memory_tool_write(
                         result,
                         next_args,
-                        build_metadata=lambda: agent._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
+                        build_metadata=lambda: dict(provenance),
                     )
                 return result
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
