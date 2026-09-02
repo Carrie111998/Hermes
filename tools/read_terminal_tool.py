@@ -41,7 +41,13 @@ def read_terminal_tool(
         return tool_error(f"Failed to read terminal: {exc}")
 
     if not raw:
-        return tool_error("No in-app terminal is open, or the read timed out.")
+        return tool_error(
+            "No in-app terminal is open, or the read timed out. "
+            "read_terminal only works while a terminal tab is open in the "
+            "Hermes desktop app — do not retry it expecting a different "
+            "result. If you need to run or check commands yourself, use the "
+            "terminal or execute_code tools instead."
+        )
 
     # Desktop answers with a JSON object; pass it through, else wrap the raw text.
     try:
