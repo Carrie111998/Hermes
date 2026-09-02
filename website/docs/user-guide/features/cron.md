@@ -407,6 +407,20 @@ Doctor never mutates jobs or state — it only reports. Pair it with
 
 ## Delivery options
 
+### Output format (`payload_type`)
+
+Cron output is treated as `text/markdown` by default. Jobs that intentionally emit HTML (e.g. a report rendered for an HTML-capable channel) must declare it explicitly:
+
+```
+payload_type: "text/html"
+```
+
+**Guard behavior (since the payload-type contract):** under the default `text/markdown`, a delivery containing raw HTML tags *outside* code fences is **dead-lettered, not sent** — the message is recorded to `~/.hermes/cron/deadletter.jsonl` (preview + SHA-256, capped at 1 MiB with drop-oldest rotation) and the run reports the dead-letter instead of leaking broken markup to the user.
+
+**Writing safe reports:** literal angle-bracket tokens like `<model>`, `<your-api-key>`, or `<host>` placeholders will trip this guard under the default payload type. Either wrap them in backticks (`` `<host>` `` — inline code is exempt), or declare `payload_type: "text/html"` for the job.
+
+Invalid `payload_type` values (e.g. `text/md`) are coerced to `text/markdown` with a one-time warning naming the job.
+
 When scheduling jobs, you specify where the output goes:
 
 | Option | Description | Example |

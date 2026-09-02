@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -62,6 +63,62 @@ from agent.delegation_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+_VALID_PAYLOAD_TYPES = frozenset({"text/markdown", "text/html"})
+_DEFAULT_PAYLOAD_TYPE = "text/markdown"
+
+# Job IDs already warned about an invalid payload_type (log once per process,
+# not once per run — a cron job fires on every tick).
+_payload_type_warned: set = set()
+
+
+def _extract_payload_type(job: dict) -> str:
+    """Extract the declared payload_type from a cron job config, coercing invalid values to the default."""
+    value = job.get("payload_type", _DEFAULT_PAYLOAD_TYPE)
+    if value in _VALID_PAYLOAD_TYPES:
+        return value
+    job_id = job.get("id", "?")
+    if job_id not in _payload_type_warned:
+        _payload_type_warned.add(job_id)
+        logger.warning(
+            "Job '%s': invalid payload_type %r (valid: %s) — coercing to %s. "
+            "Fix the job config; coercion may cause unexpected HTML-leak dead-lettering.",
+            job_id, value, sorted(_VALID_PAYLOAD_TYPES), _DEFAULT_PAYLOAD_TYPE,
+        )
+    return _DEFAULT_PAYLOAD_TYPE
+
+
+# Dead-letter rotation: cap the append-only log so a persistently-leaking job
+# cannot grow it forever (#90844 review). Drop-oldest, keep newest records.
+_DEADLETTER_MAX_BYTES = 1_048_576  # 1 MiB
+_DEADLETTER_KEEP_FRACTION = 0.5  # after rotation, retain newest half
+
+
+def _rotate_deadletter(deadletter_path) -> None:
+    """Drop-oldest rotation for deadletter.jsonl once it exceeds the cap.
+
+    Keeps the newest ~half of records (whole JSON lines, never split). Cheap:
+    only runs when the file is over _DEADLETTER_MAX_BYTES, and dead-letter
+    writes are rare by design.
+    """
+    import os as _os
+
+    try:
+        size = _os.path.getsize(deadletter_path)
+    except OSError:
+        return
+    if size <= _DEADLETTER_MAX_BYTES:
+        return
+    with open(deadletter_path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    keep = max(1, int(len(lines) * _DEADLETTER_KEEP_FRACTION))
+    retained = lines[-keep:]
+    with open(deadletter_path, "w", encoding="utf-8") as fh:
+        fh.writelines(retained)
+    logger.warning(
+        "deadletter.jsonl exceeded %d bytes — rotated, dropped %d oldest record(s), kept %d",
+        _DEADLETTER_MAX_BYTES, len(lines) - len(retained), len(retained),
+    )
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -3176,6 +3233,69 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
+    # TKT-0033 Phase A: markdown-claimed content must not leak raw HTML tags
+    # (outside code fences) to the user. Hard-fail into a dead-letter record
+    # instead of sending. Declared text/html payloads skip this check.
+    from cron.format_validator import find_html_leak, should_deadletter
+
+    if should_deadletter(_extract_payload_type(job), delivery_content):
+        leak_tag = find_html_leak(delivery_content) or "?"
+        logger.error(
+            "Job '%s': HTML tag %r found in text/markdown delivery content — "
+            "dead-lettering instead of sending",
+            job["id"], leak_tag,
+        )
+        try:
+            deadletter_path = _get_hermes_home() / "cron" / "deadletter.jsonl"
+            deadletter_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "job_id": job["id"],
+                "payload_type": _extract_payload_type(job),
+                "leak_tag": leak_tag,
+                # Diagnosis needs a preview + integrity check, not a second
+                # copy of every near-leak (which can carry sensitive data).
+                "content_preview": delivery_content[:500],
+                "content_sha256": hashlib.sha256(
+                    delivery_content.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "content_chars": len(delivery_content),
+            }
+            with open(deadletter_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            # Bounded growth: drop-oldest rotation once the file exceeds the
+            # cap — an unlucky job must not grow this forever (#90844 review).
+            try:
+                _rotate_deadletter(deadletter_path)
+            except Exception as rot_err:
+                logger.warning(
+                    "Job '%s': dead-letter rotation failed: %s",
+                    job["id"], rot_err,
+                )
+        except Exception as dl_err:
+            logger.error(
+                "Job '%s': failed to write dead-letter record: %s",
+                job["id"], dl_err,
+            )
+        return (
+            f"HTML tag {leak_tag} found in text/markdown delivery content; "
+            "message dead-lettered"
+        )
+
+    # TKT-0033 Phase A Task 5: WARN-only unified report template assertions.
+    # Log missing markers as WARNINGS — NEVER block delivery on them, and
+    # never let an assert failure crash the delivery path.
+    try:
+        from cron.template_asserts import check_report_markers
+
+        for _w in check_report_markers(delivery_content):
+            logger.warning("Job '%s': %s", job["id"], _w)
+    except Exception as _ta_err:
+        logger.warning(
+            "Job '%s': report template assertion failed to run: %s",
+            job["id"], _ta_err,
+        )
+
     delivery_errors = []
 
     for target in targets:
@@ -3483,6 +3603,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "payload_type": _extract_payload_type(job),
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -3497,7 +3618,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {"job_id": job["id"], "payload_type": _extract_payload_type(job)}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
@@ -3827,7 +3948,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, payload_type=_extract_payload_type(job))
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3856,7 +3977,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, payload_type=_extract_payload_type(job)))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
