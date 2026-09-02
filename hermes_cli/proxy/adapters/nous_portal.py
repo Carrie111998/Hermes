@@ -23,6 +23,7 @@ from hermes_cli.auth import (
     _save_auth_store,
     _validate_nous_inference_url_from_network,
     _write_shared_nous_state,
+    get_provider_auth_state,
     resolve_nous_runtime_credentials,
 )
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
@@ -162,12 +163,10 @@ class NousPortalAdapter(UpstreamAdapter):
     def _read_state(self) -> Optional[Dict[str, Any]]:
         try:
             with _auth_store_lock():
-                store = _load_auth_store()
+                state = get_provider_auth_state("nous")
         except Exception as exc:
             logger.warning("proxy: failed to load auth store: %s", exc)
             return None
-        providers = store.get("providers") or {}
-        state = providers.get("nous")
         if not isinstance(state, dict):
             return None
         return dict(state)  # copy so the refresh helper can mutate freely

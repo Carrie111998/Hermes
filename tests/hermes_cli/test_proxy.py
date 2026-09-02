@@ -45,6 +45,39 @@ def _write_auth_store(hermes_home: Path, nous_state: Dict[str, Any]) -> Path:
 
 
 
+def test_nous_adapter_falls_back_to_global_auth_store_in_profile(tmp_path, monkeypatch):
+    """In a profile with empty providers, NousPortalAdapter must resolve from global auth store."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    global_home = tmp_path / ".hermes"
+    global_home.mkdir()
+    _write_auth_store(global_home, {
+        "access_token": "global-access-token",
+        "refresh_token": "global-refresh-token",
+    })
+
+    profile_home = global_home / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {},
+    }))
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    adapter = NousPortalAdapter()
+    assert adapter.is_authenticated() is True
+    with patch(
+        "hermes_cli.proxy.adapters.nous_portal.resolve_nous_runtime_credentials",
+        return_value={
+            "api_key": "jwt-token",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "expires_at": "2099-01-01T00:00:00Z",
+        },
+    ):
+        cred = adapter.get_credential()
+        assert cred.bearer == "jwt-token"
+
+
 def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
     """Two parallel get_credential() calls must serialize through the lock."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
