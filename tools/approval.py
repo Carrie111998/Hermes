@@ -1624,7 +1624,18 @@ def _shell_tokens_with_spans(segment: str, start: int):
         while i < len(segment) and (quote or not segment[i].isspace()):
             char = segment[i]
             if quote:
-                if char == quote:
+                # Bracket-class member: a quote followed by ] inside a
+                # double-quoted word is a literal character-class member
+                # (e.g. grep "[^"]*"), not a closing quote.
+                if (
+                    quote == '"'
+                    and char == '"'
+                    and i + 1 < len(segment)
+                    and segment[i + 1] == "]"
+                ):
+                    value.append(char)
+                    i += 1
+                elif char == quote:
                     quote = None
                     i += 1
                 elif char == "\\" and quote == '"' and i + 1 < len(segment):
