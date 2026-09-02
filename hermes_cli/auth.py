@@ -6614,6 +6614,15 @@ def fetch_nous_models(
     if not isinstance(data, list):
         return []
 
+    # Model IDs known to be listed by the Nous API but which are NOT callable
+    # via the chat completions endpoint.  These produce opaque errors like
+    # "Couldn't find that, sorry." when reached through /v1/chat/completions.
+    # Keep this set as small and precise as possible — only add models confirmed
+    # to 404/error on a chat request.
+    _CHAT_UNCALLABLE_MODELS: frozenset[str] = frozenset({
+        "claude-fable-5",
+    })
+
     model_ids: List[str] = []
     for item in data:
         if not isinstance(item, dict):
@@ -6623,6 +6632,9 @@ def fetch_nous_models(
             mid = model_id.strip()
             # Skip Hermes models — they're not reliable for agentic tool-calling
             if "hermes" in mid.lower():
+                continue
+            # Skip models listed by the API but not reachable via chat completions
+            if mid in _CHAT_UNCALLABLE_MODELS:
                 continue
             model_ids.append(mid)
 
