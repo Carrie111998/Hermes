@@ -1112,6 +1112,125 @@ class TestBedrockContextProbe:
                 region="eu-central-1") == 1_000_000
 
 
+class TestBedrockContextProbeTierEscalation:
+    """Which outcome is allowed to step up to the next probe tier.
+
+    Escalation is only informative after an *acceptance*, because that is the
+    only outcome that leaves the window unbounded above.  A rejection is
+    terminal: the error shape follows the model, not the payload size, so a
+    bigger prompt returns the identical error.  Each tier is a multi-megabyte
+    upload from the user's machine (~7.2 MB then ~12.2 MB at the current tiers),
+    so a tier that cannot return new information must not be sent.
+    """
+
+    # Verbatim from live Bedrock, us-east-2, 2026-08-30.  claude-sonnet-4 and
+    # claude-sonnet-4-5 both return this shape, with no number to parse, at
+    # *every* tier (RequestIds 58d9ac48-48a0-4fa7-a513-1043c47105c0 at 1.3M and
+    # 4569eaad-2ade-4c4c-8c94-6809206b811e at 2.2M).
+    NUMBERLESS_LENGTH_ERROR = (
+        "An error occurred (ValidationException) when calling the Converse "
+        "operation: The model returned the following errors: Input is too long "
+        "for requested model."
+    )
+    # The other shape, from the same sweep (claude-opus-4-8, RequestId
+    # 8b984dbf-62df-42b2-a224-2b129f26418f).
+    NUMERIC_LENGTH_ERROR = (
+        "An error occurred (ValidationException) when calling the Converse "
+        "operation: The model returned the following errors: prompt is too "
+        "long: 1444476 tokens > 1000000 maximum"
+    )
+
+    def _client(self, *outcomes):
+        """A client whose successive converse() calls follow ``outcomes``.
+
+        An ``Exception`` instance is raised; anything else is returned.
+        """
+        client = MagicMock()
+        client.converse.side_effect = list(outcomes)
+        return client
+
+    def _probe(self, client):
+        from agent.bedrock_adapter import probe_bedrock_context_length
+        with patch("agent.bedrock_adapter._get_bedrock_runtime_client",
+                   return_value=client):
+            return probe_bedrock_context_length("any.model", "us-east-2")
+
+    def test_numberless_rejection_does_not_escalate(self):
+        """The regression this class exists for.
+
+        A numberless length error means *this model* does not report its
+        maximum.  The next tier returns the same numberless error, so sending it
+        uploads ~12.2 MB to learn exactly nothing.
+        """
+        client = self._client(
+            Exception(self.NUMBERLESS_LENGTH_ERROR),
+            Exception(self.NUMBERLESS_LENGTH_ERROR),
+        )
+        assert self._probe(client) is None
+        assert client.converse.call_count == 1, (
+            "probe escalated to a larger tier after a rejection it could not "
+            "parse; the larger request returns the identical error, so this is "
+            "a wasted multi-megabyte upload"
+        )
+
+    def test_opaque_failure_does_not_escalate(self):
+        """Same for a non-length failure.
+
+        Auth and throttle errors recur regardless of size, and per the
+        function's own docstring a *larger* payload is more likely to produce an
+        opaque InternalServerException — so stepping up is strictly worse.
+        """
+        client = self._client(
+            Exception("An error occurred (InternalServerException) ..."),
+            Exception("An error occurred (InternalServerException) ..."),
+        )
+        assert self._probe(client) is None
+        assert client.converse.call_count == 1
+
+    def test_parseable_rejection_returns_on_the_first_tier(self):
+        client = self._client(Exception(self.NUMERIC_LENGTH_ERROR))
+        assert self._probe(client) == 1_000_000
+        assert client.converse.call_count == 1
+
+    def test_acceptance_escalates_to_bound_the_window(self):
+        """Acceptance is the case escalation is *for*.
+
+        A prompt that large going through only proves ``>= tier``.  Stepping up
+        is what turns that into a real figure — the reason the docstring gives
+        for having tiers, which acceptance-returns-immediately never exercised.
+        """
+        client = self._client({"output": {}}, Exception(self.NUMERIC_LENGTH_ERROR))
+        assert self._probe(client) == 1_000_000
+        assert client.converse.call_count == 2
+
+    def test_accepted_floor_survives_a_useless_next_tier(self):
+        """A confirmed lower bound must not be thrown away.
+
+        Tier 1 was accepted, so the window is at least 1.3M.  If the escalated
+        request then fails opaquely (docstring reason (a): wildly oversized
+        payloads fail opaquely), returning ``None`` would discard a fact we
+        already established and fall back to a table value that may be lower.
+        """
+        from agent.bedrock_adapter import _BEDROCK_PROBE_TIERS
+        client = self._client(
+            {"output": {}},
+            Exception(self.NUMBERLESS_LENGTH_ERROR),
+        )
+        assert self._probe(client) == _BEDROCK_PROBE_TIERS[0]
+        assert client.converse.call_count == 2
+
+    def test_every_tier_accepted_returns_the_largest(self):
+        from agent.bedrock_adapter import _BEDROCK_PROBE_TIERS
+        client = self._client(*[{"output": {}} for _ in _BEDROCK_PROBE_TIERS])
+        assert self._probe(client) == _BEDROCK_PROBE_TIERS[-1]
+        assert client.converse.call_count == len(_BEDROCK_PROBE_TIERS)
+
+    def test_tiers_ascend(self):
+        """The floor/escalation logic assumes ascending tiers."""
+        from agent.bedrock_adapter import _BEDROCK_PROBE_TIERS
+        assert list(_BEDROCK_PROBE_TIERS) == sorted(_BEDROCK_PROBE_TIERS)
+        assert len(set(_BEDROCK_PROBE_TIERS)) == len(_BEDROCK_PROBE_TIERS)
+
 
 # ---------------------------------------------------------------------------
 # Tool-calling capability detection

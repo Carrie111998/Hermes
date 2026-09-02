@@ -1989,6 +1989,16 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
     InternalServerException instead of a clean length error, and (b) stepping
     up discovers larger windows without over-padding smaller ones.
 
+    Escalation therefore only happens on **acceptance**, which is the one
+    outcome that leaves the window unbounded above.  A *rejection* is terminal:
+    the error shape is a property of the model, not of the payload size, so a
+    bigger prompt returns the identical error.  Bedrock has two shapes —
+
+        prompt is too long: 1444476 tokens > 1000000 maximum   (parseable)
+        Input is too long for requested model.                 (no number)
+
+    — and padding harder never converts the second into the first.
+
     Returns the detected window, or ``None`` if the probe could not run
     (missing credentials, network error, or no parseable limit) so the caller
     can fall back to the static table.
@@ -2005,6 +2015,7 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
         return None
 
     last_error = ""
+    largest_accepted = None
     for tier_tokens in _BEDROCK_PROBE_TIERS:
         pad_words = int(tier_tokens / _WORDS_PER_TOKEN)
         oversized = "data " * pad_words
@@ -2014,14 +2025,15 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
                 messages=[{"role": "user", "content": [{"text": oversized}]}],
                 inferenceConfig={"maxTokens": 8},
             )
-            # Accepted a prompt this large → the window is at least this tier.
-            # Returning the tier as a lower bound is safe and avoids inventing
-            # a number we can't confirm.
+            # Accepted a prompt this large → the window is at least this tier,
+            # but we have no upper bound yet.  This is the only outcome a bigger
+            # tier can improve on, so keep this as a floor and step up.
             logger.debug(
                 "Bedrock context probe for %s accepted ~%s-token prompt; "
                 "window is at least that", model_id, f"{tier_tokens:,}",
             )
-            return tier_tokens
+            largest_accepted = tier_tokens
+            continue
         except Exception as exc:
             msg = str(exc)
             last_error = msg
@@ -2032,10 +2044,17 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
                     model_id, f"{limit:,}",
                 )
                 return limit
-            # No parseable limit at this tier (opaque server error, auth,
-            # throttle).  Try the next, smaller-overage strategy is N/A here —
-            # tiers ascend — so just continue; if all fail we return None.
-            continue
+            # Rejected with nothing parseable — a numberless length error, or an
+            # opaque server/auth/throttle failure.  Escalating cannot help: the
+            # error shape follows the model, not the payload size, and per (a)
+            # above a larger payload is *more* likely to fail opaquely.  Stop
+            # rather than upload the next tier to learn the same nothing.
+            break
+
+    if largest_accepted is not None:
+        # An earlier tier was accepted and a later one gave us nothing better;
+        # the confirmed lower bound still beats falling back to the table.
+        return largest_accepted
 
     logger.debug(
         "Bedrock context probe for %s returned no parseable limit: %s",
