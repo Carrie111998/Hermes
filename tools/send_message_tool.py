@@ -53,6 +53,8 @@ _WHATSAPP_JID_RE = re.compile(
     r"^\s*[\w-]+@(?:g\.us|s\.whatsapp\.net|lid|broadcast|newsletter)\s*$",
     re.IGNORECASE,
 )
+# signal-cli GV2 group IDs are base64-encoded 32-byte identifiers.
+_SIGNAL_GROUP_ID_RE = re.compile(r"^\s*[A-Za-z0-9+/]{43}=\s*$")
 # Buzz channels and DMs use native UUID identifiers. They are explicit
 # targets and must never substitute the configured home channel.
 _BUZZ_UUID_RE = re.compile(
@@ -231,7 +233,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'signal:group:<base64_group_id>', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -608,6 +610,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if group_id:
             return f"group:{group_id}", None, True
         return None, None, False
+    if platform_name == "signal" and _SIGNAL_GROUP_ID_RE.fullmatch(stripped_target):
+        return f"group:{stripped_target}", None, True
     # WeCom: group IDs start with "wr" or "wc", user IDs start with "wo" or
     # are bare alphanumeric strings. Treat any non-empty WeCom target_ref as
     # an explicit chat_id — the adapter resolves whether to use APP_CMD_RESPONSE
