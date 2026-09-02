@@ -776,6 +776,52 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
         return nous_api_mode(model)
 
+    # Provider plugins may be multi-wire even when every model shares one
+    # endpoint. Delegate only when the concrete profile class overrides the
+    # base hook: ordinary/static profiles must retain the existing catalog
+    # transport precedence (some intentionally differ from profile.api_mode on
+    # custom endpoints). Try both the raw identity and canonical core alias.
+    try:
+        from providers import get_provider_profile
+        from providers.base import ProviderProfile
+    except Exception:
+        get_provider_profile = None
+        ProviderProfile = None
+    if get_provider_profile is not None and ProviderProfile is not None:
+        canonical = normalize_provider(provider_norm)
+        for identity in dict.fromkeys((provider_norm, canonical)):
+            try:
+                profile = get_provider_profile(identity)
+            except Exception as exc:
+                logger.warning(
+                    "Provider profile lookup failed for %s: %s", identity, exc
+                )
+                continue
+            if profile is None:
+                continue
+            if type(profile).resolve_api_mode is ProviderProfile.resolve_api_mode:
+                break
+            try:
+                resolved_mode = profile.resolve_api_mode(model, base_url)
+            except Exception as exc:
+                logger.warning(
+                    "Provider %s resolve_api_mode failed; using catalog transport: %s",
+                    identity,
+                    exc,
+                )
+                break
+            if (
+                isinstance(resolved_mode, str)
+                and resolved_mode in set(TRANSPORT_TO_API_MODE.values())
+            ):
+                return resolved_mode
+            logger.warning(
+                "Provider %s returned unsupported api_mode %r; using catalog transport",
+                identity,
+                resolved_mode,
+            )
+            break
+
     pdef = get_provider(provider)
     if pdef is not None:
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")

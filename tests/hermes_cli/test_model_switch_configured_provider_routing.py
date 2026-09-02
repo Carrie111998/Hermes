@@ -122,3 +122,22 @@ def test_xai_oauth_soft_accept_preserved_when_no_match():
     )
     assert result.success is True, result.error_message
     assert result.target_provider == "xai-oauth"
+
+
+def test_model_switch_passes_target_model_to_api_mode_resolution():
+    seen_models = []
+
+    def determine(provider, base_url, model=""):
+        seen_models.append(model)
+        return "codex_responses" if model.startswith("gpt-") else "chat_completions"
+
+    with patch("hermes_cli.model_switch.determine_api_mode", side_effect=determine):
+        result = _run_switch(
+            raw_input="gpt-7",
+            current_provider="dynamic-test",
+            current_base_url="https://relay.test/v1",
+        )
+
+    assert result.success is True, result.error_message
+    assert result.api_mode == "codex_responses"
+    assert "gpt-7" in seen_models

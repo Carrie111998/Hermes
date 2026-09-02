@@ -2384,7 +2384,7 @@ def switch_model(
     if _mandated_mode is not None:
         api_mode = _mandated_mode
     elif not api_mode:
-        api_mode = determine_api_mode(target_provider, base_url)
+        api_mode = determine_api_mode(target_provider, base_url, model=new_model)
 
     # --- Normalize model name for target provider ---
     new_model = _resolve_named_custom_model_id(
