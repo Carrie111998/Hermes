@@ -2800,13 +2800,33 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             # base_url uses the provider's default endpoint and must still
             # resolve to anthropic_messages, not chat_completions.
             fb_api_mode = "anthropic_messages"
-        elif fb_base_url_hint:
-            _orig_url = fb_base_url_hint.rstrip("/").lower()
-            if (
-                _orig_url.endswith("/anthropic")
-                or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
-            ):
-                fb_api_mode = "anthropic_messages"
+        else:
+            # Host-mandated wire protocols: some endpoints accept exactly one
+            # protocol (Kimi Coding api.kimi.com/coding speaks native Anthropic
+            # Messages; api.anthropic.com and /anthropic gateways likewise).
+            # resolve_provider_client() routes these through
+            # _to_openai_base_url() which APPENDS /v1 for Kimi (/coding →
+            # /coding/v1), so the pre-resolve hint must consult
+            # host_mandated_api_mode() — the same source of truth the primary
+            # path uses — or a named kimi-coding entry (no explicit base_url)
+            # falls through to chat_completions and 404s. Only the pre-resolve
+            # pass needs it: the resolved client URL re-check below happens
+            # on the same rewritten /coding/v1 URL.
+            try:
+                from hermes_cli.providers import host_mandated_api_mode as _hmm
+
+                _mandated = _hmm(fb_base_url_hint or "") if fb_base_url_hint else None
+            except Exception:
+                _mandated = None
+            if _mandated is not None:
+                fb_api_mode = _mandated
+            elif fb_base_url_hint:
+                _orig_url = fb_base_url_hint.rstrip("/").lower()
+                if (
+                    _orig_url.endswith("/anthropic")
+                    or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
+                ):
+                    fb_api_mode = "anthropic_messages"
         
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
@@ -2844,7 +2864,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
-            if fb_provider == "openai-codex":
+            # Host-mandated wire protocols first: the resolved client base_url
+            # for Kimi Coding has already been rewritten to .../coding/v1 by
+            # _to_openai_base_url(), so the /anthropic-suffix and
+            # api.anthropic.com checks below never fire for it. Ask the same
+            # host_mandated_api_mode() the primary path consults, or a
+            # kimi-coding fallback is driven over the OpenAI wire
+            # (POST /coding/chat/completions → 404). Also covers entries whose
+            # base_url is resolved from the provider config rather than the
+            # fallback entry (the pre-resolve hint pass never saw it).
+            try:
+                from hermes_cli.providers import host_mandated_api_mode as _hmm
+
+                _mandated = _hmm(fb_base_url)
+            except Exception:
+                _mandated = None
+            if _mandated is not None:
+                fb_api_mode = _mandated
+            elif fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
             elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
                 # Portal is dual-wire: anthropic/* must land on /v1/messages.
