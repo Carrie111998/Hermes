@@ -662,7 +662,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
-    p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
+    p_block.add_argument(
+        "reason", nargs="*",
+        help="Required. Why it is blocked / what it waits for (also appended "
+             "as a comment)",
+    )
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
     p_block.add_argument(
@@ -2451,6 +2455,23 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
+    # A blocked task is a request for a human decision, and a request with no
+    # sentence is one nobody can act on: the next reader has to reconstruct the
+    # cause from run logs, or unblock blind and watch it re-block.
+    # ``kanban_block`` (tools/kanban_tools.py) has always refused an empty reason
+    # with "reason is required — explain what input you need". The same operation
+    # through the CLI accepted one, so the requirement depended on which surface
+    # you happened to use. Measured on one install: 126 of 141 block events
+    # carried a reason and 13 of the 15 that did not came from outside a run —
+    # this path.
+    if not reason:
+        print(
+            "kanban block: a reason is required — say what input or decision "
+            "the task is waiting for (the same rule kanban_block enforces for "
+            "workers)",
+            file=sys.stderr,
+        )
+        return 2
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
