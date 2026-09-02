@@ -19091,14 +19091,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return ""
                 if _text_outcome == _clarify_mod.TEXT_REJECTED_SELECTION:
                     # Selection-shaped but invalid (out-of-range number,
-                    # unrecognised comma-list). Keep the clarify armed so
-                    # the user can retry — do not cancel and do not treat
-                    # this as an unrelated follow-up turn.
+                    # unrecognised comma-list, ambiguous abbreviation). Keep
+                    # the clarify armed and give the user an immediate retry
+                    # path — do not cancel or treat this as an unrelated turn.
                     logger.info(
                         "Gateway retained pending clarify after invalid "
                         "selection attempt (session=%s, id=%s)",
                         _quick_key, _pending_clarify.clarify_id,
                     )
+                    _clarify_adapter = self._adapter_for_source(source)
+                    if _clarify_adapter:
+                        try:
+                            await _clarify_adapter.send(
+                                source.chat_id,
+                                _clarify_mod._selection_retry_message(
+                                    _pending_clarify
+                                ),
+                                reply_to=event.message_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to send clarify selection retry hint",
+                                exc_info=True,
+                            )
                     return ""
                 if _text_outcome == _clarify_mod.TEXT_REJECTED_PROSE:
                     # Native-choice prompts deliberately reject unmatched
