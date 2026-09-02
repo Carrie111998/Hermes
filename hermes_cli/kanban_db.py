@@ -12148,3 +12148,125 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+_ARTIFACT_HEADING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*|\*\*)\s*"
+    r"(?:deliverables?|output\s+files?|artifacts?|交付物|产出物|输出文件)"
+    r"\s*[:：]?\s*\*{0,2}\s*$",
+    re.IGNORECASE,
+)
+_NEXT_HEADING_RE = re.compile(r"^\s*(?:#{1,6}\s|\*\*\S)")
+_ARTIFACT_PATH_RE = re.compile(
+    r"^\s*[-*+]?\s*`?([^\s`,;()]+\.[A-Za-z0-9_]{1,8})`?\s*$"
+)
+# Prose declarations: a path introduced by a verb that means "produce
+# this". Read verbs are deliberately absent -- a card names the sources
+# it wants consulted far more often than the files it must leave, and
+# requiring an input to exist would fail every completion.
+_PROSE_ARTIFACT_RE = re.compile(
+    r"(?:"
+    r"写入|写到|输出到|保存到|存到|生成到|产出到|落盘到|"
+    r"writes?\s+(?:to\s+)?|saves?\s+(?:to\s+)?|outputs?\s+(?:to\s+)?|"
+    r"emits?\s+(?:to\s+)?|records?\s+(?:to\s+)?"
+    r")\s*[`'\"]?([^\s`'\",;()]+\.[A-Za-z0-9_]{1,8})",
+    re.IGNORECASE,
+)
+# A templated name cannot be resolved to a real file, so it cannot be
+# checked and must not block completion. This is the gate's real limit:
+# a card that says "write r<N>.md for each round" declares nothing this
+# can verify, which is why dispatch should enumerate the rounds instead
+# of templating them.
+_PLACEHOLDER_RE = re.compile(r"[<>{}*?]|\$\{|%s|\bN\b")
+
+
+def _declared_artifact_paths(body: Optional[str]) -> list[str]:
+    """Return the files a card says it must leave behind.
+
+    Two shapes count. A deliverables heading is the explicit form and is
+    what dispatch should write. Prose is the form cards actually use --
+    "每轮评审结果写入 docs/reviews/r1.md" sitting in a numbered
+    requirement -- and missing it was how a review card closed as done
+    with nothing on disk.
+
+    Paths the card merely references stay out: only write verbs promote
+    a path to a deliverable, and templated names are skipped because
+    nothing can verify them.
+    """
+    if not body:
+        return []
+    paths: list[str] = []
+
+    in_section = False
+    for line in body.splitlines():
+        if _ARTIFACT_HEADING_RE.match(line):
+            in_section = True
+            continue
+        if in_section:
+            if _NEXT_HEADING_RE.match(line):
+                # Section over; the line itself is a heading, nothing to
+                # scan, but later prose is back in play.
+                in_section = False
+                continue
+            match = _ARTIFACT_PATH_RE.match(line)
+            if match:
+                paths.append(match.group(1))
+                continue
+            if line.strip():
+                # A non-path line inside the section: the bullet list has
+                # ended even though no new heading started. Fall through
+                # so this line is read as prose.
+                in_section = False
+        for match in _PROSE_ARTIFACT_RE.finditer(line):
+            paths.append(match.group(1))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in paths:
+        if path in seen or _PLACEHOLDER_RE.search(path):
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _missing_artifact_rejection(task: Optional[Task]) -> Optional[str]:
+    """Report declared deliverables that are not on disk.
+
+    A worker whose iteration budget runs out can still call complete, and
+    a review card that produced no report is then indistinguishable from
+    one that produced three. Checking the files the card itself named is
+    the cheapest evidence available, and it costs nothing on the cards
+    that name none.
+
+    An empty file counts as missing: a zero-byte report says as little as
+    an absent one.
+    """
+    if task is None:
+        return None
+    declared = _declared_artifact_paths(task.body)
+    if not declared:
+        return None
+    root = task.workspace_path
+    if not root:
+        # Nothing to resolve relative paths against; the check would be
+        # guessing at a location rather than verifying one.
+        return None
+
+    missing: list[str] = []
+    for rel in declared:
+        candidate = Path(rel)
+        if not candidate.is_absolute():
+            candidate = Path(root) / rel
+        try:
+            if not candidate.is_file() or candidate.stat().st_size == 0:
+                missing.append(rel)
+        except OSError:
+            missing.append(rel)
+    if not missing:
+        return None
+    return (
+        "declared deliverables are missing or empty: "
+        + ", ".join(missing)
+        + f" (resolved against {root})"
+    )

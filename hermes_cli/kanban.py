@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -25,6 +26,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_db import (
+    _declared_artifact_paths,
+    _missing_artifact_rejection,
+)
 from hermes_cli import kanban_swarm as ks
 
 
@@ -2379,6 +2384,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
+
+            # Cheapest evidence first: if the card named the files it must
+            # leave behind, they have to exist before it can close. A
+            # worker that exhausts its iteration budget can still reach
+            # this call, and without the check a review that produced no
+            # report closes exactly like one that produced three.
+            missing = _missing_artifact_rejection(task)
+            if missing is not None:
+                print(
+                    f"kanban: cannot complete {tid}: {missing}. "
+                    f"Write the deliverables the card declares, or edit the "
+                    f"card if the plan changed.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
+
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),

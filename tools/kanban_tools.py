@@ -752,6 +752,22 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+
+            # The card's own declared deliverables come first, and cost
+            # nothing on cards that declare none. A worker out of
+            # iteration budget still reaches this call, so without the
+            # check a review that wrote no report closes exactly like one
+            # that wrote three. This is separate from the artifacts=[...]
+            # argument below: that one is what the worker claims it
+            # produced, this one is what the card demanded up front.
+            missing = kb._missing_artifact_rejection(task)
+            if missing is not None:
+                return tool_error(
+                    f"Cannot complete: {missing}. Write the deliverables the "
+                    f"card declares, then complete again. If the plan changed, "
+                    f"edit the card body first so the record matches reality."
+                )
+
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
