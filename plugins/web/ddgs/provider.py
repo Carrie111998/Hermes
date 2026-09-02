@@ -45,6 +45,88 @@ _POLL_INTERVAL_SECS = 0.1
 _TERMINATE_GRACE_SECS = 1.0
 
 
+def _is_termux_env() -> bool:
+    """Return True if running inside Android Termux or Android environment."""
+    prefix = os.environ.get("PREFIX", "")
+    return bool(
+        os.environ.get("TERMUX_VERSION")
+        or "com.termux/files/usr" in prefix
+        or prefix.startswith("/data/data/com.termux/")
+        or sys.platform == "android"
+        or os.path.exists("/data/data/com.termux")
+    )
+
+
+def _run_ddgs_html_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+    """Execute search via DuckDuckGo HTML endpoint without native/Rust dependencies.
+
+    Used on Android/Termux where the native ``primp``/``ndk-context`` library panics
+    with ``android context was not initialized`` (#85972), or as a fallback when
+    the ddgs package fails.
+    """
+    import html as html_lib
+    import re
+    import urllib.parse
+    import urllib.request
+
+    url = "https://html.duckduckgo.com/html/"
+    data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        content = resp.read().decode("utf-8", errors="replace")
+
+    results: list[dict[str, Any]] = []
+    links = re.findall(
+        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        content,
+        re.DOTALL,
+    )
+    snippets = re.findall(
+        r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+        content,
+        re.DOTALL,
+    )
+
+    for i, (href, raw_title) in enumerate(links[:safe_limit]):
+        actual_url = href
+        if "uddg=" in href:
+            match = re.search(r"[?&]uddg=([^&]+)", href)
+            if match:
+                actual_url = urllib.parse.unquote(match.group(1))
+
+        title = re.sub(r"<[^>]+>", "", raw_title)
+        title = html_lib.unescape(title).strip()
+
+        snippet = ""
+        if i < len(snippets):
+            raw_snippet = snippets[i]
+            snippet = re.sub(r"<[^>]+>", "", raw_snippet)
+            snippet = html_lib.unescape(snippet).strip()
+
+        results.append(
+            {
+                "title": title,
+                "url": actual_url,
+                "description": snippet,
+                "position": i + 1,
+            }
+        )
+
+    return results
+
+
 class _SearchInterrupted(Exception):
     """Raised when tools.interrupt.is_interrupted() trips during a search wait."""
 
@@ -56,24 +138,34 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     tests can patch it for in-process unit tests. ``DDGS(timeout=…)`` bounds
     each individual HTTP request; the overall wall-clock cap is enforced by
     the parent via process timeout (#68096).
-    """
-    from ddgs import DDGS  # type: ignore
 
-    results: list[dict[str, Any]] = []
-    with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
-            if i >= safe_limit:
-                break
-            url = str(hit.get("href") or hit.get("url") or "")
-            results.append(
-                {
-                    "title": str(hit.get("title", "")),
-                    "url": url,
-                    "description": str(hit.get("body", "")),
-                    "position": i + 1,
-                }
-            )
-    return results
+    On Termux / Android (or if the native ddgs/primp package panics or fails),
+    falls back to direct HTTP HTML search without native dependencies (#85972).
+    """
+    if _is_termux_env():
+        return _run_ddgs_html_search(query, safe_limit)
+
+    try:
+        from ddgs import DDGS  # type: ignore
+
+        results: list[dict[str, Any]] = []
+        with DDGS(timeout=10) as client:
+            for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+                if i >= safe_limit:
+                    break
+                url = str(hit.get("href") or hit.get("url") or "")
+                results.append(
+                    {
+                        "title": str(hit.get("title", "")),
+                        "url": url,
+                        "description": str(hit.get("body", "")),
+                        "position": i + 1,
+                    }
+                )
+        return results
+    except Exception as exc:
+        logger.debug("DDGS package search failed (%s); falling back to HTML search", exc)
+        return _run_ddgs_html_search(query, safe_limit)
 
 
 # Optional test-only hook name forwarded to the child (see _search_worker.py).
@@ -281,12 +373,14 @@ class DDGSWebSearchProvider(WebSearchProvider):
         return "DuckDuckGo (ddgs)"
 
     def is_available(self) -> bool:
-        """Return True when the ``ddgs`` package is importable.
+        """Return True when the ``ddgs`` package is importable or on Termux.
 
-        Probes the import once; cheap because Python caches the import. Must
-        NOT perform network I/O — runs at tool-registration time and on every
-        ``hermes tools`` paint.
+        On Termux / Android, search uses the pure-Python HTTP scraper which has
+        no package prerequisites (#85972). On other platforms, probes package
+        importability.
         """
+        if _is_termux_env():
+            return True
         try:
             import ddgs  # noqa: F401
 
@@ -307,13 +401,14 @@ class DDGSWebSearchProvider(WebSearchProvider):
         a hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
         ``primp`` call cannot freeze the Hermes process (#36776, #68096).
         """
-        try:
-            import ddgs  # type: ignore  # noqa: F401 — availability probe
-        except ImportError:
-            return {
-                "success": False,
-                "error": "ddgs package is not installed — run `pip install ddgs`",
-            }
+        if not _is_termux_env():
+            try:
+                import ddgs  # type: ignore  # noqa: F401 — availability probe
+            except ImportError:
+                return {
+                    "success": False,
+                    "error": "ddgs package is not installed — run `pip install ddgs`",
+                }
 
         # DDGS().text yields at most `max_results` items; we cap defensively
         # in case the package ignores the hint.
