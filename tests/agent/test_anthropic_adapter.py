@@ -61,6 +61,56 @@ class TestBuildAnthropicClient:
             assert "oauth-2025-04-20" not in betas  # OAuth-only beta NOT present
             assert "claude-code-20250219" not in betas  # OAuth-only beta NOT present
 
+    def test_custom_provider_extra_headers_merge_with_anthropic_betas(self):
+        base_url = "https://proxy.example.com/anthropic/v1"
+        config = {
+            "custom_providers": [
+                {
+                    "name": "anthropic-proxy",
+                    "base_url": base_url,
+                    "api_mode": "anthropic_messages",
+                    "extra_headers": {
+                        "User-Agent": "hermes-custom/1.0",
+                        "CF-Access-Client-Id": "client-id",
+                    },
+                }
+            ]
+        }
+
+        with (
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk,
+            patch("hermes_cli.config.load_config", return_value=config),
+        ):
+            build_anthropic_client("sk-test", base_url=base_url)
+
+        kwargs = mock_sdk.Anthropic.call_args.kwargs
+        assert kwargs["base_url"] == "https://proxy.example.com/anthropic"
+        assert kwargs["default_headers"]["User-Agent"] == "hermes-custom/1.0"
+        assert kwargs["default_headers"]["CF-Access-Client-Id"] == "client-id"
+        assert "interleaved-thinking-2025-05-14" in kwargs["default_headers"]["anthropic-beta"]
+
+    def test_custom_provider_without_extra_headers_preserves_sdk_defaults(self):
+        base_url = "https://proxy.example.com/anthropic"
+        config = {
+            "custom_providers": [
+                {
+                    "name": "anthropic-proxy",
+                    "base_url": base_url,
+                    "api_mode": "anthropic_messages",
+                }
+            ]
+        }
+
+        with (
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk,
+            patch("hermes_cli.config.load_config", return_value=config),
+        ):
+            build_anthropic_client("sk-test", base_url=base_url)
+
+        headers = mock_sdk.Anthropic.call_args.kwargs["default_headers"]
+        assert "User-Agent" not in headers
+        assert "user-agent" not in headers
+        assert "interleaved-thinking-2025-05-14" in headers["anthropic-beta"]
 
 
 

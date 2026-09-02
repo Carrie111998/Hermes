@@ -698,11 +698,42 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    _apply_configured_anthropic_extra_headers(kwargs, base_url)
+
     client = _anthropic_sdk.Anthropic(**kwargs)
     # Same env-inference trap as build_anthropic_client: auth_token-only
     # construction would otherwise also send ANTHROPIC_API_KEY as X-Api-Key.
     client.api_key = None
     return client
+
+
+def _apply_configured_anthropic_extra_headers(
+    client_kwargs: Dict[str, Any],
+    base_url: str | None,
+) -> None:
+    """Merge endpoint-scoped custom-provider headers into Anthropic kwargs.
+
+    The shared config helper (``hermes_cli.config``) preserves SDK/provider
+    defaults such as ``anthropic-beta`` while allowing the matching
+    ``extra_headers`` entry to add or explicitly override headers — the
+    provider entry is the most specific configuration level. Covers every
+    native Anthropic client construction path (initial build, agent rebuilds
+    after provider switch / interrupt / credential recovery) because both
+    builders here call it right before SDK construction.
+
+    SECURITY: header values may carry credentials and must never be logged.
+    """
+    if not base_url:
+        return
+    try:
+        from hermes_cli.config import apply_custom_provider_extra_headers_to_client_kwargs
+
+        apply_custom_provider_extra_headers_to_client_kwargs(client_kwargs, base_url)
+    except Exception as exc:
+        logger.debug(
+            "Could not resolve custom-provider headers for Anthropic endpoint: %s",
+            type(exc).__name__,
+        )
 
 
 def build_anthropic_client(
@@ -848,6 +879,12 @@ def build_anthropic_client(
         headers.setdefault("X-Title", "Hermes Agent")
         headers.setdefault("User-Agent", f"HermesAgent/{_HERMES_VERSION}")
         kwargs["default_headers"] = headers
+
+    # Endpoint-scoped extra_headers from the matching providers/custom_providers
+    # entry are merged last so user-configured headers (e.g. Cloudflare Access
+    # service tokens, WAF-required User-Agents) win over the hardcoded provider
+    # attribution sets above.
+    _apply_configured_anthropic_extra_headers(kwargs, base_url)
 
     client = _anthropic_sdk.Anthropic(**kwargs)
     # Bearer-only construction leaves ``api_key`` unset, so the SDK fills it
