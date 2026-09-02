@@ -9244,6 +9244,37 @@ def _build_call_kwargs(
         "timeout": timeout,
     }
 
+    # Per-task reasoning override from config: auxiliary.<task>.reasoning_effort.
+    # Canonical case: compression against a local thinking model. A
+    # reasoning-capable summarizer happily spends its entire output budget on
+    # <think> before writing a single summary character — the call returns
+    # thinking-only content (or dies to the host's wall-clock hygiene
+    # watchdog mid-thought) and compaction loops on empty/size-neutral
+    # summaries. Digest work gains nothing from reasoning, so operators can
+    # turn it off per task (``reasoning_effort: none`` or ``false``) or pin
+    # an effort level, using the same spellings as the main-model knob.
+    # Explicit per-call reasoning_config (e.g. MoA per-slot) still wins.
+    _task_reasoning_from_config = False
+    if reasoning_config is None and task:
+        _cfg_effort = None
+        try:
+            _cfg_effort = _get_auxiliary_task_config(task).get("reasoning_effort")
+        except Exception:
+            _cfg_effort = None
+        if _cfg_effort is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            _task_reasoning = parse_reasoning_effort(_cfg_effort)
+            if _task_reasoning is not None:
+                reasoning_config = _task_reasoning
+                _task_reasoning_from_config = True
+            else:
+                logger.warning(
+                    "auxiliary.%s.reasoning_effort value %r not recognized "
+                    "(expected none/false or an effort level) — ignoring",
+                    task, _cfg_effort,
+                )
+
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
         temperature = None  # strip — let server choose
@@ -9418,6 +9449,30 @@ def _build_call_kwargs(
     merged_extra = dict(extra_body or {})
     merged_extra.update(profile_body)
     merged_extra.update(profile_reasoning_extra)
+    # Profile-authoritative reasoning: when the provider profile already
+    # expresses the reasoning intent in ITS wire dialect (top-level
+    # ``reasoning_effort`` for Ollama/GLM-class, nested ``thinking_config``
+    # for Gemini, …), also sending the generic ``extra_body.reasoning``
+    # object is at best redundant and at worst poison: on Ollama's
+    # /v1/chat/completions an unknown top-level object can suppress the
+    # honored ``reasoning_effort`` key entirely (probe-verified 2026-08-23:
+    # effort "none" + reasoning {enabled: false} on the same payload ran
+    # FULL thinking, 580s+ timeout, while effort "none" alone ran 12.5s
+    # with zero thinking). Only drops the generic object when the profile
+    # actually carries a reasoning intent for this call — an explicit
+    # extra_body.reasoning with no reasoning_config keeps the documented
+    # "explicit wire control wins" contract untouched.
+    if (
+        profile_handles_reasoning
+        and reasoning_config
+        and isinstance(reasoning_config, dict)
+        and "reasoning" in merged_extra
+        and "reasoning" in profile_reasoning_extra
+    ):
+        # Gate on the profile being the SOURCE of the generic object: a
+        # caller-supplied extra_body.reasoning alongside a reasoning-aware
+        # profile keeps the "explicit wire control wins" contract.
+        merged_extra.pop("reasoning", None)
     if (
         reasoning_config
         and isinstance(reasoning_config, dict)
@@ -9469,6 +9524,29 @@ def _build_call_kwargs(
             or _is_anthropic_compat_endpoint(provider_norm, effective_base)
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
+
+    # Top-level ``reasoning_effort`` fallback for servers whose provider has
+    # NO reasoning-aware profile. Ollama-class local backends silently drop
+    # ``extra_body.reasoning`` (probe-verified: a {enabled: false} payload
+    # left ~10K chars of thinking untouched) — for them the top-level key is
+    # the only knob that bites. Gated on the per-task CONFIG flag (explicit
+    # operator intent), never on internal per-call reasoning_config, so a
+    # strict OpenAI endpoint can never receive an unsolicited key it would
+    # 400 on ("Unrecognized request argument"). Providers WITH a reasoning
+    # profile (custom/Ollama, OpenRouter, Gemini…) are already covered above.
+    if (
+        _task_reasoning_from_config
+        and reasoning_config
+        and isinstance(reasoning_config, dict)
+        and not profile_handles_reasoning
+    ):
+        # Config-pinned intent on a profile-less backend: emit the operator's
+        # actual level ("none" when disabled, the configured effort otherwise)
+        # so a pinned level is never silently dropped on the wire.
+        if reasoning_config.get("enabled") is False:
+            kwargs["reasoning_effort"] = "none"
+        elif reasoning_config.get("effort"):
+            kwargs["reasoning_effort"] = reasoning_config["effort"]
 
     return kwargs
 
