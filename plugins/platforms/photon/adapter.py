@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    sanitize_outbound_typography,
 )
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 
@@ -2525,6 +2526,7 @@ class PhotonAdapter(BasePlatformAdapter):
         richlink: bool = True,
         markdown: bool = True,
     ) -> SendResult:
+        text = sanitize_outbound_typography(text)
         rich_url = _richlink_candidate(text) if richlink else None
         if rich_url:
             rich_result = await self._sidecar_send_richlink(space_id, rich_url)

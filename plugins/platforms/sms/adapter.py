@@ -33,6 +33,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    sanitize_outbound_typography,
 )
 from gateway.platforms.helpers import redact_phone, strip_markdown
 
@@ -189,7 +190,7 @@ class SmsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         import aiohttp
 
-        formatted = self.format_message(content)
+        formatted = sanitize_outbound_typography(self.format_message(content))
         chunks = self.truncate_message(formatted)
         last_result = SendResult(success=True)
 

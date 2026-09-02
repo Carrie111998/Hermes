@@ -334,6 +334,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_image_from_url,
     cache_audio_from_url,
+    sanitize_outbound_typography,
 )
 from utils import env_int
 
@@ -994,7 +995,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             import aiohttp
 
             # Format and chunk the message
-            formatted = self.format_message(content)
+            formatted = sanitize_outbound_typography(self.format_message(content))
             chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
 
             sent_message_ids: list[str] = []
