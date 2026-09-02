@@ -912,7 +912,7 @@ function Invoke-PreDownload {
         Write-Warn "  Failed to download Node.js: $_"
     }
 
-    # 4. Repository bundle (BLOCKER 1 — exact-commit contract via git bundle)
+    # 4. Repository bundle (BLOCKER 1 -- exact-commit contract via git bundle)
     Write-Info "[4/6] Creating repository bundle..."
     try {
         # Source the bounded module for bundle creation.
@@ -958,7 +958,7 @@ function Invoke-PreDownload {
         Write-Info "  You can manually run: uv pip download --python-platform windows --python-version 3.11 --out-dir `"$TargetDir\python-wheels`" -e .[all] (use staged repo bundle or installed repo for extras spec)"
     }
 
-    # 6. npm cache (BLOCKER 2 — explicit fail-closed since full offline npm requires registry access)
+    # 6. npm cache (BLOCKER 2 -- explicit fail-closed since full offline npm requires registry access)
     Write-Info "[6/6] Checking npm offline cache..."
     try {
         # Explicit failure: full npm dependency resolution requires a live registry
@@ -1012,19 +1012,22 @@ function Install-Uv {
             # Verify SHA-256 if manifest exists
             $manifestPath = Join-Path $OfflineDir "offline-manifest.json"
             if (Test-Path $manifestPath) {
+                $offlineManifest = $null
+                $uvAsset = $null
                 try {
                     $offlineManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-                    $uvAsset = $offlineManifest.assets | Where-Object { $_.name -eq "uv.exe" }
-                    $expectedHash = if ($uvAsset) { $uvAsset.hash } else { $null }
-                    if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineUv -ExpectedHash $expectedHash)) {
-                        Write-Err "SHA-256 mismatch for uv.exe — offline asset may be corrupted"
-                        Write-Err "Expected: $expectedHash"
-                        Write-Err "Actual:   $((Get-FileHash $offlineUv -Algorithm SHA256).Hash.ToLower())"
-                        throw "Offline asset integrity check failed"
-                    }
                 } catch {
-                    if ($_.Exception.Message -match "integrity check failed") { throw }
-                    # Manifest parse error — proceed without hash check
+                    # Manifest parse error -- proceed without hash check
+                }
+                if ($offlineManifest) {
+                    $uvAsset = $offlineManifest.assets | Where-Object { $_.name -eq "uv.exe" }
+                }
+                $expectedHash = if ($uvAsset) { $uvAsset.hash } else { $null }
+                if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineUv -ExpectedHash $expectedHash)) {
+                    Write-Err "SHA-256 mismatch for uv.exe -- offline asset may be corrupted"
+                    Write-Err "Expected: $expectedHash"
+                    Write-Err "Actual:   $((Get-FileHash $offlineUv -Algorithm SHA256).Hash.ToLower())"
+                    throw "Offline asset integrity check failed"
                 }
             }
             Write-Info "Installing uv from offline bundle..."
@@ -1811,23 +1814,26 @@ function Install-Git {
         $tmpFile = "$env:TEMP\$assetName"
         $gitDir = "$HermesHome\git"
 
-        # Offline-aware download: check OfflineDir first (BLOCKER 3 — verify hash)
+        # Offline-aware download: check OfflineDir first (BLOCKER 3 -- verify hash)
         if ($OfflineDir -and (Test-Path (Join-Path $OfflineDir $assetName))) {
             Write-Info "Installing Git from offline bundle: $assetName"
             # Verify SHA-256 against manifest before copying.
             $manifestPath = Join-Path $OfflineDir "offline-manifest.json"
             $offlineAssetPath = Join-Path $OfflineDir $assetName
             if (Test-Path $manifestPath) {
+                $offlineManifest = $null
+                $gitAsset = $null
                 try {
                     $offlineManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-                    $gitAsset = $offlineManifest.assets | Where-Object { $_.name -eq $assetName }
-                    $expectedHash = if ($gitAsset) { $gitAsset.hash } else { $null }
-                    if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineAssetPath -ExpectedHash $expectedHash)) {
-                        throw "Offline Git asset SHA-256 mismatch — asset may be corrupted"
-                    }
                 } catch {
-                    if ($_.Exception.Message -match "mismatch") { throw }
-                    # Manifest parse error — proceed without hash check
+                    # Manifest parse error -- proceed without hash check
+                }
+                if ($offlineManifest) {
+                    $gitAsset = $offlineManifest.assets | Where-Object { $_.name -eq $assetName }
+                }
+                $expectedHash = if ($gitAsset) { $gitAsset.hash } else { $null }
+                if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineAssetPath -ExpectedHash $expectedHash)) {
+                    throw "Offline Git asset SHA-256 mismatch -- asset may be corrupted"
                 }
             }
             Copy-Item $offlineAssetPath $tmpFile -Force
