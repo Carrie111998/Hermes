@@ -84,6 +84,10 @@ def make_restart_runner(
         DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
     )
     runner._stop_task = None
+    runner._last_home_notify_degraded = 0
+    runner._last_home_notify_delivered = set()
+    runner._boot_sends_task = None
+    runner._deferred_lifecycle_retry_task = None
     runner._busy_input_mode = "interrupt"
     runner._update_prompt_pending = {}
     runner._voice_mode = {}
