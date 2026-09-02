@@ -5,6 +5,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import ToolGuardrailDecision
 from run_agent import AIAgent
 
 
@@ -423,3 +424,42 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_guardrail_halt_wins_over_review_yield_boundary():
+    agent = _make_agent("review_current_work", max_iterations=10)
+    response = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call("review_current_work", "{}", "c-review")],
+    )
+    assert agent.client is not None
+    agent.client.chat.completions.create.return_value = response
+    decision = ToolGuardrailDecision(
+        action="halt",
+        code="test_guardrail_halt",
+        tool_name="review_current_work",
+        count=2,
+    )
+
+    def fake_execute(assistant_message, messages, *_args):
+        messages.append({
+            "role": "tool",
+            "name": "review_current_work",
+            "tool_call_id": assistant_message.tool_calls[0].id,
+            "content": json.dumps({"status": "dispatched"}),
+        })
+        agent._review_yield_requested = True
+        agent._tool_guardrail_halt_decision = decision
+
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=fake_execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("review this work")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert "stopped retrying" in result["final_response"]
+    assert agent._review_yield_requested is False

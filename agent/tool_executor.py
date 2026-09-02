@@ -1949,6 +1949,45 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _append_review_yield_cancellations(
+    agent,
+    calls,
+    messages: list,
+    effective_task_id: str,
+) -> bool:
+    """Persist skipped calls after an asynchronous review becomes a barrier."""
+    for skipped_tc in calls:
+        skipped_name = skipped_tc.function.name
+        cancelled_result = (
+            f"[Tool execution cancelled — {skipped_name} was skipped "
+            "because review_current_work yielded the parent]"
+        )
+        messages.append(make_tool_result_message(
+            skipped_name,
+            cancelled_result,
+            _pairing_tool_call_id(skipped_tc),
+            effect_disposition="none",
+        ))
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=skipped_name,
+            function_args={},
+            result=cancelled_result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(skipped_tc, "id", "") or "",
+            status="cancelled",
+            error_type="review_yield",
+            error_message="Tool execution skipped because review_current_work yielded the parent",
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"review-yield cancellation {skipped_name}",
+        ):
+            return False
+    return True
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1967,6 +2006,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         tool_call_id = _pairing_tool_call_id(tool_call)
         if getattr(agent, "_incremental_persistence_failed", False):
+            return
+        if getattr(agent, "_review_yield_requested", False):
+            _append_review_yield_cancellations(
+                agent,
+                assistant_message.tool_calls[i - 1:],
+                messages,
+                effective_task_id,
+            )
             return
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -2385,6 +2432,30 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('setup_mcp', function_args, tool_duration, result=function_result)}")
+        elif function_name == "review_current_work":
+            _review_result = None
+            try:
+                def _execute(next_args: dict) -> Any:
+                    return agent._dispatch_review_current_work(next_args, messages)
+                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=tool_call_id,
+                    execute=_execute,
+                    scope_block=_ts_scope_block,
+                    display_index=i,
+                ))
+                _review_result = function_result
+            finally:
+                tool_duration = time.time() - tool_start_time
+                cute_msg = _get_cute_tool_message_impl(
+                    "review_current_work", function_args, tool_duration,
+                    result=_review_result,
+                )
+                if agent._should_emit_quiet_tool_messages():
+                    agent._vprint(f"  {cute_msg}")
         elif function_name == "delegate_task":
             _action_arg = str(function_args.get("action") or "").strip().lower()
             tasks_arg = function_args.get("tasks")
@@ -2894,7 +2965,17 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
+        if getattr(agent, "_review_yield_requested", False):
+            remaining = [
+                tool_call
+                for _, segment_calls in segments[segment_index:]
+                for tool_call in segment_calls
+            ]
+            _append_review_yield_cancellations(
+                agent, remaining, messages, effective_task_id
+            )
+            return
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2910,6 +2991,16 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
+            return
+        if getattr(agent, "_review_yield_requested", False):
+            remaining = [
+                tool_call
+                for _, segment_calls in segments[segment_index + 1:]
+                for tool_call in segment_calls
+            ]
+            _append_review_yield_cancellations(
+                agent, remaining, messages, effective_task_id
+            )
             return
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────

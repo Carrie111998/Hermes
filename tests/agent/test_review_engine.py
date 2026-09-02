@@ -255,6 +255,7 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
         except Exception:
             continue
     assert evt is not None and evt["type"] == "async_delegation"
+    assert evt["parent_session_id"] == "review-parent-sess"
     assert evt["results"][0]["summary"] == "REVIEW: looks good"
 
 

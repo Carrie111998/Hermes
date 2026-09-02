@@ -8001,6 +8001,11 @@ def run_conversation(
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:
+                    # Guardrail halts are authoritative over auxiliary phase
+                    # boundaries. If both flags are set, do not let the
+                    # review-yield response mask the safety stop or leak the
+                    # yield flag into a later completion turn.
+                    agent._review_yield_requested = False
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
@@ -8021,6 +8026,17 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                if getattr(agent, "_review_yield_requested", False):
+                    # An asynchronous review is a phase boundary. The review
+                    # result re-enters through the normal delegation rail; do
+                    # not make another model call in this work phase.
+                    agent._review_yield_requested = False
+                    _turn_exit_reason = "review_dispatched"
+                    final_response = (
+                        "Review dispatched. Yielding until the review result returns."
+                    )
                     break
 
                 # Reset per-turn retry counters after successful tool

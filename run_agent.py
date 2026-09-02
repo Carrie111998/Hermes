@@ -9080,6 +9080,30 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _dispatch_review_current_work(self, function_args: dict, messages: list) -> str:
+        """Dispatch the parent-only bridge to the existing review engine."""
+        if getattr(self, "_delegate_depth", 0) > 0:
+            return json.dumps({
+                "status": "error",
+                "error": "review_current_work is available only to the parent agent.",
+            })
+
+        from agent.review_engine import start_review
+
+        try:
+            result = start_review(
+                self,
+                messages,
+                user_prompt=str(function_args.get("focus") or ""),
+                autonomous=True,
+            )
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": str(exc)})
+
+        if result.get("status") == "dispatched":
+            self._review_yield_requested = True
+        return json.dumps(result, ensure_ascii=False)
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False,
