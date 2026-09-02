@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -312,6 +313,62 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+
+
+def test_max_runtime_honours_dispatcher_failure_limit(kanban_home, monkeypatch):
+    """A dispatcher failure limit of one blocks on the first timeout."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="single-timeout budget",
+            assignee="worker",
+            max_runtime_seconds=1,
+        )
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, 999_991)
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (old_started, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, tid),
+            )
+
+        # The crash reaper runs before timeout enforcement. Keep this fresh
+        # claim inside its launch grace so only the timeout path handles it.
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "86400")
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        killed = []
+        # dispatch_once does not expose enforce_max_runtime's signal_fn test
+        # hook, so patch the process-global kill function for this short scope.
+        monkeypatch.setattr(
+            os, "kill", lambda pid, sig: killed.append((pid, sig)),
+        )
+        result = _kb.dispatch_once(
+            conn, max_spawn=0,
+            failure_limit=1,
+        )
+        assert tid in result.timed_out
+        assert killed == [(999_991, signal.SIGTERM)]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        gave_up = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "gave_up"
+        ]
+        assert len(gave_up) == 1
+        assert gave_up[0].payload["effective_limit"] == 1
+        assert gave_up[0].payload["limit_source"] == "dispatcher"
+    finally:
+        conn.close()
 
 
 
@@ -1320,6 +1377,86 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+def test_crash_honours_dispatcher_failure_limit(kanban_home, monkeypatch):
+    """The configured unified failure budget applies to plain crashes."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="single-crash budget", assignee="worker")
+        pid = 991_099
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+        _kb._set_worker_pid(conn, tid, pid)
+        _kb._record_worker_exit(pid, 256)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 30, tid),
+            )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        result = _kb.dispatch_once(conn, max_spawn=0, failure_limit=1)
+        assert tid in result.crashed
+        assert tid in result.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        gave_up = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "gave_up"
+        ]
+        assert len(gave_up) == 1
+        assert gave_up[0].payload["effective_limit"] == 1
+        assert gave_up[0].payload["limit_source"] == "dispatcher"
+    finally:
+        conn.close()
+
+
+def test_crash_breaker_agrees_with_lenient_dispatcher_limit(
+    kanban_home, monkeypatch,
+):
+    """A lenient dispatcher limit must not trip at the built-in default."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="lenient crash budget", assignee="worker")
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        for attempt, pid in enumerate((991_101, 991_102, 991_103), start=1):
+            assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+            _kb._set_worker_pid(conn, tid, pid)
+            _kb._record_worker_exit(pid, 256)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ? WHERE id = ?",
+                    (int(time.time()) - 30, tid),
+                )
+
+            result = _kb.dispatch_once(conn, max_spawn=0, failure_limit=3)
+            assert tid in result.crashed
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == attempt
+            gave_up = [
+                event for event in kb.list_events(conn, tid)
+                if event.kind == "gave_up"
+            ]
+            if attempt < 3:
+                assert task.status == "ready"
+                assert tid not in result.auto_blocked
+                assert gave_up == []
+            else:
+                assert task.status == "blocked"
+                assert tid in result.auto_blocked
+                assert len(gave_up) == 1
+                assert gave_up[0].payload["effective_limit"] == 3
+                assert gave_up[0].payload["limit_source"] == "dispatcher"
+    finally:
+        conn.close()
+
+
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     """Mixed failure kinds must not consume the violation retry budget.
 
@@ -1406,5 +1543,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-
