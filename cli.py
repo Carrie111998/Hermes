@@ -16489,6 +16489,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
 
+            # Warp CLI-agent notification (native OSC 777) — surfaces this
+            # approval request in Warp's tab status / notification mailbox
+            # even when the user isn't looking at this tab. No-ops outside
+            # Warp. See hermes_cli/warp_notify.py.
+            try:
+                from hermes_cli.warp_notify import notify_permission_request
+                notify_permission_request(
+                    tool_name=command,
+                    summary=description or f"Wants to run {command}",
+                    session_id=getattr(self, "session_id", "") or "",
+                )
+            except Exception:
+                pass
+
             _last_countdown_refresh = _time.monotonic()
             while True:
                 try:
@@ -17628,6 +17642,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self.bell_on_complete:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
+
+            # Warp CLI-agent notification (native OSC 777, no plugin/config
+            # needed) — no-ops outside Warp or on older Warp builds. See
+            # hermes_cli/warp_notify.py for the protocol writeup.
+            try:
+                from hermes_cli.warp_notify import notify_stop
+                notify_stop(session_id=getattr(self, "session_id", "") or "")
+            except Exception:
+                pass
 
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
