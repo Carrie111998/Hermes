@@ -584,6 +584,28 @@ class TestDetectLocalServerTypeAuth:
         assert mock_client.call_args.kwargs["headers"] == {
             "Authorization": "Bearer lm-token"
         }
+        assert mock_client.call_args.kwargs.get("trust_env") is False
+
+    def test_local_probes_disable_trust_env(self):
+        """Windows WinINET proxies must not hijack localhost num_ctx probes (#96476)."""
+        from agent import model_metadata
+        from agent.model_metadata import detect_local_server_type
+
+        model_metadata._endpoint_probe_path_cache.clear()
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"models": []}
+
+        client_mock = MagicMock()
+        client_mock.__enter__ = lambda s: client_mock
+        client_mock.__exit__ = MagicMock(return_value=False)
+        client_mock.get.return_value = resp
+
+        with patch("httpx.Client", return_value=client_mock) as mock_client:
+            detect_local_server_type("http://127.0.0.1:11434")
+
+        assert mock_client.call_args.kwargs.get("trust_env") is False
 
     def test_native_api_base_url_is_not_doubled(self):
         from agent.model_metadata import detect_local_server_type
