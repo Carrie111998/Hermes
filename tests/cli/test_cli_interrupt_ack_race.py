@@ -154,6 +154,36 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_kanban_quota_exit_survives_post_result_render_failure():
+    """A later display failure must not turn provider quota into exit 0."""
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    cli = _make_cli()
+    agent = _StubAgent(cli.session_id, turn_seconds=0)
+    agent.run_conversation = MagicMock(return_value={
+        "final_response": "",
+        "messages": [],
+        "api_calls": 1,
+        "completed": False,
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "quota exhausted",
+    })
+    cli.agent = agent
+
+    with patch.dict("os.environ", {"HERMES_KANBAN_TASK": "t_rate_limited"}, clear=False), \
+         patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True), \
+         patch.object(cli, "_flush_stream", side_effect=RuntimeError("render failed")):
+        assert cli.chat("work kanban task t_rate_limited") is None
+
+    assert cli._kanban_worker_exit_code == KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():

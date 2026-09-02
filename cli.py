@@ -1488,6 +1488,28 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _kanban_worker_rate_limit_exit_code(result: object) -> Optional[int]:
+    """Return the dispatcher's temporary-failure sentinel on provider quota.
+
+    Kanban workers use both the fully-quiet and human-readable single-query
+    paths. Keep their provider-quota exit contract identical so the dispatcher
+    requeues the task without counting a task failure.
+    """
+    if (
+        not os.environ.get("HERMES_KANBAN_TASK")
+        or not isinstance(result, dict)
+        or not result.get("failed")
+        or result.get("failure_reason") not in ("rate_limit", "billing")
+    ):
+        return None
+
+    try:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    except Exception:
+        return 1
+    return KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -16966,6 +16988,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._kanban_worker_exit_code = None
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -17460,6 +17483,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Normal completion: agent thread should be done already,
                 # but guard against edge cases.
                 agent_thread.join(timeout=30)
+
+            # Preserve the structured provider outcome before any post-turn
+            # rendering or output flush can fail.  The outer one-shot boundary
+            # consumes this after the normal response and exit summary print.
+            self._kanban_worker_exit_code = _kanban_worker_rate_limit_exit_code(result)
 
             # Freeze per-prompt elapsed timer once the agent thread has
             # exited (or been abandoned as a daemon after interrupt).
@@ -22358,19 +22386,13 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                        _exit_code = _kanban_worker_rate_limit_exit_code(result)
+                        if _exit_code is None:
+                            _exit_code = (
+                                1
+                                if isinstance(result, dict) and result.get("failed")
+                                else 0
+                            )
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -22397,6 +22419,9 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _kanban_exit_code = getattr(cli, "_kanban_worker_exit_code", None)
+                if _kanban_exit_code is not None:
+                    sys.exit(_kanban_exit_code)
         finally:
             _finalize_single_query(cli)
         return
