@@ -716,15 +716,32 @@ def cmd_mcp_list(args=None):
         else:
             transport = "?"
 
-        # Tool count
+        # Tool count — mirror _normalize_name_filter's accepted shapes: the
+        # sanctioned config writer stores a scalar string for a single-tool
+        # include, and registration enforces it, so counting only lists would
+        # display "all" while exactly one tool is live (#93313).
         tools_cfg = cfg.get("tools", {})
         if isinstance(tools_cfg, dict):
             include = tools_cfg.get("include")
             exclude = tools_cfg.get("exclude")
-            if include and isinstance(include, list):
-                tools_str = f"{len(include)} selected"
-            elif exclude and isinstance(exclude, list):
-                tools_str = f"-{len(exclude)} excluded"
+
+            def _filter_len(value: Any) -> int:
+                if isinstance(value, str):
+                    return 1
+                if isinstance(value, (list, tuple, set)):
+                    return len(value)
+                return 0
+
+            include_n = _filter_len(include)
+            exclude_n = _filter_len(exclude)
+            if include_n:
+                tools_str = f"{include_n} selected"
+            elif exclude_n:
+                # Offline list has no served tool list, so this counts
+                # configured patterns, not tools actually blocked — say
+                # "patterns" so the number can't be read as an effect
+                # count (#98067).
+                tools_str = f"{exclude_n} pattern{'s' if exclude_n != 1 else ''}"
             else:
                 tools_str = "all"
         else:
