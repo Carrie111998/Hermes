@@ -33,6 +33,7 @@ from hermes_cli.auth import (
     _load_auth_store,
     _load_provider_state,
     _load_provider_state_with_source,
+    _read_credential_pool_with_source,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _same_path,
@@ -808,9 +809,20 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        persistence_path: Optional[Path] = None,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
+        # Explicit ownership for profile-fallback rows.  Currently only xAI
+        # opts into write-back because its rotating refresh token makes a
+        # profile shadow destructive; normal/profile-owned pools retain the
+        # existing local-store behavior (None).
+        self._persistence_path = persistence_path
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         # RLock: the mutation primitives below (_replace_entry/_persist)
@@ -942,6 +954,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                target_path=self._persistence_path,
             )
 
     def _is_terminal_auth_failure(
@@ -1567,7 +1580,8 @@ class CredentialPool:
                 else self._sync_anthropic_entry_from_pool_store
             )
             with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                target_path=self._persistence_path,
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
@@ -2810,6 +2824,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=[removed.id],
+                target_path=self._persistence_path,
             )
             if self._current_id == removed.id:
                 self._current_id = None
@@ -3629,9 +3644,28 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+# Providers whose refresh token ROTATES on every refresh. A borrowed pool
+# row from the global root store must write its refresh back to that owner:
+# persisting it into the borrowing profile creates a shadow copy while the
+# root keeps the consumed token — poisoning every other consumer. Providers
+# with stable refresh tokens keep the ordinary profile-write behavior.
+_ROTATING_REFRESH_PROVIDERS = {"xai-oauth"}
+
+
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    persistence_path: Optional[Path] = None
+    if provider in _ROTATING_REFRESH_PROVIDERS:
+        raw_entries, source_path = _read_credential_pool_with_source(provider)
+        global_path = _global_auth_file_path()
+        if (
+            source_path is not None
+            and global_path is not None
+            and _same_path(source_path, global_path)
+        ):
+            persistence_path = source_path
+    else:
+        raw_entries = list(read_credential_pool(provider))
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -3691,5 +3725,6 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
+            target_path=persistence_path,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(provider, entries, persistence_path=persistence_path)

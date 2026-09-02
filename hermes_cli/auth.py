@@ -1700,7 +1700,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    Ordinary writes target the profile. Internal refresh paths may retain the
+    source path separately and write a rotating borrowed credential back to
+    the store that owns it.
     See issue #18594 follow-up.
     """
     auth_store = _load_auth_store()
@@ -1732,6 +1734,32 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
+
+
+def _read_credential_pool_with_source(
+    provider_id: str,
+) -> tuple[List[Dict[str, Any]], Optional[Path]]:
+    """Return one pool slice and the auth store that owns it.
+
+    The public read helper intentionally hides profile fallback provenance.
+    Refresh paths for rotating credentials need it so they can update the row
+    they borrowed instead of creating a profile-local shadow.
+    """
+    auth_store = _load_auth_store()
+    pool = auth_store.get("credential_pool")
+    if isinstance(pool, dict):
+        entries = pool.get(provider_id)
+        if isinstance(entries, list) and entries:
+            return list(entries), _auth_file_path()
+
+    global_path = _global_auth_file_path()
+    global_store = _load_global_auth_store()
+    global_pool = global_store.get("credential_pool") if global_store else None
+    if isinstance(global_pool, dict):
+        entries = global_pool.get(provider_id)
+        if isinstance(entries, list) and entries:
+            return list(entries), global_path
+    return [], None
 
 
 _POOL_STATUS_FIELDS = (
@@ -1806,6 +1834,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1826,8 +1855,8 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1865,7 +1894,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
