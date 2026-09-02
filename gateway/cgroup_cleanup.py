@@ -10,6 +10,14 @@ We deliberately iterate ``cgroup.procs`` and send per-PID SIGKILLs instead
 of writing ``1`` to ``cgroup.kill``: the original failure mode in #37454
 was the kernel returning ``EINVAL`` on the cgroup-wide kill, while per-PID
 signal delivery uses a separate code path that still works.
+
+``cgroup_worker`` nests dispatched kanban workers in child cgroups
+(``main/`` and ``workers/``) under this unit. Those nested pids do NOT appear
+in this cgroup's *own* ``cgroup.procs`` file, so this reaper must walk the
+whole cgroup **subtree**, not just the top level, or every dispatched worker
+would be orphaned on stop — trading one outage class (event-loop starvation)
+for another (Restart=always can never recover). This module therefore reaps
+recursively.
 """
 
 from __future__ import annotations
@@ -51,24 +59,53 @@ def _read_cgroup_pids(cgroup_path: str) -> list[int]:
     return pids
 
 
+def iter_cgroup_tree(cgroup_path: str):
+    """Yield every cgroup dir path (as ``str``) under ``cgroup_path``.
+
+    Includes ``cgroup_path`` itself first, then each descendant directory
+    (``main/``, ``workers/``, and anything deeper). Deterministic order.
+    """
+    fs_root = Path("/sys/fs/cgroup")
+    top = Path(f"/sys/fs/cgroup{cgroup_path}")
+    if not top.is_dir():
+        return
+    stack = [top]
+    while stack:
+        current = stack.pop()
+        rel = str(current.relative_to(fs_root))
+        yield rel
+        try:
+            for child in sorted(current.iterdir()):
+                if child.is_dir():
+                    stack.append(child)
+        except OSError:
+            continue
+
+
 def reap_cgroup(cgroup_path: str | None = None) -> int:
-    """SIGKILL every PID in the cgroup other than the caller. Returns the count killed."""
+    """SIGKILL every PID in this cgroup's *subtree* other than the caller.
+
+    Walks ``cgroup.procs`` of the cgroup and every descendant cgroup, so
+    nested worker pids (``workers/`` and deeper) are reaped too. Returns the
+    count killed.
+    """
     if cgroup_path is None:
         cgroup_path = _own_cgroup_path()
     if not cgroup_path:
         return 0
     own = os.getpid()
     killed = 0
-    for pid in _read_cgroup_pids(cgroup_path):
-        if pid == own:
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — Linux-only (reads /proc, /sys/fs/cgroup; runs from a systemd unit)
-            killed += 1
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            continue
+    for rel in iter_cgroup_tree(cgroup_path):
+        for pid in _read_cgroup_pids(rel):
+            if pid == own:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — Linux-only (reads /proc, /sys/fs/cgroup; runs from a systemd unit)
+                killed += 1
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                continue
     return killed
 
 

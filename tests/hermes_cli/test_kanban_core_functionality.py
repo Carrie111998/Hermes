@@ -743,6 +743,67 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_places_worker_in_child_cgroup(kanban_home, monkeypatch):
+    """_default_spawn must move each dispatched worker into the workers cgroup.
+
+    This is the isolation that stops the gateway event loop being starved by
+    its own dispatched workers (jarvis-os t_4ae8a651 / t_5c779aae). We stub the
+    placement helper and assert it receives the spawned pid; a cgroup failure
+    must never abort dispatch.
+    """
+    captured = {}
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 99999
+
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: FakeProc())
+
+    from gateway import cgroup_worker
+
+    placed = []
+    monkeypatch.setattr(
+        cgroup_worker,
+        "place_worker_in_child_cgroup",
+        lambda pid: placed.append(pid) or True,
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cgroup placement test", assignee="some-profile")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99999
+    finally:
+        conn.close()
+
+    assert placed == [99999], f"worker pid should be placed in the child cgroup: {placed}"
+
+
+def test_default_spawn_survives_cgroup_placement_failure(kanban_home, monkeypatch):
+    """A failing cgroup placement must not break dispatch (best-effort guard)."""
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: SimpleNamespace(pid=99999))
+
+    from gateway import cgroup_worker
+
+    monkeypatch.setattr(
+        cgroup_worker,
+        "place_worker_in_child_cgroup",
+        lambda pid: (_ for _ in ()).throw(RuntimeError("cgroup write failed")),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cgroup failure test", assignee="some-profile")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        # must still return the pid despite the helper raising
+        assert kb._default_spawn(task, str(workspace)) == 99999
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Per-task force-loaded skills
 # ---------------------------------------------------------------------------
