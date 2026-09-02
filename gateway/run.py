@@ -797,6 +797,13 @@ def _is_transient_network_error(exc: BaseException) -> bool:
         "ServerDisconnectedError",
         "ClientConnectorError",
         "ClientOSError",
+        # Feishu/Lark normal closes only (#67358). Do NOT treat bare
+        # "ConnectionClosed" / ConnectionClosedError as transient —
+        # those base/error classes cover policy/auth/abnormal closes
+        # (1008, 4401, etc.) where staying alive would mask misconfig.
+        # Scope to ConnectionClosedOK + lark_oapi's wrapper name.
+        "ConnectionClosedOK",
+        "ConnectionClosedException",  # lark_oapi wrapper name
     }
     while cur is not None and depth < 12:
         ident = id(cur)

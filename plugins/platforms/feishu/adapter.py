@@ -1322,6 +1322,37 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+def _feishu_ws_loop_exception_handler(
+    loop: "asyncio.AbstractEventLoop", context: Dict[str, Any]
+) -> None:
+    """Worker-loop safety net for the Lark receive task (issue #67358).
+
+    The SDK's ``_receive_message_loop`` task lives on this thread-local
+    worker loop, so a normal close (1000) or transient disconnect surfaces
+    here rather than on the gateway loop. Reuse the gateway's transient
+    classifier so classification stays consistent, and only swallow the
+    close/reconnect path — genuine bugs fall through to the default handler.
+    """
+    exc = context.get("exception")
+    is_transient = False
+    if exc is not None:
+        try:
+            from gateway.run import _is_transient_network_error
+
+            is_transient = _is_transient_network_error(exc)
+        except Exception:
+            is_transient = False
+    if exc is not None and is_transient:
+        logger.warning(
+            "[Feishu] Swallowed transient WS error on worker loop: %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    loop.default_exception_handler(context)
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
@@ -1330,6 +1361,15 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     asyncio.set_event_loop(loop)
     ws_client_module.loop = loop
     adapter._ws_thread_loop = loop
+    # The Lark SDK schedules its own `_receive_message_loop` task on THIS
+    # worker loop (lark_oapi/ws/client.py), not on the gateway loop where
+    # `_gateway_loop_exception_handler` is installed. Unretrieved task
+    # exceptions on a normal close therefore hit this loop's default
+    # handler (the real escalation vector). start()-surfaced errors were
+    # already swallowed pre-change; we still log unexpected exits below.
+    # Install the transient classifier on the loop that owns the receive
+    # task (see #67358).
+    loop.set_exception_handler(_feishu_ws_loop_exception_handler)
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
@@ -1363,8 +1403,16 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
-    except Exception:
-        pass
+    except Exception as exc:
+        # Log unexpected start() exits (pre-change this was bare pass).
+        # Loop-level task exceptions are handled by
+        # _feishu_ws_loop_exception_handler; this path is observability only.
+        logger.warning(
+            "[Feishu] WebSocket client exited: %s: %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
     finally:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
