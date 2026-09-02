@@ -27,6 +27,13 @@ from typing import Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
+from tools.package_acquisition import (
+    PACKAGE_ACQUISITION_DESCRIPTION,
+    PACKAGE_ACQUISITION_PATTERN_KEY,
+    PACKAGE_EXEC_WRAPPERS,
+    is_package_argv_acquisition,
+    package_executable_basename,
+)
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -507,6 +514,12 @@ _CMDPOS = (
     r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
     r'\s*'
 )
+
+# Package acquisition is a distinct trust boundary. Documentation, skills, and
+# model-generated commands can all contain a syntactically normal install for
+# an abandoned, mistyped, or later-hijacked package name. Package classifiers
+# therefore feed a stricter owner-only, one-operation policy below rather than
+# the reusable dangerous-command approval path.
 
 # Destructive-path argument matcher for the rm hardline rules.
 #
@@ -2485,6 +2498,155 @@ def _command_detection_variants(command: str):
         yield variant
 
 
+def _canonical_package_word(word: str) -> str:
+    # Empty/unset variable interpolation is a common way to split an action
+    # token (for example, i"$EMPTY"nstall). Removing simple variable forms is
+    # conservative: if the variable is non-empty the package manager will not
+    # see the protected action anyway.
+    without_variables = re.sub(
+        r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)",
+        "",
+        word,
+    )
+    if re.match(r"^[\"']?[A-Za-z]:\\", without_variables):
+        return without_variables.strip("\"'").lower()
+    return _deobfuscate_shell_word_for_detection(without_variables).lower()
+
+
+def _package_argv_is_acquisition(words: list[str]) -> bool:
+    canonical_argv = [_canonical_package_word(word) for word in words]
+    return is_package_argv_acquisition(canonical_argv)
+
+
+def _read_package_command_words(command: str, start: int) -> list[str]:
+    words: list[str] = []
+    pos = start
+    while len(words) < 64:
+        word_start, word_end, word = _read_shell_word(command, pos)
+        if word_start == word_end:
+            break
+        words.append(word)
+        pos = _skip_shell_whitespace(command, word_end)
+        if pos >= len(command) or command[pos] in ";&|\n":
+            break
+    return words
+
+
+def _package_words_are_acquisition(words: list[str]) -> bool:
+    if _package_argv_is_acquisition(words):
+        return True
+    if not words:
+        return False
+    exe_word = _canonical_package_word(words[0])
+    if _ENV_ASSIGNMENT_RE.fullmatch(exe_word):
+        return any(
+            _package_argv_is_acquisition(words[index:])
+            for index in range(1, len(words))
+        )
+    exe = package_executable_basename(exe_word)
+    if exe == "find":
+        for index, word in enumerate(words[:-1]):
+            if _canonical_package_word(word) in {"-exec", "-execdir"}:
+                return _package_argv_is_acquisition(words[index + 1:])
+        return False
+    if exe in PACKAGE_EXEC_WRAPPERS:
+        # Wrapper option grammars vary and many options consume operands.
+        # Inspect each suffix; the classifier still requires an exact package
+        # manager executable and acquisition action.
+        return any(
+            _package_argv_is_acquisition(words[index:])
+            for index in range(1, len(words))
+        )
+    if exe == "eval" and len(words) > 1:
+        try:
+            payload = " ".join(
+                _deobfuscate_shell_word_for_detection(word) for word in words[1:]
+            )
+            return _package_words_are_acquisition(shlex.split(payload, posix=True))
+        except ValueError:
+            return False
+    return False
+
+
+def _non_shell_heredoc_body_spans(command: str) -> list[tuple[int, int]]:
+    """Return heredoc data spans whose owning command is not a shell."""
+    spans: list[tuple[int, int]] = []
+    lines = command.splitlines(keepends=True)
+    offset = 0
+    line_offsets = []
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line)
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = re.search(
+            r"(?<!<)<<(?P<strip>-)?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)\2",
+            line,
+        )
+        if not match:
+            index += 1
+            continue
+        header = line[:match.start()]
+        if _contains_shell_carrier(header):
+            index += 1
+            continue
+        delimiter = match.group("delimiter")
+        strip_tabs = bool(match.group("strip"))
+        body_start = line_offsets[index] + len(line)
+        end_index = index + 1
+        while end_index < len(lines):
+            candidate = lines[end_index].rstrip("\r\n")
+            if strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == delimiter:
+                spans.append((body_start, line_offsets[end_index]))
+                index = end_index
+                break
+            end_index += 1
+        index += 1
+    return spans
+
+
+def detect_package_acquisition(command: str) -> tuple:
+    """Detect commands that may retrieve and execute package-registry code.
+
+    Detection begins only at quote-aware shell command-word spans. This keeps
+    install text inside quoted prose and heredoc/script data from becoming a
+    false positive while still surfacing executable words behind wrappers such
+    as ``sudo``, ``env``, ``command``, and ``builtin``.
+    """
+    pending = [command]
+    seen_variants = set()
+
+    while pending:
+        command_variant = pending.pop()
+        if command_variant in seen_variants:
+            continue
+        seen_variants.add(command_variant)
+        ignored_spans = _non_shell_heredoc_body_spans(command_variant)
+
+        normalized_variant = _normalize_command_for_detection(
+            _mask_quoted_newlines(command_variant)
+        )
+        for _, payload in _execution_flag_findings(normalized_variant):
+            if payload:
+                pending.append(payload)
+
+        for command_start in _iter_shell_command_starts(command_variant):
+            if any(start <= command_start < end for start, end in ignored_spans):
+                continue
+            words = _read_package_command_words(command_variant, command_start)
+            if _package_words_are_acquisition(words):
+                return (
+                    True,
+                    PACKAGE_ACQUISITION_PATTERN_KEY,
+                    PACKAGE_ACQUISITION_DESCRIPTION,
+                )
+    return (False, None, None)
+
+
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
@@ -2884,9 +3046,20 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if not queue:
             return 0
         if request_id:
-            targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+            targets = [
+                entry for entry in queue
+                if entry.data.get("request_id") == request_id
+            ]
             if not targets:
                 return 0
+            queue[:] = [entry for entry in queue if entry not in targets]
+        elif resolve_all and choice != "deny":
+            # Broad positive actions must never authorize single-operation
+            # requests. Leave those queued for an exact request decision.
+            targets = [
+                entry for entry in queue
+                if not entry.data.get("single_operation", False)
+            ]
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)
@@ -2897,7 +3070,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
-        entry.result = choice
+        if (
+            entry.data.get("single_operation")
+            and choice in {"session", "always"}
+        ):
+            entry.result = "once"
+        else:
+            entry.result = choice
         if reason:
             entry.reason = reason
         entry.event.set()
@@ -4583,16 +4762,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     #   once             → single-use consent; it covers ONLY the leader's
     #     execution, so the follower falls through to a fresh prompt.
     leader = None
-    with _lock:
-        for existing in _gateway_queues.get(session_key, []):
-            data = existing.data
-            if (
-                data.get("command") == approval_data.get("command")
-                and list(data.get("pattern_keys") or [])
-                == list(approval_data.get("pattern_keys") or [])
-            ):
-                leader = existing
-                break
+    if not approval_data.get("single_operation", False):
+        with _lock:
+            for existing in _gateway_queues.get(session_key, []):
+                data = existing.data
+                if (
+                    data.get("command") == approval_data.get("command")
+                    and list(data.get("pattern_keys") or [])
+                    == list(approval_data.get("pattern_keys") or [])
+                ):
+                    leader = existing
+                    break
     if leader is not None:
         adopted = _await_coalesced_leader(
             session_key, leader, approval_data, surface=surface
@@ -4741,9 +4921,18 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    is_package_acquisition, package_key, package_description = (
+        detect_package_acquisition(command)
+    )
+
+    # Isolated containers normally skip host-oriented command guards. Package
+    # acquisition remains owner-gated: a sandbox can still hold credentials or
+    # trusted-network access, and downloaded lifecycle/build code executes
+    # before the command's intended workload.
+    if (
+        _should_skip_container_guards(env_type, has_host_access=has_host_access)
+        and not is_package_acquisition
+    ):
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -4775,13 +4964,21 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # --yolo or approvals.mode=off normally bypass approval prompts. Package
+    # acquisition remains owner-gated because it crosses a separate trust
+    # boundary.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        not is_package_acquisition
+        and (
+            _YOLO_MODE_FROZEN
+            or is_current_session_yolo_enabled()
+            or approval_mode == "off"
+        )
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not is_package_acquisition and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -4799,6 +4996,23 @@ def check_all_command_guards(command: str, env_type: str,
         # HERMES_EXEC_ASK routes through the gateway decision loop (no human
         # either here) — ignore it so single_query_mode actually takes effect.
         is_ask = False
+
+    # A package install is executable supply-chain input. Without an attached
+    # owner there is nobody to verify package identity or provenance, so deny
+    # before cron/single-query auto-approve can bypass the boundary.
+    if is_package_acquisition and not (is_cli or is_gateway or is_ask):
+        return {
+            "approved": False,
+            "pattern_key": package_key,
+            "description": package_description,
+            "single_operation": True,
+            "allow_session": False,
+            "allow_permanent": False,
+            "message": (
+                f"BLOCKED: {package_description}. Package acquisition is denied "
+                "in unattended contexts without an attached owner."
+            ),
+        }
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -5062,7 +5276,11 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
-    if is_dangerous:
+    if is_package_acquisition:
+        # Package approval is never reusable, even when the same pattern was
+        # already approved for this session.
+        warnings.append((package_key, package_description, False))
+    elif is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
@@ -5071,11 +5289,10 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
-    # When approvals.mode=smart, ask the aux LLM before prompting the user.
-    # Inspired by OpenAI Codex's Smart Approvals guardian subagent
-    # (openai/codex#13860).
+    # Package acquisition never goes to the auxiliary LLM: only the owner may
+    # authorize a new executable supply-chain input.
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not is_package_acquisition:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -5130,6 +5347,7 @@ def check_all_command_guards(command: str, env_type: str,
     # correctly persist the pattern key and downgrade the tirith key to
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+    single_operation_for_owner = smart_denied_for_owner or is_package_acquisition
 
     # An explicitly selected plugin transport replaces every built-in prompt
     # surface (CLI/TUI/gateway/ACP). Detection, allowed scopes, persistence,
@@ -5142,8 +5360,8 @@ def check_all_command_guards(command: str, env_type: str,
         pattern_keys=all_keys,
         session_key=session_key,
         surface="gateway" if (is_gateway or is_ask) else "cli",
-        allow_session=not smart_denied_for_owner,
-        allow_permanent=has_permanent_capable and not smart_denied_for_owner,
+        allow_session=not single_operation_for_owner,
+        allow_permanent=has_permanent_capable and not single_operation_for_owner,
     )
     if transport_attempt.get("selected"):
         transport_failure = transport_attempt.get("failure")
@@ -5177,7 +5395,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": "denied",
                     "user_consent": False,
                 }
-            if not smart_denied_for_owner:
+            # One-operation approvals never persist, even if a stale transport
+            # returns a broader choice than it was offered.
+            if not single_operation_for_owner:
                 for key, _, is_tirith in warnings:
                     if transport_choice == "session" or (
                         transport_choice == "always" and is_tirith
@@ -5222,16 +5442,10 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": redact_sensitive_text(combined_desc),
-                # Smart DENY overrides are one-operation decisions, so the UI
-                # must not offer a permanent scope.  Otherwise offer Always
-                # whenever any dangerous-pattern warning can actually be
-                # persisted (pure-tirith prompts stay session-max).
-                "allow_permanent": has_permanent_capable and not smart_denied_for_owner,
-                # Session approval is safe for every non-Smart-DENY prompt —
-                # including pure-tirith ones, where the persistence layer
-                # already caps scope at session. Adapters use this to render
-                # a session tier independently of the permanent tier.
-                "allow_session": not smart_denied_for_owner,
+                # One-operation decisions must not offer broader scopes.
+                "allow_permanent": has_permanent_capable and not single_operation_for_owner,
+                "allow_session": not single_operation_for_owner,
+                "single_operation": single_operation_for_owner,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
@@ -5290,10 +5504,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "deny_reason": deny_reason,
                 }
 
-            # A smart-DENY owner override is always one operation, even if an
-            # older client returns "session" or "always". Manual and ESCALATE
-            # choices retain their existing persistence semantics.
-            if not smart_denied_for_owner:
+            # One-operation decisions never persist, even if an older client
+            # returns "session" or "always".
+            if not single_operation_for_owner:
                 for key, _, is_tirith in warnings:
                     if choice == "session" or (choice == "always" and is_tirith):
                         approve_session(session_key, key)
@@ -5330,8 +5543,14 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_keys": all_keys,
                 "description": _disp_combined_desc,
             }
+            if single_operation_for_owner:
+                pending_data.update(
+                    allow_permanent=False,
+                    allow_session=False,
+                    single_operation=True,
+                )
             if smart_denied_for_owner:
-                pending_data.update(smart_denied=True, allow_permanent=False)
+                pending_data["smart_denied"] = True
             submit_pending(session_key, pending_data)
             result = {
                 "approved": False,
@@ -5348,8 +5567,14 @@ def check_all_command_guards(command: str, env_type: str,
                     "is pending."
                 ),
             }
+            if single_operation_for_owner:
+                result.update(
+                    allow_permanent=False,
+                    allow_session=False,
+                    single_operation=True,
+                )
             if smart_denied_for_owner:
-                result.update(smart_denied=True, allow_permanent=False)
+                result["smart_denied"] = True
             return result
 
     # CLI interactive: single combined prompt
@@ -5366,7 +5591,8 @@ def check_all_command_guards(command: str, env_type: str,
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
-        allow_permanent=has_permanent_capable and not smart_denied_for_owner,
+        allow_permanent=has_permanent_capable and not single_operation_for_owner,
+        allow_session=not single_operation_for_owner,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
@@ -5418,9 +5644,8 @@ def check_all_command_guards(command: str, env_type: str,
             "user_consent": False,
         }
 
-    # Smart-DENY owner overrides are one-operation scoped. Preserve existing
-    # persistence for manual mode and smart ESCALATE.
-    if not smart_denied_for_owner:
+    # Exact owner approval does not create a reusable package bypass.
+    if not single_operation_for_owner:
         for key, _, is_tirith in warnings:
             if choice == "session" or (choice == "always" and is_tirith):
                 # tirith: session only (no permanent broad allowlisting)
