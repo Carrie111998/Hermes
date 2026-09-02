@@ -282,6 +282,23 @@ def derive_title(user_message: str) -> Optional[str]:
     return line or None
 
 
+def _is_truncated_structured_output(raw: str) -> bool:
+    """Return whether *raw* is truncated structured output rather than prose.
+
+    This is called only after strict JSON parsing and the loose ``"title"``
+    scan fail. Structural signatures avoid rejecting legitimate Markdown
+    emphasis or quoted prose titles.
+    """
+    if not raw:
+        return False
+    # An odd fence count means a Markdown code block was never closed.
+    if raw.count("```") % 2:
+        return True
+    # A leading object or array after failed parsing is incomplete structured
+    # output, including unquoted-key variants the loose scan cannot extract.
+    return raw.lstrip().startswith(("{", "["))
+
+
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
@@ -293,7 +310,9 @@ def _extract_title_text(content: str) -> str:
         return ""
     raw = content.strip()
     # Fenced JSON from providers that wrap structured output in markdown.
-    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+    fenced = re.match(
+        r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL | re.IGNORECASE
+    )
     if fenced:
         raw = fenced.group(1).strip()
     try:
@@ -309,6 +328,10 @@ def _extract_title_text(content: str) -> str:
             return json.loads(f'"{match.group(1)}"').strip()
         except ValueError:
             return match.group(1).strip()
+    # A low output-token cap can cut structured output before the closing
+    # quote, brace, or fence. Do not persist that fragment as a title.
+    if _is_truncated_structured_output(raw):
+        return ""
     # Prose fallback. Reuse the canonical scrubber so reasoning-model output
     # (<think>…) can't leak into a title, then keep the first real line.
     try:
