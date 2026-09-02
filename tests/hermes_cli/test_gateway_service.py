@@ -1,5 +1,7 @@
 """Tests for gateway service management helpers."""
 
+import contextlib
+import io
 import os
 import plistlib
 import subprocess
@@ -644,7 +646,7 @@ class TestLaunchdServiceRecovery:
     def test_refresh_returns_false_when_bootstrap_fails(self, tmp_path, monkeypatch):
         """When the in-process bootstrap exhausts retries without registering the
         service, refresh_launchd_plist_if_needed() must return False.
-        
+
         This ensures launchd_start() can distinguish success from failure and
         not skip the kickstart when the refresh failed.
         """
@@ -694,9 +696,14 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(gateway_cli.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(gateway_cli.time, "sleep", fake_sleep)
 
-        result = gateway_cli.refresh_launchd_plist_if_needed()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = gateway_cli.refresh_launchd_plist_if_needed()
+        output = buf.getvalue()
 
         assert result is False
+        assert "did not re-register" in output
+        assert "match the current Hermes install" not in output
         # Bootstrap was attempted and retried, but never registered a PID.
         bootstrap_calls = [c for c in run_calls if len(c) > 1 and c[1] == "bootstrap"]
         list_calls = [c for c in run_calls if c[:2] == ["launchctl", "list"]]
@@ -708,7 +715,7 @@ class TestLaunchdServiceRecovery:
     def test_launchd_start_skips_kickstart_after_successful_refresh(self, tmp_path, monkeypatch):
         """When refresh_launchd_plist_if_needed() succeeds, launchd_start() must
         skip the kickstart to avoid double-starting the gateway.
-        
+
         The plist config has RunAtLoad=true and KeepAlive=true, so launchd
         automatically starts the process when bootstrap registers the label.
         A subsequent kickstart would race a second instance into existence.

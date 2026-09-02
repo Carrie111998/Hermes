@@ -5752,10 +5752,15 @@ def refresh_launchd_plist_if_needed() -> bool:
             int(_reload_budget),
             _launchd_reload_log_path(),
         )
+        print(
+            "✗ Updated the launchd plist but the service did not re-register; "
+            f"see {_launchd_reload_log_path()}"
+        )
+        return False
     print(
         "↻ Updated gateway launchd service definition to match the current Hermes install"
     )
-    return bootstrap_succeeded
+    return True
 
 
 def launchd_install(force: bool = False):
