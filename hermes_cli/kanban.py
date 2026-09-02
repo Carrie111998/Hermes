@@ -423,7 +423,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Mark runtime-affecting work. Reviewer completion "
                                "then requires done QA/live-verification parents "
                                "plus commit and runtime_evidence metadata. Leave "
-                               "off for code-only changes.")
+                               "off for ordinary code-only changes.")
+    p_create.add_argument(
+        "--runtime-acceptance-parent",
+        action="append",
+        default=[],
+        help=(
+            "Explicit QA/live-verification parent task id. Repeat for multiple "
+            "parents; each id must also be passed with --parent."
+        ),
+    )
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -1694,6 +1703,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             requires_runtime_acceptance=bool(
                 getattr(args, "requires_runtime_acceptance", False)
+            ),
+            runtime_acceptance_parents=tuple(
+                getattr(args, "runtime_acceptance_parent", None) or ()
             ),
         )
         task = kb.get_task(conn, task_id)

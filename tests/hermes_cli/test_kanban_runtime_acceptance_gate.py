@@ -8,7 +8,7 @@ insufficient. A review card explicitly marked ``requires_runtime_acceptance``
 must be parent-gated on its explicit QA/live-verification card(s), and
 reviewer completion must fail closed unless:
 
-* every QA/live-verification parent is terminal (``done``/``archived``), and
+* every explicitly cited QA/live-verification parent is ``done``, and
 * the review handoff metadata cites the tested candidate ``commit`` plus
   ``runtime_evidence`` (a non-empty description of the production-like
   runtime run).
@@ -88,10 +88,24 @@ def test_set_runtime_acceptance_flag_roundtrip(conn) -> None:
     tid = kb.create_task(conn, title="later marked", assignee="coder")
     assert kb.set_requires_runtime_acceptance(conn, tid, True) is True
     assert kb.get_task(conn, tid).requires_runtime_acceptance is True
-    assert kb.set_requires_runtime_acceptance(conn, tid, False) is True
-    assert kb.get_task(conn, tid).requires_runtime_acceptance is False
+    with pytest.raises(RuntimeError, match="cannot clear requires_runtime_acceptance"):
+        kb.set_requires_runtime_acceptance(conn, tid, False)
+    current = kb.get_task(conn, tid)
+    assert current is not None
+    assert current.requires_runtime_acceptance is True
     with pytest.raises(ValueError):
         kb.set_requires_runtime_acceptance(conn, "t_missing000", True)
+
+
+def test_runtime_acceptance_marker_cannot_be_cleared_after_review_requested(
+    conn,
+) -> None:
+    impl, _review = _runtime_review_card(conn)
+
+    with pytest.raises(RuntimeError, match="cannot clear requires_runtime_acceptance"):
+        kb.set_requires_runtime_acceptance(conn, impl, False)
+
+    assert kb.get_task(conn, impl).requires_runtime_acceptance is True
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +153,16 @@ def test_premature_approval_blocked_when_qa_parent_not_done(conn) -> None:
         assignee="qa",
     )
     kb.link_tasks(conn, qa, impl)
+    kb.designate_runtime_acceptance_parents(conn, impl, [qa])
     assert kb.get_task(conn, qa).status == "ready"  # QA still open
 
+    metadata = dict(EVIDENCE)
+    metadata["runtime_acceptance_parents"] = [qa]
     assert not kb.complete_task(
         conn,
         impl,
         summary="Approved.",
-        metadata=dict(EVIDENCE),
+        metadata=metadata,
         expected_run_id=review.current_run_id,
     )
     assert kb.get_task(conn, impl).status in ("review", "running")
@@ -156,36 +173,73 @@ def test_premature_approval_blocked_when_qa_parent_not_done(conn) -> None:
     )
 
 
-def test_pinned_non_qa_parent_cannot_satisfy_gate(conn) -> None:
+def test_non_self_describing_explicit_parent_can_satisfy_gate(conn) -> None:
     impl, review = _runtime_review_card(conn)
-    ordinary = kb.create_task(conn, title="write release notes", assignee="writer")
-    kb.link_tasks(conn, ordinary, impl)
-    assert kb.complete_task(conn, ordinary, summary="Notes published.")
+    qa = kb.create_task(conn, title="candidate receipt", assignee="qa")
+    kb.link_tasks(conn, qa, impl)
+    kb.designate_runtime_acceptance_parents(conn, impl, [qa])
+    assert kb.complete_task(conn, qa, summary="Production-like runtime passed.")
 
     metadata = dict(EVIDENCE)
-    metadata["runtime_acceptance_parents"] = [ordinary]
-    assert not kb.complete_task(
+    metadata["runtime_acceptance_parents"] = [qa]
+    assert kb.complete_task(
         conn,
         impl,
         summary="Approved.",
         metadata=metadata,
         expected_run_id=review.current_run_id,
     )
-    events = kb.list_events(conn, impl)
-    blocked = [e for e in events if e.kind == "completion_blocked_runtime_acceptance"]
-    assert blocked and blocked[-1].payload is not None
-    assert "must describe QA/live verification" in blocked[-1].payload["reason"]
+    assert kb.get_task(conn, impl).status == "done"
 
 
-def test_qa_parent_can_be_identified_from_body(conn) -> None:
+def test_unrelated_done_parent_cannot_replace_designated_runtime_parent(conn) -> None:
     impl, review = _runtime_review_card(conn)
-    qa = kb.create_task(
-        conn,
-        title="release receipt",
-        body="Production-like live verification of the candidate runtime.",
-        assignee="qa",
-    )
+    qa = kb.create_task(conn, title="candidate receipt", assignee="qa")
+    unrelated = kb.create_task(conn, title="docs check", assignee="writer")
     kb.link_tasks(conn, qa, impl)
+    kb.link_tasks(conn, unrelated, impl)
+    kb.designate_runtime_acceptance_parents(conn, impl, [qa])
+    assert kb.complete_task(conn, qa, summary="Runtime passed.")
+    assert kb.complete_task(conn, unrelated, summary="Docs passed.")
+
+    metadata = dict(EVIDENCE)
+    metadata["runtime_acceptance_parents"] = [unrelated]
+    assert not kb.complete_task(
+        conn,
+        impl,
+        summary="Approved against wrong parent.",
+        metadata=metadata,
+        expected_run_id=review.current_run_id,
+    )
+
+
+
+def test_runtime_parent_designation_cannot_be_replaced_after_unlink(conn) -> None:
+    qa = kb.create_task(conn, title="candidate receipt")
+    replacement = kb.create_task(conn, title="unrelated done parent")
+    impl = kb.create_task(
+        conn,
+        title="runtime card",
+        parents=[qa, replacement],
+        requires_runtime_acceptance=True,
+        runtime_acceptance_parents=[qa],
+    )
+
+    assert kb.unlink_tasks(conn, qa, impl)
+    with pytest.raises(RuntimeError, match="already designated"):
+        kb.designate_runtime_acceptance_parents(conn, impl, [replacement])
+
+
+
+def test_prose_only_parent_cannot_satisfy_gate(conn) -> None:
+    impl, review = _runtime_review_card(conn)
+    prose_match = kb.create_task(
+        conn,
+        title="Verify changelog formatting",
+        assignee="writer",
+    )
+    kb.link_tasks(conn, prose_match, impl)
+    assert kb.complete_task(conn, prose_match, summary="Formatting checked.")
 
     assert not kb.complete_task(
         conn,
@@ -197,7 +251,7 @@ def test_qa_parent_can_be_identified_from_body(conn) -> None:
     events = kb.list_events(conn, impl)
     blocked = [e for e in events if e.kind == "completion_blocked_runtime_acceptance"]
     assert blocked and blocked[-1].payload is not None
-    assert "not done" in blocked[-1].payload["reason"]
+    assert "runtime_acceptance_parents" in blocked[-1].payload["reason"]
 
 
 def test_evidence_backed_completion_succeeds_after_qa_done(conn) -> None:
@@ -208,13 +262,16 @@ def test_evidence_backed_completion_succeeds_after_qa_done(conn) -> None:
         assignee="qa",
     )
     kb.link_tasks(conn, qa, impl)
+    kb.designate_runtime_acceptance_parents(conn, impl, [qa])
     assert kb.complete_task(conn, qa, summary="Live verification passed.")
 
+    metadata = dict(EVIDENCE)
+    metadata["runtime_acceptance_parents"] = [qa]
     assert kb.complete_task(
         conn,
         impl,
         summary="Approved with runtime evidence.",
-        metadata=dict(EVIDENCE),
+        metadata=metadata,
         expected_run_id=review.current_run_id,
     )
     assert kb.get_task(conn, impl).status == "done"
@@ -234,6 +291,7 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         assignee="qa",
     )
     kb.link_tasks(conn, qa, impl)
+    kb.designate_runtime_acceptance_parents(conn, impl, [qa])
     assert kb.complete_task(conn, qa, summary="Live verification passed.")
 
     # No metadata at all.
@@ -248,7 +306,7 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         conn,
         impl,
         summary="Approved.",
-        metadata={"commit": "abc123"},
+        metadata={"commit": "abc123", "runtime_acceptance_parents": [qa]},
         expected_run_id=review.current_run_id,
     )
     # Runtime evidence without a commit.
@@ -256,7 +314,10 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         conn,
         impl,
         summary="Approved.",
-        metadata={"runtime_evidence": EVIDENCE["runtime_evidence"]},
+        metadata={
+            "runtime_evidence": EVIDENCE["runtime_evidence"],
+            "runtime_acceptance_parents": [qa],
+        },
         expected_run_id=review.current_run_id,
     )
     # A non-hash label is not a candidate commit.
@@ -267,6 +328,7 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         metadata={
             "commit": "latest",
             "runtime_evidence": EVIDENCE["runtime_evidence"],
+            "runtime_acceptance_parents": [qa],
         },
         expected_run_id=review.current_run_id,
     )
@@ -277,7 +339,11 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         conn,
         impl,
         summary="Approved.",
-        metadata={"commit": "6a49d075dd", "runtime_evidence": mismatched},
+        metadata={
+            "commit": "6a49d075dd",
+            "runtime_evidence": mismatched,
+            "runtime_acceptance_parents": [qa],
+        },
         expected_run_id=review.current_run_id,
     )
     # Blank strings don't count.
@@ -285,7 +351,11 @@ def test_missing_commit_or_evidence_fails_closed(conn) -> None:
         conn,
         impl,
         summary="Approved.",
-        metadata={"commit": "  ", "runtime_evidence": "  "},
+        metadata={
+            "commit": "  ",
+            "runtime_evidence": "  ",
+            "runtime_acceptance_parents": [qa],
+        },
         expected_run_id=review.current_run_id,
     )
     assert kb.get_task(conn, impl).status in ("review", "running")
@@ -359,6 +429,99 @@ def test_unmarked_parent_does_not_gate_marked_child_contract(
 # ---------------------------------------------------------------------------
 
 
+def test_decompose_rejects_marked_runtime_parent_cycle(kanban_home) -> None:
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="triage me", triage=True)
+        children = [
+            {
+                "title": "review A",
+                "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [1],
+            },
+            {
+                "title": "review B",
+                "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [0],
+            },
+        ]
+        with pytest.raises(ValueError, match="cannot itself require runtime acceptance"):
+            kb.decompose_triage_task(
+                conn, root, root_assignee="orchestrator", children=children
+            )
+        root_task = kb.get_task(conn, root)
+        assert root_task is not None
+        assert root_task.status == "triage"
+
+
+@pytest.mark.parametrize("scalar_parent_owner", ["review", "runtime_parent"])
+@pytest.mark.parametrize("scalar_parent_value", [1, 0, False, ""])
+def test_decompose_rejects_scalar_parents_before_runtime_edge_normalization(
+    kanban_home,
+    scalar_parent_owner,
+    scalar_parent_value,
+) -> None:
+    review_parents = scalar_parent_value if scalar_parent_owner == "review" else []
+    qa_parents = scalar_parent_value if scalar_parent_owner == "runtime_parent" else []
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="triage me", triage=True)
+        children = [
+            {
+                "title": "review",
+                "assignee": "reviewer",
+                "parents": review_parents,
+                "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [1],
+            },
+            {
+                "title": "candidate receipt",
+                "assignee": "qa",
+                "parents": qa_parents,
+            },
+        ]
+        with pytest.raises(ValueError, match="parents must be a list"):
+            kb.decompose_triage_task(
+                conn, root, root_assignee="orchestrator", children=children
+            )
+
+
+def test_decompose_rejects_boolean_runtime_parent_index(kanban_home) -> None:
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="triage me", triage=True)
+        children = [
+            {
+                "title": "review",
+                "assignee": "reviewer",
+                "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [True],
+            },
+            {"title": "candidate receipt", "assignee": "qa"},
+        ]
+        with pytest.raises(ValueError, match="not a valid sibling index"):
+            kb.decompose_triage_task(
+                conn, root, root_assignee="orchestrator", children=children
+            )
+
+
+def test_decompose_validates_referenced_child_before_normalizing_runtime_edges(
+    kanban_home,
+) -> None:
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="triage me", triage=True)
+        children = [
+            {
+                "title": "review",
+                "assignee": "reviewer",
+                "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [1],
+            },
+            "not a child object",
+        ]
+        with pytest.raises(ValueError, match=r"child\[1\] is not a dict"):
+            kb.decompose_triage_task(
+                conn, root, root_assignee="orchestrator", children=children
+            )
+
+
 def test_decompose_preserves_marker_and_rejects_reviewer_before_qa(
     kanban_home,
 ) -> None:
@@ -369,8 +532,9 @@ def test_decompose_preserves_marker_and_rejects_reviewer_before_qa(
                 "title": "implement",
                 "assignee": "coder",
                 "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [1],
             },
-            {"title": "live-verify", "assignee": "qa", "parents": [0]},
+            {"title": "candidate receipt", "assignee": "qa", "parents": [0]},
         ]
         child_ids = kb.decompose_triage_task(
             conn, root, root_assignee="orchestrator", children=children
@@ -407,6 +571,7 @@ def test_decompose_links_marked_review_child_under_qa_child(
                 "title": "review PR",
                 "assignee": "reviewer",
                 "requires_runtime_acceptance": True,
+                "runtime_acceptance_parents": [0],
                 "parents": [0],
             },
         ]
@@ -489,16 +654,19 @@ def test_manual_done_on_marked_review_card_also_gated(kanban_home) -> None:
         # Backfill a QA parent as done + evidence → now it completes.
         qa = kb.create_task(conn, title="live verify", assignee="qa")
         kb.link_tasks(conn, qa, impl)
+        kb.designate_runtime_acceptance_parents(conn, impl, [qa])
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status = 'done', completed_at = ? "
                 "WHERE id = ?",
                 (int(__import__("time").time()), qa),
             )
+        metadata = dict(EVIDENCE)
+        metadata["runtime_acceptance_parents"] = [qa]
         assert kb.complete_task(
             conn,
             impl,
             summary="Manual approve with evidence.",
-            metadata=dict(EVIDENCE),
+            metadata=metadata,
         )
         assert kb.get_task(conn, impl).status == "done"

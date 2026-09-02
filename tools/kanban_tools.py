@@ -1401,6 +1401,11 @@ def _handle_create(args: dict, **kw) -> str:
     )
     if runtime_bool_error:
         return tool_error(runtime_bool_error)
+    runtime_acceptance_parents = args.get("runtime_acceptance_parents") or []
+    if isinstance(runtime_acceptance_parents, str):
+        runtime_acceptance_parents = [runtime_acceptance_parents]
+    if not isinstance(runtime_acceptance_parents, (list, tuple)):
+        return tool_error("runtime_acceptance_parents must be a list of task ids")
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -1469,6 +1474,7 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 requires_runtime_acceptance=requires_runtime_acceptance,
+                runtime_acceptance_parents=tuple(runtime_acceptance_parents),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2282,6 +2288,14 @@ KANBAN_CREATE_SCHEMA = {
                     "candidate commit plus production-like runtime_evidence. "
                     "Leave false for code-only changes; browser/UI evidence is "
                     "not globally required."
+                ),
+            },
+            "runtime_acceptance_parents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Explicit QA/live-verification parent task ids for a "
+                    "runtime-gated card. Every id must also appear in parents."
                 ),
             },
             "goal_mode": {
