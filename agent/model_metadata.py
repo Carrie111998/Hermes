@@ -3870,10 +3870,13 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     # time while ``reasoning`` holds the same text for trajectory storage —
     # counting both charged the same thinking twice and inflated the rough
     # estimate by up to +53% against provider-reported prompt_tokens
-    # (#84371 comment data, llama.cpp/Qwen). Keep ``reasoning`` only as the
-    # promotion proxy when no ``reasoning_content`` exists to displace it.
+    # (#84371 comment data, llama.cpp/Qwen). A string placeholder (including
+    # ``""`` or ``" "`` from legacy sessions) also enters policy case 1 and
+    # returns before promotion, so it displaces ``reasoning`` just as a
+    # non-empty value does (#99398). Keep ``reasoning`` only when there is no
+    # string ``reasoning_content`` to displace it.
     _rc = msg.get("reasoning_content")
-    drop_reasoning_dup = isinstance(_rc, str) and bool(_rc.strip())
+    drop_reasoning_dup = isinstance(_rc, str)
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
