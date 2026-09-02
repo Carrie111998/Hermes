@@ -19514,9 +19514,26 @@ def _is_serve_orphaned(
     try:
         if expected_start_marker is not None:
             probe = process_start_marker or _process_start_marker
-            return not _parent_start_markers_match(
-                probe(int(desktop_pid)), expected_start_marker
-            )
+            actual_marker = probe(int(desktop_pid))
+            if _parent_start_markers_match(actual_marker, expected_start_marker):
+                return False
+            if actual_marker.startswith("ps:") and expected_start_marker.startswith("ps:"):
+                # `ps -o lstart=` is a timezone/locale-rendered wall-clock
+                # string (macOS's only marker format -- no /proc stat or
+                # Win32 GetProcessTimes equivalent). The SAME process
+                # instant renders differently before/after a TZ change
+                # while the Electron parent stays alive uninterrupted, so
+                # a mismatch here is not proof the parent died -- it's
+                # exactly the "inconclusive" case this function's own
+                # docstring already promises to keep serving through.
+                # Degrade to the PID-only check rather than exiting
+                # (issue #95693).
+                if pid_exists is None:
+                    from gateway.status import _pid_exists
+
+                    pid_exists = _pid_exists
+                return not bool(pid_exists(int(desktop_pid)))
+            return True
 
         if pid_exists is None:
             from gateway.status import _pid_exists
@@ -19568,6 +19585,15 @@ def _start_parent_death_watchdog() -> None:
     def _loop() -> None:
         while not _is_serve_orphaned(desktop_pid, start_marker):
             time.sleep(poll)
+        try:
+            _log.warning(
+                "Parent-death watchdog: desktop PID %s appears orphaned "
+                "(expected_start_marker=%r); exiting.",
+                desktop_pid,
+                start_marker,
+            )
+        except Exception:
+            pass
         os._exit(0)
 
     threading.Thread(target=_loop, daemon=True, name="serve-parent-watchdog").start()
