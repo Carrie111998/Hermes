@@ -765,7 +765,23 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            # This fires from a background thread while prompt_toolkit owns
+            # the terminal (raw mode). Writing Rich's SGR bytes straight to
+            # stdout there races PT's renderer and the ESC bytes get mangled
+            # into literal '?' on screen (#95968). Render the SAME markup to
+            # an ANSI string, then emit it through cprint — prompt_toolkit's
+            # print_formatted_text — which serializes with the live prompt.
+            import io
+            from rich.console import Console as _ANSIConsole
+            buf = io.StringIO()
+            ansi_console = _ANSIConsole(
+                file=buf,
+                force_terminal=True,
+                color_system="truecolor",
+                width=console.width,
+            )
+            ansi_console.print(_format_update_notice(behind))
+            cprint(buf.getvalue().rstrip("\n"))
         except Exception:
             pass  # never break the session over an update notice
 
