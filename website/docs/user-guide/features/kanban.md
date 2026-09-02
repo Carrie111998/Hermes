@@ -256,6 +256,41 @@ hermes kanban create "nightly ops review" \
     --json
 ```
 
+`--json` prints the full task object plus one extra field, `disposition`,
+telling you which of the two happened:
+
+| `disposition` | Meaning |
+|---|---|
+| `created` | This call inserted the row. |
+| `existing` | A task with the same `--idempotency-key` was already on the board; you got its id back and nothing was inserted. |
+
+Abridged response:
+
+```json
+{
+  "id": "t_9f3c1a20",
+  "title": "nightly ops review",
+  "status": "ready",
+  "assignee": "ops",
+  "disposition": "existing"
+}
+```
+
+The actual response retains every existing task field; only `disposition` is
+added. Read the field rather than inferring from `created_at` or `status` — a
+re-run within the same second is indistinguishable from a fresh insert by
+timestamp. The value comes from the database branch that produced the id,
+so concurrent callers sharing one key see exactly one `created` and the
+rest `existing`, all pointing at the same task.
+
+Dedup ignores **archived** tasks: archiving retires a key, so the next
+create with that key reports `created` and starts a new task. Every other
+status (`ready`, `running`, `done`, …) still dedups.
+
+Without `--json` the output line is unchanged (`Created t_9f3c1a20  (ready,
+assignee=ops)`) for both dispositions — scripts that need the distinction
+should ask for `--json`.
+
 ### Bulk CLI verbs
 
 All the lifecycle verbs accept multiple ids so you can clean up a batch
