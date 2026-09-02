@@ -724,42 +724,40 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Probe failure must never block prompt build.
             pass
 
-    # Bot Mode teammate protocol — injected ONLY into a bot's canonical
-    # "Bot Chat" session (the conversation teammate bots message into via
-    # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), on
-    # installs where Bot Mode manages profiles (ui_meta['hermes-bots']).
-    # Regular sessions never carry it — the desktop's composer middleware
-    # owns the @mention send path. Title is read once at first build and the
-    # rendered prompt is cached + DB-restored, so this is cache-safe.
-    # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
-    if getattr(agent, "_bot_mode_protocol", True):
-        try:
-            from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
-                epoch_line,
-                get_bot_mode_protocol_section,
-            )
-            _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-            if not _title:
-                _sdb = getattr(agent, "_session_db", None)
-                _sid = getattr(agent, "session_id", None)
-                _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
-            if _title == BOT_CHAT_TITLE:
-                _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
-                if _bot_section:
-                    post_workspace_parts.append(_bot_section)
-                    # Eternal-session support: stamp the capability epoch so
-                    # the restore path can detect user-initiated capability
-                    # changes (skills/toolsets/MCP/SOUL/roster) and rebuild
-                    # ONCE per change instead of waiting for /new or
-                    # compression. Also marks this prompt as timeless — the
-                    # volatile timestamp line is omitted (see below), since a
-                    # birth date pinned in a session that lives for months is
-                    # misinformation.
-                    post_workspace_parts.append(epoch_line(_agent_home(agent)))
-                    agent._bot_chat_timeless_prompt = True
-        except Exception:
-            pass
+    # Bot Mode teammate protocol — injected ONLY into routed Bot Mode
+    # sessions (bot_mode_probe.bot_mode_session_state): a bot's canonical
+    # "Bot Chat" (the conversation teammate bots message into via
+    # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), or
+    # a classified human messaging chat (Discord, Telegram, ...) routed to a
+    # real profile in a Bot-Mode-participating install — so a bot can route
+    # teammates from its chats, not only from its Bot Chat. All other sessions
+    # never carry it — the
+    # desktop's composer middleware owns the @mention send path. Title and
+    # platform are read once at first build and the rendered prompt is
+    # cached + DB-restored, so this is cache-safe.
+    # Config participation is resolved inside the shared frozen state.
+    try:
+        from tools.bot_mode_probe import (
+            bot_mode_session_state,
+            epoch_line,
+            get_bot_mode_protocol_section,
+        )
+        if bot_mode_session_state(agent)["session_kind"]:
+            _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
+            if _bot_section:
+                post_workspace_parts.append(_bot_section)
+                # Eternal-session support: stamp the capability epoch so
+                # the restore path can detect user-initiated capability
+                # changes (skills/toolsets/MCP/SOUL/roster) and rebuild
+                # ONCE per change instead of waiting for /new or
+                # compression. Also marks this prompt as timeless — the
+                # volatile timestamp line is omitted (see below), since a
+                # birth date pinned in a session that lives for months is
+                # misinformation.
+                post_workspace_parts.append(epoch_line(_agent_home(agent)))
+                agent._bot_chat_timeless_prompt = True
+    except Exception:
+        pass
 
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
