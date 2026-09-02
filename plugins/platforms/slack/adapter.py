@@ -3838,8 +3838,53 @@ class SlackAdapter(BasePlatformAdapter):
             return "none"
         return value
 
+    def _slack_api_human_allowlists(self) -> tuple:
+        """Return (user_ids, app_ids) whose Web-API posts count as human.
+
+        Messages posted through the Web API with a *user* token carry the
+        posting app's ``bot_id``/``app_id`` even though the author is a real
+        person — Slack stamps every API post with the app that made it.
+        Operators running their own front-ends on top of Hermes (an internal
+        dashboard, a mobile shell) can allowlist those senders here so their
+        posts are not dropped as bot traffic. Configured via
+        ``platforms.slack.extra.api_human_users`` / ``.api_human_apps`` or the
+        ``SLACK_API_HUMAN_USERS`` / ``SLACK_API_HUMAN_APPS`` env vars
+        (comma-separated; the config keys win when both are set).
+        """
+
+        def _parse(value) -> set:
+            if value is None:
+                return set()
+            if isinstance(value, (list, tuple, set)):
+                return {str(v).strip() for v in value if str(v).strip()}
+            return {p.strip() for p in str(value).split(",") if p.strip()}
+
+        users = self.config.extra.get("api_human_users")
+        if users is None:
+            users = os.getenv("SLACK_API_HUMAN_USERS", "")
+        apps = self.config.extra.get("api_human_apps")
+        if apps is None:
+            apps = os.getenv("SLACK_API_HUMAN_APPS", "")
+        return _parse(users), _parse(apps)
+
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
+        # Allowlisted Web-API posts from real users are human, not bot,
+        # traffic (see _slack_api_human_allowlists). Scoped to events that
+        # name a real user and are not subtype=bot_message, so genuine bot
+        # posts (which carry no ``user``) can never match.
+        sender_user = event.get("user")
+        if sender_user and event.get("subtype") != "bot_message":
+            allow_users, allow_apps = self._slack_api_human_allowlists()
+            if sender_user in allow_users or (
+                event.get("app_id") and event.get("app_id") in allow_apps
+            ):
+                logger.info(
+                    "[Slack] Treating API-posted message as human: user=%s app=%s",
+                    sender_user,
+                    event.get("app_id"),
+                )
+                return False
         if event.get("bot_id") or event.get("bot_profile"):
             return True
         if event.get("subtype") == "bot_message":
@@ -9830,6 +9875,15 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         ).lower()
     if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
         os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+    for _key, _env in (
+        ("api_human_users", "SLACK_API_HUMAN_USERS"),
+        ("api_human_apps", "SLACK_API_HUMAN_APPS"),
+    ):
+        _val = slack_cfg.get(_key)
+        if _val is not None and not os.getenv(_env):
+            if isinstance(_val, (list, tuple, set)):
+                _val = ",".join(str(v) for v in _val)
+            os.environ[_env] = str(_val)
     frc = slack_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):

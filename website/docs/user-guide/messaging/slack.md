@@ -472,6 +472,7 @@ platforms:
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
 | `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
 | `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts a bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all of them. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
+| `platforms.slack.extra.api_human_users` / `.api_human_apps` | *(empty)* | Comma-separated Slack user IDs / app IDs whose **Web-API posts count as human**. Posts made with a *user* token still carry the posting app's `bot_id`/`app_id`, so by default they are dropped as bot traffic; allowlist your own front-end here instead of reaching for `allow_bots: all`. See [Treating your own app's user-token posts as human](#treating-your-own-apps-user-token-posts-as-human-api_human_users). |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
 The equivalent environment variable is `SLACK_ALLOW_BOTS=none|mentions|all`.
@@ -700,6 +701,43 @@ How `mentions` mode gates:
 `mentions` is the recommended mode for bot-to-bot collaboration: each agent must explicitly summon the other per turn. Avoid `all` unless every peer bot's own reply policy is loop-safe — two bots that answer everything will answer each other forever. Detection covers labeled bot messages (`bot_id`, `subtype: bot_message`), app-originated events, and unlabeled bot *users* (probed via `users.info`), so peer Hermes agents are filtered consistently across workspaces.
 
 For strict multi-bot deployments, pair with `require_mention: true` and `strict_mention: true` — see the smoke-check profile below.
+
+### Treating your own app's user-token posts as human (`api_human_users`)
+
+A message posted through the Web API with a **user token** (`xoxp-`) is
+authored by a real person, but Slack still stamps it with the posting app's
+`bot_id`/`app_id` — so Hermes's bot-sender detection drops it like any other
+app post. This blocks a common pattern: a custom front-end (an internal
+dashboard, a mobile shell, a kiosk) that sends messages to Hermes *as* the
+logged-in user.
+
+`allow_bots: all` would let those posts through, but it opens the door to every
+bot in the channel and weakens the loop protections. Instead, allowlist just
+your own senders:
+
+```yaml
+platforms:
+  slack:
+    extra:
+      # Slack user IDs whose API posts are treated as human-authored
+      api_human_users: "U0AAAAAAA,U0BBBBBBB"
+      # ...or trust every user posting through this app ID
+      api_human_apps: "A0CCCCCCC"
+```
+
+Env equivalents: `SLACK_API_HUMAN_USERS` / `SLACK_API_HUMAN_APPS`
+(comma-separated; the config keys win when both are set).
+
+Scope and safety:
+
+- Only events that carry a real `user` id and are **not** `subtype:
+  bot_message` can match — classic bot posts carry no `user`, so a peer bot
+  can never ride this allowlist.
+- The rest of the pipeline is unchanged: mention gating, `allowed_channels`,
+  and `SLACK_ALLOWED_USERS` still apply to the (now human) sender.
+- Prefer `api_human_users` when a fixed set of people uses the front-end;
+  use `api_human_apps` when the app manages its own logins and any workspace
+  member may post through it.
 
 ### Reaction Triggers (`reaction_triggers`)
 
