@@ -192,6 +192,35 @@ def test_find_fallback_prunes_protected_directories(tmp_path, monkeypatch):
         assert "-prune" in command
 
 
+def test_bsd_find_fallback_prints_only_the_keep_branch(tmp_path, monkeypatch):
+    """BSD find default-prints prune matches unless the keep side has -print.
+
+    The GNU command uses -printf (an action). When that fails, the fallback
+    had no action, so macOS find printed ~/Downloads as a search hit.
+    """
+    home = tmp_path / "Users" / "alice"
+    home.mkdir(parents=True)
+    env = RecordingEnvironment(home)
+    ops = ShellFileOperations(env)
+    monkeypatch.setattr(file_operations, "_HOME", str(home))
+    monkeypatch.setattr(file_operations.sys, "platform", "darwin")
+    monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
+
+    result = ops.search("*.txt", path=str(home), target="files")
+
+    bsd = [
+        command
+        for command in env.commands
+        if command.startswith("find ") and "-printf" not in command
+    ]
+    assert bsd
+    for command in bsd:
+        assert "-print" in command
+        assert "-prune" in command
+    assert result.warning is not None
+    assert "Downloads" in result.warning
+
+
 def test_real_ripgrep_does_not_descend_into_protected_folder(tmp_path, monkeypatch):
     home = tmp_path / "Users" / "alice"
     safe = home / "safe"

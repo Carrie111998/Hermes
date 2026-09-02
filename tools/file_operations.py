@@ -3557,8 +3557,16 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
-                        f"2>/dev/null | sort -rn{pagination_expr}"
+            # -print on the keep side is required: BSD find (macOS) has no
+            # -printf, so without an action it default-prints every path for
+            # which the whole expression is true. The prune clause is true
+            # for the protected dir itself, so ~/Downloads would land in
+            # results while the warning claimed it was skipped.
+            cmd_simple = (
+                f"find {self._escape_shell_arg(path)}{prune_expr}"
+                f"{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} "
+                f"-print 2>/dev/null | sort -rn{pagination_expr}"
+            )
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
 
