@@ -54,7 +54,9 @@ _MOA_PHONE_RE = re.compile(
 )
 
 
-def _redact_reference_text(text: Any) -> Any:
+def _redact_reference_text(
+    text: Any, *, redact_url_credentials: bool = False
+) -> Any:
     """Redact secrets + PII from one advisor/reference text surface.
 
     Centralized secret shapes first (force=True: the MoA privacy filter is
@@ -67,7 +69,12 @@ def _redact_reference_text(text: Any) -> Any:
         return text
     from agent.redact import redact_sensitive_text
 
-    text = redact_sensitive_text(text, force=True, code_file=True)
+    text = redact_sensitive_text(
+        text,
+        force=True,
+        code_file=True,
+        redact_url_credentials=redact_url_credentials,
+    )
     text = _MOA_EMAIL_RE.sub("[redacted email]", text)
     text = _MOA_PHONE_RE.sub("[redacted phone]", text)
     return text
@@ -83,6 +90,8 @@ def _moa_privacy_mode(moa_raw: Any) -> str:
 
 def _redact_reference_outputs(
     reference_outputs: list[tuple[str, str, Any]],
+    *,
+    redact_url_credentials: bool = False,
 ) -> list[tuple[str, str, Any]]:
     """Return reference-output tuples with their advisor text redacted.
 
@@ -92,12 +101,20 @@ def _redact_reference_outputs(
     accounting objects untouched.
     """
     return [
-        (label, _redact_reference_text(text), acct)
+        (
+            label,
+            _redact_reference_text(
+                text, redact_url_credentials=redact_url_credentials
+            ),
+            acct,
+        )
         for label, text, acct in reference_outputs
     ]
 
 
-def _redact_trace_messages(messages: Any) -> Any:
+def _redact_trace_messages(
+    messages: Any, *, redact_url_credentials: bool = False
+) -> Any:
     """Redact message copies destined for trace persistence.
 
     Handles both string content and structured content-part lists (e.g.
@@ -112,13 +129,27 @@ def _redact_trace_messages(messages: Any) -> Any:
             continue
         content = m.get("content")
         if isinstance(content, str):
-            out.append({**m, "content": _redact_reference_text(content)})
+            out.append(
+                {
+                    **m,
+                    "content": _redact_reference_text(
+                        content,
+                        redact_url_credentials=redact_url_credentials,
+                    ),
+                }
+            )
         elif isinstance(content, list):
             out.append(
                 {
                     **m,
                     "content": [
-                        {**p, "text": _redact_reference_text(p.get("text"))}
+                        {
+                            **p,
+                            "text": _redact_reference_text(
+                                p.get("text"),
+                                redact_url_credentials=redact_url_credentials,
+                            ),
+                        }
                         if isinstance(p, dict) and isinstance(p.get("text"), str)
                         else p
                         for p in content
@@ -130,7 +161,9 @@ def _redact_trace_messages(messages: Any) -> Any:
     return out
 
 
-def _redact_trace_accounting(acct: Any) -> Any:
+def _redact_trace_accounting(
+    acct: Any, *, redact_url_credentials: bool = False
+) -> Any:
     """Return a copy of a ``_RefAccounting`` with its trace text redacted.
 
     Traces persist the advisor's FULL input messages and output to disk, so a
@@ -144,8 +177,12 @@ def _redact_trace_accounting(acct: Any) -> Any:
         acct.cost_usd,
         acct.cost_status,
         acct.cost_source,
-        messages=_redact_trace_messages(acct.messages),
-        output=_redact_reference_text(acct.output),
+        messages=_redact_trace_messages(
+            acct.messages, redact_url_credentials=redact_url_credentials
+        ),
+        output=_redact_reference_text(
+            acct.output, redact_url_credentials=redact_url_credentials
+        ),
         model=acct.model,
         provider=acct.provider,
         temperature=acct.temperature,
@@ -1159,6 +1196,45 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rendered
 
 
+def _current_turn_reference_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return exactly the latest real user turn from the raw transcript.
+
+    Unlike ``_reference_messages``, this deliberately excludes every prior
+    assistant/tool frame. Structured image-only content becomes the same text
+    placeholder used by the legacy conversation view, while empty text gets a
+    distinct non-empty placeholder so strict advisor providers do not reject
+    the request. Binary/base64 payloads never reach advisors.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        text = flatten_message_text(content)
+        if not text.strip() and isinstance(content, list) and content:
+            text = "[user sent non-text content (e.g. an image attachment)]"
+        elif not text.strip():
+            text = "[user sent an empty message]"
+        return [{"role": "user", "content": text}]
+    return []
+
+
+def _redact_reference_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Redact advisor-input text on a copy before any provider call."""
+    return [
+        {
+            **message,
+            "content": _redact_reference_text(
+                message.get("content"), redact_url_credentials=True
+            ),
+        }
+        for message in messages
+    ]
+
+
 
 def _extract_text(response: Any) -> str:
     try:
@@ -1247,6 +1323,8 @@ def aggregate_moa_context(
     reference_max_tokens: int | None = None,
     reference_timeout: float | None = None,
     degraded_reference_policy: str = "loud",
+    reference_input_scope: str | None = None,
+    reference_input_filter: str | None = None,
     agent: Any = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
@@ -1271,9 +1349,42 @@ def aggregate_moa_context(
     ``agent``, when passed, lets the reference fan-out be aborted early on a
     user interrupt — see ``_run_references_parallel``'s docstring.
     """
+    from hermes_cli.moa_config import (
+        _coerce_reference_input_filter,
+        _coerce_reference_input_scope,
+        resolve_moa_preset,
+    )
+
+    # One live read serves both the legacy privacy toggle and the compatibility
+    # fallback below. Explicit one-shot preset kwargs remain authoritative.
+    try:
+        from hermes_cli.config import load_config as _load_moa_config
+
+        live_moa_raw = (_load_moa_config() or {}).get("moa") or {}
+    except Exception:  # pragma: no cover - config fallback must fail open
+        live_moa_raw = {}
+    fallback_preset: dict[str, Any] = {}
+    if reference_input_scope is None or reference_input_filter is None:
+        try:
+            fallback_preset = resolve_moa_preset(live_moa_raw)
+        except Exception:  # pragma: no cover - invalid reads keep legacy defaults
+            fallback_preset = {}
+    if reference_input_scope is None:
+        reference_input_scope = fallback_preset.get("reference_input_scope")
+    if reference_input_filter is None:
+        reference_input_filter = fallback_preset.get("reference_input_filter")
+    input_scope = _coerce_reference_input_scope(reference_input_scope)
+    input_filter = _coerce_reference_input_filter(reference_input_filter)
+
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
     reference_outputs: list[tuple[str, str, Any]] = []
-    ref_messages = _reference_messages(api_messages)
+    ref_messages = (
+        _current_turn_reference_messages(api_messages)
+        if input_scope == "current_turn"
+        else _reference_messages(api_messages)
+    )
+    if input_filter == "redact":
+        ref_messages = _redact_reference_messages(ref_messages)
     reference_outputs = _run_references_parallel(
         reference_models,
         ref_messages,
@@ -1293,10 +1404,10 @@ def aggregate_moa_context(
     # runs on the successful outputs only (failed refs are already filtered
     # into the degraded notice).
     try:
-        from hermes_cli.config import load_config as _load_config
-
-        if _moa_privacy_mode((_load_config() or {}).get("moa")) == "full":
-            successful_outputs = _redact_reference_outputs(successful_outputs)
+        if _moa_privacy_mode(live_moa_raw) == "full":
+            successful_outputs = _redact_reference_outputs(
+                successful_outputs, redact_url_credentials=True
+            )
     except Exception:  # pragma: no cover - privacy filter must never break a turn
         logger.debug("MoA privacy filter check failed", exc_info=True)
 
@@ -1999,7 +2110,33 @@ class MoAChatCompletions:
         from agent.usage_pricing import CanonicalUsage
 
         reference_outputs: list[tuple[str, str, Any]] = []
+        # Keep the legacy rendered conversation as the primary cache/cadence
+        # signature source. Scope/filter only shape the disposable provider
+        # payload, so distinct text states never collide after redaction. The
+        # rendered view deliberately drops empty user messages, though, so the
+        # raw user-turn count (excluding the advisory marker) is folded into
+        # every hash below to ensure a new empty turn cannot reuse the prior
+        # turn's advisor output.
         ref_messages = _reference_messages(messages)
+        raw_user_turn_count = sum(
+            1
+            for message in messages
+            if message.get("role") == "user"
+            and flatten_message_text(message.get("content")) != _ADVISORY_INSTRUCTION
+        )
+        reference_input_scope = str(
+            preset.get("reference_input_scope") or "conversation"
+        ).strip().lower()
+        reference_input_filter = str(
+            preset.get("reference_input_filter") or "none"
+        ).strip().lower()
+        advisor_messages = (
+            _current_turn_reference_messages(messages)
+            if reference_input_scope == "current_turn"
+            else list(ref_messages)
+        )
+        if reference_input_filter == "redact":
+            advisor_messages = _redact_reference_messages(advisor_messages)
 
         # Fan-out cadence. "user_turn" (default — cheapest cadence, #67199):
         # advisors run ONCE per user turn; subsequent tool iterations reuse
@@ -2055,7 +2192,10 @@ class MoAChatCompletions:
         def _hash_messages(msgs: list[dict[str, Any]]) -> str:
             return hashlib.sha256(
                 "\u0000".join(
-                    f"{m.get('role')}:{m.get('content')}" for m in msgs
+                    [
+                        *(f"{m.get('role')}:{m.get('content')}" for m in msgs),
+                        f"raw_user_turn_count:{raw_user_turn_count}",
+                    ]
                 ).encode("utf-8", "replace")
             ).hexdigest()
 
@@ -2125,7 +2265,7 @@ class MoAChatCompletions:
 
             reference_outputs = _run_references_parallel(
                 reference_models,
-                ref_messages,
+                advisor_messages,
                 temperature=temperature,
                 max_tokens=reference_max_tokens,
                 progress_callback=_progress,
@@ -2184,8 +2324,19 @@ class MoAChatCompletions:
             # privacy mode ('display' or 'full') redacts the advisor text and
             # the full per-advisor input/output carried by _RefAccounting.
             if privacy_mode:
+                _strict_output_privacy = privacy_mode == "full"
                 _trace_refs = [
-                    (label, _redact_reference_text(text), _redact_trace_accounting(acct))
+                    (
+                        label,
+                        _redact_reference_text(
+                            text,
+                            redact_url_credentials=_strict_output_privacy,
+                        ),
+                        _redact_trace_accounting(
+                            acct,
+                            redact_url_credentials=_strict_output_privacy,
+                        ),
+                    )
                     for label, text, acct in reference_outputs
                 ]
             else:
@@ -2225,7 +2376,14 @@ class MoAChatCompletions:
                     index=_idx,
                     count=_ref_count,
                     label=_label,
-                    text=_redact_reference_text(_text) if privacy_mode else _text,
+                    text=(
+                        _redact_reference_text(
+                            _text,
+                            redact_url_credentials=privacy_mode == "full",
+                        )
+                        if privacy_mode
+                        else _text
+                    ),
                 )
             if _ref_count:
                 # Phase transition: reference fan-out is complete, the
@@ -2260,7 +2418,9 @@ class MoAChatCompletions:
             # refs are already filtered out; only successful advisor text is
             # joined (and redacted when requested).
             _agg_refs = (
-                _redact_reference_outputs(successful_outputs)
+                _redact_reference_outputs(
+                    successful_outputs, redact_url_credentials=True
+                )
                 if privacy_mode == "full"
                 else successful_outputs
             )
