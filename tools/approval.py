@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -74,6 +74,21 @@ _approval_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 # single-threaded CLI callers that still export HERMES_INTERACTIVE.
 _hermes_interactive_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "hermes_interactive",
+    default=None,
+)
+
+# Per-session CLI approval callback. The CLI registers its prompt_toolkit
+# approval panel on the agent thread (cli.py run_agent), but MCP elicitation
+# consent runs on the MCP background loop's worker threads (tools/mcp_tool.py
+# ``_mcp_loop`` + ``asyncio.to_thread``). A thread-local slot cannot cross that
+# gap, so the callback is also carried in a contextvar: the elicitation handler
+# replays the captured tool-call context (``owner._pending_call_context``) via
+# ``contextvars.Context.run``, which restores this value on the worker thread.
+# ``None`` = unset → no interactive panel available → the elicitation consent
+# path fails closed (mirrors ``tools.terminal_tool._callback_tls`` semantics,
+# GHSA-qg5c-hvr5-hjgr, but scoped to the session context instead of a thread).
+_cli_approval_callback: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "cli_approval_callback",
     default=None,
 )
 
@@ -350,16 +365,38 @@ def _is_gateway_approval_context() -> bool:
 def _resolve_cli_approval_callback(approval_callback=None):
     """Return an interactive CLI approval callback when one is available.
 
-    Prefers an explicitly passed callback, then the per-thread CLI callback
-    registered via ``tools.terminal_tool.set_approval_callback``.
+    Prefers an explicitly passed callback, then the per-context callback
+    carried in ``_cli_approval_callback`` (set on the CLI agent thread and
+    replayed across the MCP thread hop via ``contextvars.Context.run``), then
+    the per-thread CLI callback registered via
+    ``tools.terminal_tool.set_approval_callback``.
     """
     if approval_callback is not None:
         return approval_callback
+    ctx_cb = _cli_approval_callback.get()
+    if ctx_cb is not None:
+        return ctx_cb
     try:
         from tools.terminal_tool import _get_approval_callback
         return _get_approval_callback()
     except Exception:
         return None
+
+
+def set_cli_approval_callback(cb) -> contextvars.Token:
+    """Register the CLI approval callback for the current context.
+
+    Mirrors ``tools.terminal_tool.set_approval_callback`` (thread-local) but
+    carries the callback in ``_cli_approval_callback`` so it survives the
+    thread hop into the MCP elicitation consent path. Returns a
+    ``contextvars.Token``; callers should ``reset()`` it when the session ends.
+    """
+    return _cli_approval_callback.set(cb)
+
+
+def reset_cli_approval_callback(token: contextvars.Token) -> None:
+    """Restore the prior CLI approval callback context."""
+    _cli_approval_callback.reset(token)
 
 
 def _should_fall_through_to_cli_approval(
@@ -5944,13 +5981,18 @@ def request_elicitation_consent(
         return "decline"
 
     # CLI / TUI path. allow_permanent=False because elicitation is a
-    # per-call confirmation — there is no pattern to remember.
+    # per-call confirmation — there is no pattern to remember. Resolve the
+    # CLI approval callback explicitly: without it the prompt_toolkit guard
+    # in _prompt_dangerous_approval_inner fail-closes with an invisible
+    # "deny" on interactive surfaces (#94488).
     try:
+        callback = _resolve_cli_approval_callback()
         choice = prompt_dangerous_approval(
             message,
             description,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            approval_callback=callback,
         )
     except Exception as exc:
         logger.error(

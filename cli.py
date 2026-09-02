@@ -17236,6 +17236,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     set_secret_capture_callback(self._secret_capture_callback)
                 except Exception:
                     pass
+                # Also carry the CLI approval callback in a contextvar so the
+                # MCP elicitation consent path (which runs on the MCP background
+                # loop's worker threads, not this agent thread) can still surface
+                # the prompt_toolkit approval panel. Without it the elicitation
+                # prompt fail-closes with an invisible deny (#94488).
+                try:
+                    from tools.approval import set_cli_approval_callback
+                    _cli_approval_token = set_cli_approval_callback(self._approval_callback)
+                except Exception:
+                    _cli_approval_token = None
                 # Bind this turn's approval session key into the contextvar so
                 # ``tools.approval.is_current_session_yolo_enabled()`` resolves
                 # against the same key that ``/yolo`` toggles under (see
@@ -17341,6 +17351,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if _approval_session_token is not None and reset_current_session_key is not None:
                         try:
                             reset_current_session_key(_approval_session_token)
+                        except Exception:
+                            pass
+                    if _cli_approval_token is not None:
+                        try:
+                            from tools.approval import reset_cli_approval_callback
+                            reset_cli_approval_callback(_cli_approval_token)
                         except Exception:
                             pass
 
