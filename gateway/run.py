@@ -3690,12 +3690,15 @@ def _build_document_context_note(
     mtype: str,
     *,
     content_inlined: bool = True,
+    filename_requires_path_only: bool = False,
 ) -> str:
     """Context note prepended to a user turn when they attach a document.
 
     Text documents (``text/*``) are usually inlined upstream by the platform
     adapter. ``content_inlined=False`` records adapters that cache the file
     without injecting its content, so the note tells the agent to read it.
+    Discord credential-like filenames are explicitly marked path-only, so
+    their note must not claim that a body is present.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
     must tell the agent to *extract* the text itself before answering — earlier
@@ -3703,6 +3706,14 @@ def _build_document_context_note(
     model into punting back to the user, which is why attached PDFs/DOCX looked
     "unreadable" to the agent even though it has the tools to read them.
     """
+    if filename_requires_path_only:
+        return (
+            f"[The user sent a file attachment: '{display_name}'. "
+            f"It is saved at: {agent_path}. Its content was not automatically "
+            f"inlined because the filename indicates it may contain credentials "
+            f"or a private key. Read the saved file only if the user's request "
+            f"requires it.]"
+        )
     if mtype.startswith("text/") and content_inlined:
         return (
             f"[The user sent a text document: '{display_name}'. "
@@ -20712,6 +20723,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.credential_files import to_agent_visible_cache_path
 
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
+            _path_only_attachment_paths = set(
+                (getattr(event, "metadata", None) or {}).get(
+                    "discord_path_only_attachment_paths", []
+                )
+            )
             for i, path in enumerate(event.media_urls):
                 # Per-attachment document handling. Skip anything already routed
                 # as image / audio / video by the buckets above — only genuine
@@ -20758,6 +20774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_path,
                     mtype,
                     content_inlined=inline_flag is not False,
+                    filename_requires_path_only=(path in _path_only_attachment_paths),
                 )
                 message_text = f"{context_note}\n\n{message_text}"
 
